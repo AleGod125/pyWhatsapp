@@ -25,21 +25,10 @@ def state() -> SessionState:
     return SessionState()
 
 
-@pytest.fixture(scope="module")
-def app(database):
-    """Una sola ventana para el modulo (ver test_gui_geometry)."""
-    from app.gui import App
-
-    try:
-        instance = App(queue.Queue())
-    except tk.TclError as exc:  # pragma: no cover - entorno sin display
-        pytest.skip(f"sin display disponible: {exc}")
-    instance.attach_viewer(database.session)
-    yield instance
-    try:
-        instance.root.destroy()
-    except tk.TclError:
-        pass
+@pytest.fixture
+def app(tk_app):
+    """La ventana compartida de la suite (ver ``tk_app`` en conftest)."""
+    return tk_app
 
 
 # ---------------------------------------------------------------------------

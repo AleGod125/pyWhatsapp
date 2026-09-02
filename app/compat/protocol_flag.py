@@ -54,25 +54,34 @@ def last_raw_message() -> bytes | None:
 
 
 def apply() -> bool:
-    """Instala la captura. Idempotente y sin cambiar comportamiento."""
-    from pywhats.messaging.receiver import Receiver
+    """Instala la captura. Idempotente y sin cambiar comportamiento.
 
-    original = Receiver._handle_protocol_message
+    El gancho es ``_extract_text`` y no ``_handle_protocol_message``, y la
+    diferencia importa: el camino de los mensajes de GRUPO (``skmsg``,
+    receiver.py:565-589) construye el ``Message`` sin pasar por
+    ``_handle_protocol_message``. Con el gancho anterior esos mensajes
+    dejaban ``_last_raw`` con el valor del mensaje ANTERIOR, asi que la
+    clasificacion podia mirar el protobuf equivocado.
+
+    ``_extract_text(proto)`` se invoca exactamente una vez por mensaje en
+    AMBOS caminos (lineas 455 y 575), justo antes de construir el evento.
+    """
+    import pywhats.messaging.receiver as receiver_module
+
+    original = receiver_module._extract_text
     if getattr(original, _MARKER, False):
         return True
 
-    def _handle_protocol_message(self: Any, proto: Any, sender: Any) -> bool:
-        # Se anota ANTES de delegar: lo que interesa es la forma del
-        # protobuf, no si pywhats supo tratarlo.
+    def _extract_text(proto: Any) -> str:
         global _last_raw
         try:
             _last_raw = proto.SerializeToString()
         except Exception:  # noqa: BLE001 - nunca romper la recepcion
             _last_raw = None
-        return original(self, proto, sender)
+        return original(proto)
 
-    setattr(_handle_protocol_message, _MARKER, True)
-    Receiver._handle_protocol_message = _handle_protocol_message  # type: ignore[method-assign]
+    setattr(_extract_text, _MARKER, True)
+    receiver_module._extract_text = _extract_text
 
     log.info("Deteccion de mensajes de protocolo en vivo aplicada")
     return True

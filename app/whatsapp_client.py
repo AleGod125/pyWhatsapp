@@ -99,6 +99,10 @@ class WhatsAppClient:
         # Aviso a los servicios de fondo (backfill, multimedia) para que
         # dejen de trabajar antes de cerrar la sesion.
         self.on_shutdown: Any = None
+        # Lo crea _main() dentro de su propio loop: un asyncio.Event debe
+        # nacer en el loop que lo va a esperar.
+        self._shutdown_requested: asyncio.Event | None = None
+        self._shutdown_timeout = 10.0
 
     # -- Estado --------------------------------------------------------------
 
@@ -198,13 +202,36 @@ class WhatsAppClient:
         else:
             await self._connect_with_pairing_retries()
 
+        self._shutdown_requested = asyncio.Event()
+
         if self.post_connect is not None:
             # En segundo plano: los mensajes live siguen siendo prioritarios.
             asyncio.create_task(
                 self._run_post_connect(), name="post-connect"
             )
 
-        await self._client.wait_closed()
+        # Se espera a que la sesion se cierre O a que alguien pida parar. Asi
+        # el cierre ordenado ocurre DENTRO de esta corrutina y el loop no
+        # termina con _shutdown() a medias (el "Task was destroyed").
+        closed = asyncio.create_task(self._client.wait_closed(), name="wait-closed")
+        requested = asyncio.create_task(
+            self._shutdown_requested.wait(), name="shutdown-requested"
+        )
+        try:
+            done, pending = await asyncio.wait(
+                {closed, requested}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (closed, requested):
+                if not task.done():
+                    task.cancel()
+            # CancelledError propia del cierre: se absorbe a proposito. Una
+            # cancelacion inesperada seguiria propagandose desde otro sitio.
+            await asyncio.gather(closed, requested, return_exceptions=True)
+
+        if requested in done:
+            log.info("Parada solicitada: cerrando la sesion")
+            await self._shutdown(self._shutdown_timeout)
 
     async def _run_post_connect(self) -> None:
         """Trabajo posterior a la conexion (multimedia). Nunca tumba la sesion."""
@@ -301,18 +328,19 @@ class WhatsAppClient:
         self._stopping.set()
 
         loop = self._loop
-        client = self._client
+        event = self._shutdown_requested
 
-        if loop is not None and not self._finished.is_set() and loop.is_running():
-            # El cierre se ejecuta DENTRO del loop y se espera aqui: asi no
-            # queda ninguna corrutina pendiente cuando el loop termine.
-            future = asyncio.run_coroutine_threadsafe(self._shutdown(timeout), loop)
-            try:
-                future.result(timeout=timeout + 5)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("Cierre ordenado incompleto: %s", type(exc).__name__)
+        if loop is not None and event is not None and not self._finished.is_set():
+            # Solo se SENALIZA. El cierre lo ejecuta _main() dentro del loop,
+            # asi que cuando el hilo termine no puede quedar nada pendiente.
+            self._shutdown_timeout = timeout
+            loop.call_soon_threadsafe(event.set)
             if self._thread is not None:
-                self._thread.join(timeout=timeout)
+                self._thread.join(timeout=timeout + 10)
+                if self._thread.is_alive():
+                    log.warning("El hilo del cliente sigue vivo tras %.0fs", timeout)
+                else:
+                    log.info("Hilo del cliente terminado limpiamente")
             return
 
         if self._finished.is_set():

@@ -19,19 +19,14 @@ TOTAL = 452
 
 
 @pytest.fixture(scope="module")
-def app(database):
-    from app.gui import App
+def app(tk_app):
+    """La ventana compartida de la suite (ver ``tk_app`` en conftest).
 
-    try:
-        instance = App(queue.Queue())
-    except tk.TclError as exc:  # pragma: no cover
-        pytest.skip(f"sin display: {exc}")
-    instance.attach_viewer(database.session)
-    yield instance
-    try:
-        instance.root.destroy()
-    except tk.TclError:
-        pass
+    Antes cada modulo creaba y destruia su propio ``Tk()``, y encadenar varios
+    interpretes Tcl en un mismo proceso hacia que en Windows fallaran de forma
+    intermitente con "Can't find a usable init.tcl".
+    """
+    return tk_app
 
 
 @pytest.fixture
@@ -54,13 +49,26 @@ def chat_452(session):
     return chat_id
 
 
+@pytest.fixture
+def sin_scroll_automatico(monkeypatch):
+    """Apaga el prefetch para poder medir el boton en aislamiento."""
+    import app.chat_view as chat_view
+
+    monkeypatch.setattr(chat_view, "AUTO_PREFETCH", False)
+
+
 # ---------------------------------------------------------------------------
 # A -- paginacion manual contra PostgreSQL
 # ---------------------------------------------------------------------------
 
 
-def test_A_progresion_200_400_452(app, session, chat_452):
-    """200 -> 400 -> 452, y despues el boton se agota."""
+def test_A_progresion_200_400_452(app, session, chat_452, sin_scroll_automatico):
+    """200 -> 400 -> 452 PULSANDO el boton, y despues se agota.
+
+    Aqui se prueba el respaldo manual, asi que el scroll automatico se apaga:
+    con el visor mapeado cargaria paginas por su cuenta y ya no se estaria
+    midiendo lo que pulsa el usuario.
+    """
     from app.chat_view import LOAD_DONE_LABEL, PAGE_SIZE
     from app.repository import ChatSummary
 

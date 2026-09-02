@@ -40,6 +40,9 @@ class AppState(str, Enum):
     CHECKING_SESSION = "CHECKING_SESSION"
     CONNECTING = "CONNECTING"
     CONNECTED = "CONNECTED"
+    # Conectado, pero el History Sync inicial aun esta llegando. Lanzar el
+    # backfill aqui produce "0 candidatos" y luego el bootstrap llega tarde.
+    WAITING_INITIAL_HISTORY = "WAITING_INITIAL_HISTORY"
     SESSION_INVALID = "SESSION_INVALID"
     PAIRING_REQUIRED = "PAIRING_REQUIRED"
     DISCONNECTED = "DISCONNECTED"
@@ -47,7 +50,9 @@ class AppState(str, Enum):
 
 
 # Estados en los que se puede mostrar el visor de conversaciones.
-VIEWER_ALLOWED = frozenset({AppState.CONNECTED})
+# El visor puede abrirse mientras llega el historial inicial: la sesion ya
+# esta confirmada por el servidor y hay datos locales que mostrar.
+VIEWER_ALLOWED = frozenset({AppState.CONNECTED, AppState.WAITING_INITIAL_HISTORY})
 
 # Estados terminales de una sesion que ya no sirve.
 SESSION_DEAD = frozenset({AppState.SESSION_INVALID, AppState.PAIRING_REQUIRED})

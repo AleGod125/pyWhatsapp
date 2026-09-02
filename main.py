@@ -245,11 +245,36 @@ def wire_gui(
             app.schedule_sidebar_refresh()
 
     def on_message_stored(event: ClientEvent) -> None:
+        """Llega un mensaje: se toca lo minimo (seccion 34).
+
+        Primero se intenta refrescar SOLO la fila de ese chat. Reconstruir el
+        sidebar entero con cada mensaje es destruir y recrear todos los
+        widgets para cambiar una linea; solo se hace cuando el chat es nuevo
+        y de verdad hay que crear su fila.
+        """
         if not state.viewer_allowed or app.viewer is None:
             return
         data = event.payload or {}
-        app.viewer.refresh_chats()
-        app.viewer.reload_if_open(data.get("chat_id"))
+        chat_id = data.get("chat_id")
+        if not app.viewer.refresh_chat_row(chat_id):
+            app.schedule_sidebar_refresh()
+        # Y en la conversacion, anadir al final en vez de repintarla: repintar
+        # devuelve el scroll abajo y arrastraria a quien este leyendo mensajes
+        # antiguos.
+        if not app.viewer.append_new_message(chat_id):
+            app.viewer.reload_if_open(chat_id)
+
+    def on_status(event: ClientEvent) -> None:
+        """Estado del trabajo de fondo -> barra inferior (secciones 29 y 30)."""
+        if app.viewer is not None and event.payload is not None:
+            app.viewer.update_status(event.payload)
+
+    def on_waiting_history(_event: ClientEvent) -> None:
+        wa_log.info("Historial inicial en curso; el visor ya esta disponible")
+
+    def on_maintenance(event: ClientEvent) -> None:
+        log.info("Mantenimiento automatico: %s", event.payload)
+        _refresh_if_live()
 
     def on_history_ingested(event: ClientEvent) -> None:
         log.info("Historial ingerido (%s)", event.payload)
@@ -276,6 +301,9 @@ def wire_gui(
     app.on("history_ingested", on_history_ingested)
     app.on("media_downloaded", on_media_downloaded)
     app.on("backfill_done", on_backfill_done)
+    app.on("status", on_status)
+    app.on("waiting_initial_history", on_waiting_history)
+    app.on("maintenance_done", on_maintenance)
 
 
 def wire_history_ingestion(
@@ -304,6 +332,8 @@ def wire_history_ingestion(
     def ingest(full: Any) -> None:
         # Se avisa ANTES de persistir: el backfill solo necesita saber que su
         # chat aparecio en un blob para dejar de esperar.
+        if _HISTORY_GATE is not None:
+            _HISTORY_GATE.note_history_sync(full.sync_type)
         if _BACKFILL is not None:
             _BACKFILL.notify_history(full)
         try:
@@ -324,19 +354,65 @@ def wire_history_ingestion(
     history_compat.set_callback(ingest)
 
 
-# Instancia unica del backfill: la crea wire_backfill() y la consume el
-# post_connect. Se guarda a nivel de modulo porque ambos cableados corren en
-# hilos distintos y necesitan la misma referencia.
+# Instancias unicas del backfill, la barrera de historial y el orquestador.
+# Se guardan a nivel de modulo porque los cableados corren en hilos distintos
+# y necesitan la misma referencia.
 _BACKFILL: Any = None
+_HISTORY_GATE: Any = None
+_ORCHESTRATOR: Any = None
+
+
+def session_fingerprint_from_disk(settings: Settings) -> str | None:
+    """Huella de la sesion guardada, ANTES de conectar.
+
+    El backfill la calcula del dispositivo vivo, que aqui todavia no existe.
+    Se deriva de lo mismo (JID y device_id del ``DeviceStore``) para que
+    ambas coincidan: es lo que permite saber, ya en el arranque, si esta
+    sesion necesita esperar el bootstrap o no (seccion 18).
+
+    Ni el JID ni el device_id son material criptografico, y ademas solo se
+    guarda su SHA-256 truncado: nunca se registra el identificador en claro.
+    """
+    import hashlib
+    import json
+
+    if not settings.session_file.exists():
+        return None
+    try:
+        datos = json.loads(settings.session_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    jid = datos.get("jid") or {}
+    if not jid.get("user"):
+        return None
+    crudo = (
+        f"{jid['user']}:{jid.get('server', 's.whatsapp.net')}:"
+        f"{datos.get('device_id', '')}"
+    )
+    return hashlib.sha256(crudo.encode()).hexdigest()[:16]
 
 
 def wire_backfill(
     client: WhatsAppClient, database: Database, settings: Settings
 ) -> Any:
-    """Prepara la recuperacion historica ON_DEMAND."""
+    """Prepara la recuperacion historica ON_DEMAND y la barrera de historial."""
     from app.backfill_service import BackfillService
+    from app.history_gate import InitialHistoryGate, initial_history_confirmed
 
-    global _BACKFILL
+    global _BACKFILL, _HISTORY_GATE
+
+    # Si esta sesion YA recibio su History Sync inicial, no hay nada que
+    # esperar: el servidor no lo reenvia. Antes se agotaban 180 segundos en
+    # cada arranque para acabar escribiendo "sesion ya sincronizada".
+    huella = session_fingerprint_from_disk(settings)
+    ya_confirmado = initial_history_confirmed(database, huella)
+    _HISTORY_GATE = InitialHistoryGate(
+        settle_seconds=settings.history_settle_seconds,
+        already_confirmed=ya_confirmado,
+    )
+    if ya_confirmado:
+        log.info("Historial inicial ya confirmado para esta sesion")
+
     _BACKFILL = BackfillService(settings, database)
     # El backfill debe saber quienes somos para no pedirse historial a si mismo.
     from inspect_db import own_identity
@@ -367,63 +443,31 @@ def wire_live_messages(
     client.sinks["message"] = service.handle
 
 
-def wire_media_downloads(
+def wire_orchestrator(
     client: WhatsAppClient, database: Database, settings: Settings
-) -> None:
-    """Descarga los adjuntos pendientes una vez conectados.
+) -> Any:
+    """Instala el orquestador como ``post_connect`` del cliente.
 
-    Corre en el event loop del cliente y en segundo plano, para no retrasar la
-    recepcion de mensajes.
+    Todo el trabajo posterior a la conexion (identidad, historial, contactos,
+    multimedia, backfill y mantenimiento periodico) vive en un unico sitio con
+    un orden explicito, en lugar de repartido por closures de este modulo
+    (seccion 15).
     """
-    from app.media_service import MediaService
+    from app.orchestrator import Orchestrator
 
-    media_log = get_logger("MEDIA")
+    global _ORCHESTRATOR
+    _ORCHESTRATOR = Orchestrator(
+        settings, database, client, publish=client._publish
+    )
+    _ORCHESTRATOR.backfill = _BACKFILL
+    _ORCHESTRATOR.gate = _HISTORY_GATE
 
-    async def download(pywhats_client: Any) -> None:
-        service = MediaService(settings, database, pywhats_client)
-        stats = await service.run()
-        if stats.downloaded or stats.deduplicated:
-            client._publish("media_downloaded", str(stats))
-        else:
-            media_log.info("Multimedia: %s", stats)
+    # Comprobacion ligera y reconciliacion segura ANTES de conectar: la GUI
+    # abre ya con contadores, previas y cursores al dia.
+    _ORCHESTRATOR.prepare()
 
-    async def post_connect(pywhats_client: Any) -> None:
-        # 1) Nombres: se piden explicitamente porque pywhats solo sincroniza
-        #    el app-state cuando el servidor le empuja una notificacion.
-        from app.contacts_service import fetch_contact_names
-
-        try:
-            await fetch_contact_names(pywhats_client)
-            # Los nombres llegan por telefono y los chats por @lid: hay que
-            # preguntar al servidor la correspondencia o no casan.
-            from app.contacts_service import resolve_lids_via_usync
-
-            await resolve_lids_via_usync(pywhats_client, database)
-            client._publish("contacts_synced", None)
-        except Exception:  # noqa: BLE001 - sin nombres se sigue funcionando
-            media_log.debug("No se pudieron sincronizar los nombres")
-
-        # 2) Multimedia ya detectada: rapida y no depende del telefono.
-        await download(pywhats_client)
-
-        # 3) Backfill historico: este si depende del telefono principal.
-        if _BACKFILL is not None:
-            # CANARY primero: un solo chat. El backfill global no se activa
-            # hasta ver una recuperacion real, para no recorrer 9 chats
-            # repitiendo el mismo fallo.
-            _BACKFILL._client = pywhats_client
-            if _BACKFILL.capability_confirmed():
-                # Esta sesion ya demostro que ON_DEMAND funciona: repetir el
-                # canary en cada arranque solo gasta una peticion.
-                log.info("Canary omitido: capability ya confirmada para esta sesion")
-                ok = True
-            else:
-                ok = await _BACKFILL.run_canary(pywhats_client)
-            if ok and settings.backfill_all_after_canary:
-                await _BACKFILL.run(pywhats_client)
-            client._publish("backfill_done", str(_BACKFILL.stats))
-
-    client.post_connect = post_connect
+    client.post_connect = _ORCHESTRATOR.post_connect
+    return _ORCHESTRATOR
 
 
 def wire_logging(events: queue.Queue[ClientEvent]) -> None:
@@ -542,6 +586,30 @@ def main(argv: list[str] | None = None) -> int:
             return 4
 
         if not use_gui:
+            # Sin ventana tambien hay que hacer el trabajo. Antes este camino
+            # arrancaba el cliente pelado: los blobs de History Sync llegaban
+            # y quedaban solo archivados en data/history/, sin persistirse, y
+            # ni multimedia ni backfill corrian. Se cablea lo mismo que en el
+            # modo grafico, menos la GUI.
+            wire_history_ingestion(
+                client,
+                database,
+                own_jid_from_session(settings.session_file),
+                signal_db_path=settings.signal_store_file,
+            )
+            wire_live_messages(
+                client, database, own_jid_from_session(settings.session_file)
+            )
+            wire_contacts(client, database)
+            wire_backfill(client, database, settings)
+            wire_orchestrator(client, database, settings)
+
+            def _stop_headless() -> None:
+                if _ORCHESTRATOR is not None:
+                    _ORCHESTRATOR.stop()
+
+            client.on_shutdown = _stop_headless
+
             client.start()
             wire_logging(events)
             return exit_code
@@ -556,8 +624,15 @@ def main(argv: list[str] | None = None) -> int:
         set_success_callback(lambda: client._publish("session_valid", None))
 
         def _stop_workers() -> None:
-            """Detiene backfill y multimedia antes de cerrar la sesion."""
-            if _BACKFILL is not None:
+            """Detiene el trabajo de fondo antes de cerrar la sesion.
+
+            Solo SENALIZA. Cerrar el cliente desde fuera de su event loop es
+            lo que producia el 'Task was destroyed but it is pending' del
+            cierre; esa parte la hace el propio cliente en su hilo.
+            """
+            if _ORCHESTRATOR is not None:
+                _ORCHESTRATOR.stop()
+            elif _BACKFILL is not None:
                 _BACKFILL.stop()
 
         client.on_shutdown = _stop_workers
@@ -588,10 +663,11 @@ def main(argv: list[str] | None = None) -> int:
             own_jid_from_session(settings.session_file),
             signal_db_path=settings.signal_store_file,
         )
-        wire_media_downloads(client, database, settings)
         wire_live_messages(client, database, own_jid_from_session(settings.session_file))
-        wire_backfill(client, database, settings)
         wire_contacts(client, database)
+        # El backfill y la barrera primero: el orquestador los recibe ya hechos.
+        wire_backfill(client, database, settings)
+        wire_orchestrator(client, database, settings)
 
         if has_session:
             # Hay credenciales en disco, pero eso NO significa que sigan

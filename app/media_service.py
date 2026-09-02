@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.config import Settings
 from app.database import Database
@@ -217,6 +217,59 @@ class MediaService:
             return self._stats
         finally:
             self._running = False
+
+    def pending_count(self) -> int:
+        """Cuantos adjuntos quedan por descargar. Consulta barata e indexada."""
+        with self._database.transaction() as session:
+            return session.execute(
+                select(func.count())
+                .select_from(MediaFile)
+                .where(
+                    MediaFile.download_status.in_(("pending", "failed")),
+                    MediaFile.direct_path.is_not(None),
+                    MediaFile.media_key.is_not(None),
+                    MediaFile.download_attempts < 3,
+                )
+            ).scalar_one()
+
+    async def run_forever(
+        self, *, interval: float = 20.0, on_progress: Any = None
+    ) -> None:
+        """Worker permanente: descarga lo que vaya apareciendo (seccion 13).
+
+        Antes habia que reiniciar la aplicacion para que un adjunto llegado
+        despues del arranque se descargara. Ahora el pipeline se cierra solo::
+
+            mensaje -> media_files(pending) -> este worker -> downloaded
+                    -> aviso a la GUI -> la burbuja se actualiza
+
+        Vive en su propia tarea y la GUI nunca espera por el (seccion 14).
+        Entre rondas duerme: no es un bucle ocupado. Termina limpiamente al
+        cancelarse.
+        """
+        log.info("Worker de multimedia en marcha (revision cada %.0fs)", interval)
+        try:
+            while True:
+                antes = self._stats.downloaded + self._stats.deduplicated
+                try:
+                    # Comprobar primero evita escribir "no hay multimedia
+                    # pendiente" en el log cada veinte segundos para siempre.
+                    if self.pending_count():
+                        await self.run()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - una ronda mala no lo mata
+                    log.exception("Ronda de multimedia fallida; se reintentara")
+                nuevos = self._stats.downloaded + self._stats.deduplicated - antes
+                if nuevos and on_progress is not None:
+                    try:
+                        on_progress(self._stats, nuevos)
+                    except Exception:  # noqa: BLE001
+                        log.debug("El aviso de progreso de multimedia fallo")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            log.info("Worker de multimedia detenido")
+            raise
 
     async def _report_progress(self, total: int, every: float = 10.0) -> None:
         """Resumen periodico en INFO, en lugar de una linea por adjunto."""

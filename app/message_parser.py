@@ -108,7 +108,15 @@ MESSAGE_FIELD_NAMES: dict[int, str] = {
 # Envoltorios: no son el mensaje, lo CONTIENEN. Todos son FutureProofMessage,
 # cuyo campo 1 es el Message anidado. Hay que desenvolverlos o todo mensaje
 # efimero (lo normal en muchos chats) se clasificaria como "ephemeralMessage".
-WRAPPER_FIELDS: frozenset[int] = frozenset({37, 40, 53, 55, 59, 62})
+WRAPPER_FIELDS: frozenset[int] = frozenset({37, 40, 53, 55, 59, 62, 31})
+
+# Dentro de que campo viaja el mensaje real de cada envoltorio.
+# Los FutureProofMessage lo llevan en el campo 1; DeviceSentMessage (31) lo
+# lleva en el 2, porque el 1 es su destinationJid. Confundirlos deja el
+# mensaje sin desenvolver y acaba clasificado como "unknown": es lo que
+# pasaba con los mensajes enviados desde el propio telefono.
+_WRAPPER_INNER_FIELD: dict[int, int] = {31: 2}
+_DEFAULT_INNER_FIELD = 1
 
 # Campos que acompanan al mensaje sin ser su tipo.
 _IGNORED_FIELDS: frozenset[int] = frozenset({35})  # messageContextInfo
@@ -140,6 +148,7 @@ _NORMALIZED_TYPES: dict[str, str] = {
     "editedMessage": "edited",
     "senderKeyDistributionMessage": "senderkey",
     "deviceSentMessage": "device_sent",
+    "albumMessage": "album",
 }
 
 
@@ -217,8 +226,8 @@ def unwrap_message(data: bytes, *, max_depth: int = 4) -> tuple[bytes, list[str]
             break
         number, payload = candidates[0]
         wrappers.append(MESSAGE_FIELD_NAMES.get(number, str(number)))
-        # FutureProofMessage.message = 1
-        inner = [p for n, _w, p in top_level_fields(payload) if n == 1 and p]
+        inner_field = _WRAPPER_INNER_FIELD.get(number, _DEFAULT_INNER_FIELD)
+        inner = [p for n, _w, p in top_level_fields(payload) if n == inner_field and p]
         if not inner:
             break
         current = inner[0]
@@ -344,6 +353,46 @@ def extract_media(message_bytes: bytes, normalized_type: str) -> ParsedMedia | N
         media_key=bytes(getattr(node, "media_key", b"")) or None,
         file_sha256=bytes(getattr(node, "file_sha256", b"")) or None,
         file_enc_sha256=bytes(getattr(node, "file_enc_sha256", b"")) or None,
+    )
+
+
+@dataclass
+class InterpretedMessage:
+    """Lo que se puede saber de un ``Message`` E2E suelto, sin sobre."""
+
+    message_type: str
+    proto_type: str | None
+    text: str | None
+    media: ParsedMedia | None
+    wrappers: list[str]
+
+
+def interpret_message_bytes(message_bytes: bytes | None) -> InterpretedMessage | None:
+    """Interpreta un ``Message`` E2E que NO viene dentro de un WebMessageInfo.
+
+    Hace falta porque hay dos formas distintas de recibir lo mismo:
+
+    * History Sync entrega ``WebMessageInfo`` (sobre con clave, marca de
+      tiempo y remitente), que resuelve :func:`parse_web_message_info`;
+    * el receptor en vivo entrega el ``Message`` E2E pelado, sin sobre.
+
+    Y hace falta de verdad, no por simetria: pywhats no desenvuelve
+    ``deviceSentMessage``, asi que las fotos que el usuario se envia a si
+    mismo llegan con ``media=None`` y acababan guardadas como ``unknown``.
+    Aqui se desenvuelve y se recupera tanto el tipo como el adjunto.
+    """
+    if not message_bytes:
+        return None
+    inner, wrappers = unwrap_message(bytes(message_bytes))
+    message_type, proto_name = detect_message_type(inner)
+    if message_type == "unknown" and not wrappers:
+        return None
+    return InterpretedMessage(
+        message_type=message_type,
+        proto_type=proto_name if proto_name and proto_name != message_type else None,
+        text=extract_text(inner),
+        media=extract_media(inner, message_type),
+        wrappers=wrappers,
     )
 
 

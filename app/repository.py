@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from sqlalchemy import func, literal_column, select, update
+from sqlalchemy import bindparam, func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -295,15 +295,23 @@ def count_messages(session: Session, chat_jid: str | None = None) -> int:
 # Paginacion para la GUI
 # ---------------------------------------------------------------------------
 
-# Columnas que la GUI necesita. raw_proto queda fuera a proposito.
+# Columnas que la GUI necesita.
+#
+# ``raw_proto`` queda fuera A PROPOSITO: es la columna mas pesada (kilobytes
+# por fila) y traerla para 200 burbujas multiplicaria por diez el coste de
+# abrir un chat. ``raw_metadata`` si viene, porque es JSONB pequeno y lleva el
+# ``stub_type`` con el que se rotula un evento de sistema; el clasificador
+# sabe trabajar solo con eso.
 _PAGE_COLUMNS = (
     Message.id,
     Message.whatsapp_message_id,
     Message.sender_jid,
+    Message.sender_lid,
     Message.message_type,
     Message.text,
     Message.timestamp,
     Message.from_me,
+    Message.raw_metadata,
 )
 
 
@@ -462,20 +470,70 @@ def list_chat_summaries(
     return summaries
 
 
+def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
+    """Resumen de UN chat, para refrescar su fila del sidebar (seccion 23).
+
+    Cuando llega un mensaje no hace falta reconstruir la lista entera: basta
+    con volver a leer el chat afectado. Con miles de conversaciones, destruir
+    y recrear todos los widgets por cada mensaje es lo que hace que una
+    interfaz se sienta lenta.
+    """
+    fila = session.execute(
+        select(
+            Chat.id,
+            Chat.jid,
+            Chat.name,
+            Chat.chat_type,
+            Chat.last_message,
+            Chat.last_message_timestamp,
+            Contact.display_name,
+            Contact.push_name,
+        )
+        .outerjoin(Contact, (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid))
+        .where(Chat.id == chat_id)
+        .limit(1)
+    ).first()
+    if fila is None:
+        return None
+
+    total = session.execute(
+        select(func.count()).select_from(Message).where(Message.chat_id == chat_id)
+    ).scalar_one()
+    (
+        row_id, jid, name, chat_type, last_message, last_timestamp,
+        contact_name, push_name,
+    ) = fila
+    return ChatSummary(
+        id=row_id,
+        jid=jid,
+        display_name=display_name_for(jid, name, contact_name, push_name),
+        chat_type=chat_type,
+        last_message=last_message,
+        last_message_timestamp=last_timestamp,
+        message_count=total,
+    )
+
+
 def sender_names(session: Session, jids: Iterable[str]) -> dict[str, str]:
     """Nombre a mostrar de cada emisor, para las burbujas de un grupo."""
     wanted = [jid for jid in set(jids) if jid]
     if not wanted:
         return {}
+    # Se busca por AMBOS espacios de identificadores. En un grupo el emisor
+    # llega a veces como @lid y a veces como telefono; consultando solo por
+    # ``jid`` la mitad de los participantes salia con su numero crudo.
     rows = session.execute(
-        select(Contact.jid, Contact.display_name, Contact.push_name).where(
-            Contact.jid.in_(wanted)
+        select(Contact.jid, Contact.lid, Contact.display_name, Contact.push_name).where(
+            Contact.jid.in_(wanted) | Contact.lid.in_(wanted)
         )
     ).all()
-    resolved = {
-        jid: display_name_for(jid, display_name, push_name)
-        for jid, display_name, push_name in rows
-    }
+    resolved: dict[str, str] = {}
+    for contact_jid, contact_lid, display_name, push_name in rows:
+        nombre = display_name_for(contact_jid, display_name, push_name)
+        if contact_jid in wanted:
+            resolved[contact_jid] = nombre
+        if contact_lid and contact_lid in wanted:
+            resolved[contact_lid] = nombre
     for jid in wanted:
         resolved.setdefault(jid, display_name_for(jid))
     return resolved
@@ -536,37 +594,68 @@ def refresh_chat_previews(session: Session, chat_jids: Iterable[str]) -> int:
     asi que sin esto el sidebar no tendria ni vista previa ni criterio de
     orden: los chats saldrian en un orden arbitrario y todos con el mismo
     aspecto. El dato se deriva del mensaje mas reciente ya guardado.
+
+    La previa se construye con :func:`app.previews.preview_for`, que sabe
+    traducir un adjunto a "📷 Imagen" y un evento de sistema a "Llamada
+    perdida". La version anterior concatenaba ``'[' || message_type || ']'``
+    en SQL y por eso el chat propio mostraba ``[unknown]`` teniendo cuatro
+    imagenes dentro (seccion 32).
+
+    Escalabilidad: una sola consulta ``DISTINCT ON`` devuelve UN mensaje por
+    chat, no la tabla entera. El coste crece con el numero de chats, no con
+    el de mensajes.
     """
     wanted = list(chat_jids)
     if not wanted:
         return 0
 
-    # Un solo UPDATE ... FROM con DISTINCT ON: una pasada por chat en lugar de
-    # una consulta por chat.
-    newest = (
+    from app.previews import preview_for
+
+    # Se trae tambien lo que el chat tiene guardado ahora mismo para poder
+    # escribir SOLO lo que cambia: asi la operacion es idempotente y el
+    # contador que devuelve significa "filas realmente modificadas".
+    newest = session.execute(
         select(
             Message.chat_jid,
             Message.text,
             Message.message_type,
             Message.timestamp,
+            Message.raw_proto,
+            Message.raw_metadata,
+            Chat.last_message,
+            Chat.last_message_timestamp,
         )
+        .join(Chat, Chat.jid == Message.chat_jid)
         .where(Message.chat_jid.in_(wanted))
         .distinct(Message.chat_jid)
         .order_by(Message.chat_jid, Message.timestamp.desc(), Message.id.desc())
-        .subquery()
-    )
+    ).all()
+    if not newest:
+        return 0
 
-    updated = session.execute(
-        update(Chat)
-        .where(Chat.jid == newest.c.chat_jid)
-        .values(
-            # Si el mensaje no tiene texto (imagen, audio...), se guarda una
-            # etiqueta con su tipo para que la vista previa diga algo util.
-            last_message=func.coalesce(newest.c.text, "[" + newest.c.message_type + "]"),
-            last_message_timestamp=newest.c.timestamp,
-        )
-    ).rowcount
-    return updated or 0
+    updates = []
+    for (
+        chat_jid, text, message_type, timestamp, raw_proto, metadata,
+        previa_actual, ts_actual,
+    ) in newest:
+        previa = preview_for(message_type, text, raw_proto=raw_proto, metadata=metadata)
+        if previa == previa_actual and timestamp == ts_actual:
+            continue
+        updates.append({"jid_": chat_jid, "preview": previa, "ts": timestamp})
+    if not updates:
+        return 0
+
+    # Se actualiza la TABLA, no la entidad ORM: con una lista de parametros el
+    # ORM intenta un "bulk update by primary key" y exige el id de cada fila,
+    # que aqui no se tiene (se identifica por JID). A nivel de tabla es un
+    # unico UPDATE parametrizado, que ademas es lo que interesa por coste.
+    session.execute(
+        update(Chat.__table__)
+        .where(Chat.__table__.c.jid == bindparam("jid_"))
+        .values(last_message=bindparam("preview"), last_message_timestamp=bindparam("ts")),
+        updates,
+    )
+    return len(updates)
 
 
 @dataclass(frozen=True)

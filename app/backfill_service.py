@@ -46,6 +46,8 @@ PEER_DATA_OPERATION_REQUEST_MESSAGE = 16
 
 # Bandera persistida en app_state la primera vez que ON_DEMAND devuelve algo.
 CAPABILITY_KEY = "ondemand_capability_confirmed"
+# Huella de la sesion cuyo veredicto de extraccion esta vigente.
+SESSION_KEY = "backfill_session_fingerprint"
 
 # Campo 11 de Conversation. El 0 es el caso que hay que seguir pidiendo:
 # el telefono dice "he terminado este bloque, pero AUN ME QUEDAN mensajes".
@@ -214,6 +216,28 @@ class BackfillService:
         """Registra la identidad propia para excluirla del backfill."""
         self._own_jids = {j for j in (own_pn, own_lid) if j}
 
+    def refresh_own_identity(self) -> None:
+        """Relee la identidad propia del cliente CONECTADO.
+
+        La version anterior la tomaba del ``device.json`` en el momento de
+        cablear, antes de arrancar el cliente. Tras un pairing nuevo ese
+        archivo aun tenia la identidad anterior (o ninguna), asi que el self
+        no quedaba excluido y aparecia como candidato del backfill.
+        """
+        device = getattr(self._client, "device", None)
+        if device is None:
+            return
+        jids = set(self._own_jids)
+        jid = getattr(device, "jid", None)
+        if jid is not None and getattr(jid, "user", None):
+            jids.add(f"{jid.user}@{getattr(jid, 'server', 's.whatsapp.net')}")
+        lid = getattr(device, "lid", None)
+        if isinstance(lid, str) and lid:
+            jids.add(f"{lid.split('@')[0].split('.')[0]}@lid")
+        if jids != self._own_jids:
+            self._own_jids = jids
+            log.info("Identidad propia actualizada: %d identificadores", len(jids))
+
     def is_backfill_candidate(self, chat_jid: str) -> bool:
         """Un chat al que tiene sentido pedirle historial.
 
@@ -255,6 +279,11 @@ class BackfillService:
         Devuelve ``True`` si ON_DEMAND devolvio mensajes de verdad.
         """
         self._client = client
+        self.refresh_own_identity()
+        # La revalidacion va ANTES de elegir el canary: si no, todos los chats
+        # de la sesion anterior siguen marcados 'exhausted' y no hay ninguno
+        # con cursor que probar ("CANARY: no hay ningun chat con cursor valido").
+        self.revalidate_for_new_session()
         target = self.pick_canary()
         if target is None:
             log.error("CANARY: no hay ningun chat con cursor valido")
@@ -285,15 +314,29 @@ class BackfillService:
             and oldest_before is not None
             and oldest_after < oldest_before
         )
+
         if gained > 0 and went_back:
             log.info("CANARY SUCCESS: +%d mensajes, historial retrocedio", gained)
             self._confirm_capability()
             return True
 
+        # Una respuesta VALIDA con 0 mensajes agota ESE chat; no dice nada
+        # malo del protocolo. Si el telefono contesto, ON_DEMAND funciona y el
+        # backfill global debe continuar con los demas chats (seccion 13).
+        if self.stats.responses_received > 0:
+            log.info(
+                "CANARY: el protocolo responde (respuestas=%d) pero este chat no "
+                "tenia mas historial. Se da la capacidad por confirmada y se "
+                "continua con el resto.",
+                self.stats.responses_received,
+            )
+            self._confirm_capability()
+            return True
+
         log.warning(
-            "CANARY sin exito: nuevos=%d retrocedio=%s. No se activa el backfill global.",
-            gained,
-            went_back,
+            "CANARY sin respuesta (timeouts=%d): no se puede confirmar la capacidad. "
+            "Comprueba que el telefono este encendido y con datos.",
+            self.stats.timeouts,
         )
         return False
 
@@ -311,6 +354,10 @@ class BackfillService:
         bombardearlo.
         """
         self._client = client
+        self.refresh_own_identity()
+        # Si la vinculacion cambio, los "exhausted" de la sesion anterior se
+        # reabren para una comprobacion conservadora.
+        self.revalidate_for_new_session()
 
         # Pasadas sucesivas: un chat puede quedarse a medias por el tope de
         # rondas o por un timeout puntual, y la siguiente pasada lo retoma
@@ -328,7 +375,10 @@ class BackfillService:
 
             before_total = self.stats.messages_new
             log.info(
-                "Pasada %d/%d: %d chats candidatos", pass_number, max_passes, len(chats)
+                "Pasada %d/%d: candidatos reales=%d (self excluido)",
+                pass_number,
+                max_passes,
+                len(chats),
             )
 
             for chat_id, chat_jid in chats:
@@ -687,11 +737,73 @@ class BackfillService:
             return False
         saved = stored.get("session")
         if saved is None:
-            # Confirmacion antigua, sin sesion asociada. Se acepta y se
-            # reetiqueta con la sesion actual en la proxima confirmacion.
-            log.debug("Capability confirmada sin sesion asociada; se acepta")
-            return True
-        return saved == fingerprint
+            # Confirmacion antigua, sin sesion asociada. NO se acepta: fue
+            # justo esta ruta la que hizo que un pairing nuevo (device .77 ->
+            # .78) siguiera diciendo "capability ya confirmada" y se saltara
+            # el canary. Sin evidencia de a que sesion pertenece, es UNKNOWN.
+            log.info(
+                "[SESSION] capability guardada sin sesion asociada -> UNKNOWN; "
+                "se comprobara con un canary"
+            )
+            return False
+
+        same = saved == fingerprint
+        log.info(
+            "[SESSION] old_fingerprint=%s new_fingerprint=%s same_session=%s "
+            "ondemand_capability=%s",
+            saved,
+            fingerprint,
+            same,
+            "CONFIRMED" if same else "UNKNOWN",
+        )
+        return same
+
+    def revalidate_for_new_session(self) -> int:
+        """Reabre los chats agotados si la vinculacion ha cambiado.
+
+        ``exhausted`` describe lo que respondio el telefono EN AQUELLA sesion.
+        Una vinculacion nueva puede traer cursores distintos y mas historial
+        disponible, asi que ese veredicto no puede ser eterno.
+
+        Se hace de forma conservadora: los chats vuelven a ``pending`` una
+        sola vez por sesion. Cada uno recibira UNA peticion; si responde 0 o
+        final, vuelve a ``exhausted`` por su cuenta. La deduplicacion por
+        ``whatsapp_message_id`` hace que reconsultar historial ya conocido no
+        pueda duplicar nada.
+
+        Los mensajes NO se tocan: solo el estado de extraccion.
+        """
+        fingerprint = self.session_fingerprint()
+        if fingerprint is None:
+            return 0
+
+        with self._database.transaction() as session:
+            previous = repo.get_app_state(session, SESSION_KEY)
+            saved = previous.get("fingerprint") if isinstance(previous, dict) else None
+            if saved == fingerprint:
+                log.debug("Misma sesion de extraccion; no hace falta revalidar")
+                return 0
+
+            reopened = session.execute(
+                update(ChatHistoryState)
+                .where(ChatHistoryState.history_status.in_(("exhausted", "server_limited")))
+                .values(
+                    history_status="pending",
+                    consecutive_no_progress=0,
+                    last_error="revalidacion por sesion nueva",
+                )
+            ).rowcount or 0
+            repo.set_app_state(
+                session, SESSION_KEY, {"fingerprint": fingerprint, "at": int(time.time())}
+            )
+
+        if reopened:
+            log.info(
+                "Sesion de extraccion nueva: %d chats agotados vuelven a revisarse "
+                "(los mensajes no se tocan)",
+                reopened,
+            )
+        return reopened
 
     def _confirm_capability(self) -> None:
         """Una vez que ON_DEMAND funciona, se deja constancia permanente.

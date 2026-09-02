@@ -28,6 +28,7 @@ from app import repository as repo
 from app.database import Database
 from app.logging_setup import get_logger
 from app.message_parser import classify_chat
+from app.previews import preview_for
 from app.models import MediaFile, Message
 from app.repository import IncomingMessage
 
@@ -143,12 +144,37 @@ class LiveMessageService:
         if not text and media is not None and getattr(media, "caption", ""):
             text = media.caption
 
+        # pywhats no desenvuelve ``deviceSentMessage``: las fotos que el
+        # usuario se envia a si mismo llegaban con ``media=None`` y acababan
+        # guardadas como 'unknown'. Cuando pywhats no sabe que es, se mira el
+        # protobuf, que si lo dice (seccion 32).
+        propio_metadata: dict[str, Any] | None = None
+        if message_type == "unknown" and raw_proto:
+            from app.message_parser import interpret_message_bytes
+
+            suelto = interpret_message_bytes(raw_proto)
+            if suelto is not None and suelto.message_type != "unknown":
+                message_type = suelto.message_type
+                text = text or suelto.text
+                propio_metadata = {}
+                if suelto.wrappers:
+                    propio_metadata["wrappers"] = suelto.wrappers
+                if suelto.proto_type:
+                    propio_metadata["proto_type"] = suelto.proto_type
+                log.debug(
+                    "Tipo recuperado del protobuf: %s (%s)",
+                    message_type,
+                    ",".join(suelto.wrappers) or "sin envoltorio",
+                )
+
         with self._database.transaction() as session:
             chat_id = repo.upsert_chat(
                 session,
                 jid=chat_jid,
                 chat_type=classify_chat(chat_jid),
-                last_message=text or f"[{message_type}]",
+                last_message=preview_for(
+                    message_type, text, raw_proto=raw_proto, metadata=propio_metadata
+                ),
                 last_message_timestamp=int(message.timestamp),
             )
 
@@ -167,6 +193,7 @@ class LiveMessageService:
                         message_type=message_type,
                         text=text,
                         from_me=from_me,
+                        raw_metadata=propio_metadata,
                         # Fidelidad: hasta ahora los mensajes live se
                         # guardaban sin raw_proto porque el evento no lo
                         # exponia. Ahora si.
@@ -182,6 +209,16 @@ class LiveMessageService:
 
             if media is not None:
                 if self._register_media(session, chat_id, message, media, message_type):
+                    self.stats.media += 1
+            elif raw_proto and message_type in _MEDIA_KINDS.values() | {
+                "voice_note", "gif"
+            }:
+                # El adjunto lo encontro nuestro parser, no pywhats (caso
+                # deviceSentMessage). Se registra igual para que el worker lo
+                # descargue sin esperar a un reinicio.
+                if self._register_parsed_media(
+                    session, chat_id, message, raw_proto, message_type
+                ):
                     self.stats.media += 1
 
             repo.refresh_history_state(session, chat_jid)
@@ -229,5 +266,58 @@ class LiveMessageService:
         )
         session.execute(
             statement.on_conflict_do_nothing(constraint="uq_media_files_message_type")
+        )
+        return True
+
+    def _register_parsed_media(
+        self,
+        session: Any,
+        chat_id: int,
+        message: Any,
+        raw_proto: bytes,
+        message_type: str,
+    ) -> bool:
+        """Registra un adjunto detectado por nuestro parser, no por pywhats.
+
+        Mismo destino y mismas garantias que :meth:`_register_media`: fila en
+        ``pending`` y ``ON CONFLICT DO NOTHING`` para no duplicar ni pisar una
+        descarga ya hecha. Lo unico distinto es de donde salen los datos.
+        """
+        from app.message_parser import interpret_message_bytes
+
+        suelto = interpret_message_bytes(raw_proto)
+        if suelto is None or suelto.media is None:
+            return False
+
+        message_id = session.execute(
+            select(Message.id).where(
+                Message.chat_jid == jid_to_string(message.chat),
+                Message.whatsapp_message_id == message.id,
+            )
+        ).scalar_one_or_none()
+        if message_id is None:
+            return False
+
+        media = suelto.media
+        session.execute(
+            insert(MediaFile)
+            .values(
+                message_id=message_id,
+                chat_id=chat_id,
+                whatsapp_message_id=message.id,
+                media_type=media.media_type,
+                mime_type=media.mime_type,
+                file_name=media.file_name,
+                file_size=media.file_size,
+                duration_seconds=media.duration_seconds,
+                width=media.width,
+                height=media.height,
+                direct_path=media.direct_path,
+                media_key=media.media_key,
+                file_sha256=media.file_sha256,
+                file_enc_sha256=media.file_enc_sha256,
+                download_status="pending",
+            )
+            .on_conflict_do_nothing(constraint="uq_media_files_message_type")
         )
         return True

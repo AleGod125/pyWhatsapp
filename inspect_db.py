@@ -6,6 +6,10 @@
 
 Nunca imprime contenido de mensajes, raw_proto, claves ni material
 criptografico: solo formas, tipos y conteos.
+
+HERRAMIENTA DE DIAGNOSTICO (seccion 35). El mantenimiento normal lo hace
+``main.py`` solo, a traves de ``MaintenanceService``. Esto se ejecuta a mano
+cuando hace falta mirar por dentro; el uso corriente no lo necesita.
 """
 
 from __future__ import annotations

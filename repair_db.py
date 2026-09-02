@@ -11,6 +11,11 @@ Principios (secciones 1, 38 y 39 del encargo):
   mensaje real.
 * Todo ocurre en una transaccion, con conteos antes y despues.
 * ``raw_proto`` no se modifica jamas: es la referencia para diagnosticar.
+
+HERRAMIENTA DESTRUCTIVA, EXPLICITA Y A MANO (seccion 16). NUNCA la ejecuta
+``main.py`` ni el mantenimiento automatico; hay una prueba que lo verifica.
+La reconciliacion segura (contadores, cursores, previas, alias, estado de
+multimedia) es otra cosa y esa si corre sola: ver ``MaintenanceService``.
 """
 
 from __future__ import annotations

@@ -165,10 +165,17 @@ class Settings:
     # --- History on-demand ---
     history_on_demand_count: int
     history_request_timeout: float
+    history_settle_seconds: float
     max_on_demand_concurrency: int
 
     # --- Multimedia ---
     media_download_concurrency: int
+    # Cada cuanto revisa el worker permanente si hay adjuntos nuevos.
+    media_worker_interval: float
+
+    # --- Mantenimiento automatico ---
+    # Periodo de la reconciliacion en segundo plano. 0 la desactiva.
+    maintenance_interval_seconds: float
 
     # --- Interfaz ---
     gui_enabled: bool
@@ -306,8 +313,13 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         backfill_all_after_canary=_bool("BACKFILL_ALL_AFTER_CANARY", True),
         history_on_demand_count=_history_count(),
         history_request_timeout=_float("HISTORY_REQUEST_TIMEOUT", 45.0, minimum=1.0),
+        history_settle_seconds=_float("HISTORY_SETTLE_SECONDS", 8.0, minimum=1.0),
         max_on_demand_concurrency=_int("MAX_ON_DEMAND_CONCURRENCY", 1, minimum=1),
         media_download_concurrency=_int("MEDIA_DOWNLOAD_CONCURRENCY", 2, minimum=1),
+        media_worker_interval=_float("MEDIA_WORKER_INTERVAL", 20.0, minimum=5.0),
+        maintenance_interval_seconds=_float(
+            "MAINTENANCE_INTERVAL_SECONDS", 900.0, minimum=0.0
+        ),
         gui_enabled=_bool("GUI_ENABLED", True),
         terminal_progress_enabled=_bool("TERMINAL_PROGRESS_ENABLED", True),
         compat_wa_version=_bool("COMPAT_WA_VERSION", True),

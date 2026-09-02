@@ -59,20 +59,14 @@ def test_con_sesion_no_se_pide_qr(tmp_path, settings):
 
 
 @pytest.fixture(scope="module")
-def app(database):
-    """Una sola ventana para todo el modulo (ver test_gui_geometry)."""
-    from app.gui import App
+def app(tk_app):
+    """La ventana compartida de la suite (ver ``tk_app`` en conftest).
 
-    try:
-        instance = App(queue.Queue())
-    except tk.TclError as exc:  # pragma: no cover - entorno sin display
-        pytest.skip(f"sin display disponible: {exc}")
-    instance.attach_viewer(database.session)
-    yield instance
-    try:
-        instance.root.destroy()
-    except tk.TclError:
-        pass
+    Antes cada modulo creaba y destruia su propio ``Tk()``, y encadenar varios
+    interpretes Tcl en un mismo proceso hacia que en Windows fallaran de forma
+    intermitente con "Can't find a usable init.tcl".
+    """
+    return tk_app
 
 
 def test_cambiar_de_vista_no_abre_ventanas(app):

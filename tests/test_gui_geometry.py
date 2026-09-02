@@ -22,26 +22,16 @@ tk = pytest.importorskip("tkinter")
 PAYLOAD = "2@" + "A" * 120 + "," + "B" * 40 + "," + "C" * 40 + "," + "D" * 32
 
 
-@pytest.fixture(scope="module")
-def app():
-    """Un unico ``Tk()`` para todo el modulo.
+@pytest.fixture
+def app(tk_app):
+    """La ventana compartida de la suite (ver ``tk_app`` en conftest).
 
     Crear y destruir varios interpretes Tcl seguidos en el mismo proceso falla
     de forma intermitente ("tk wasn't installed properly"). Como la aplicacion
     real tampoco abre mas de una ventana, compartir el root es ademas lo fiel
     al comportamiento que se quiere probar.
     """
-    from app.gui import App
-
-    try:
-        instance = App(queue.Queue())
-    except tk.TclError as exc:  # pragma: no cover - entorno sin display
-        pytest.skip(f"sin display disponible: {exc}")
-    yield instance
-    try:
-        instance.root.destroy()
-    except tk.TclError:
-        pass
+    return tk_app
 
 
 def _settle(app) -> None:
