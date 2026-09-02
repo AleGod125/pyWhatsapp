@@ -1,0 +1,43 @@
+# --- Entorno / dependencias ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Configuracion con secretos ---
+.env
+.env.local
+*.env
+!.env.example
+
+# --- Estado del companion / protocolo (NUNCA versionar) ---
+session/
+*.signal.db
+*.signal.db-wal
+*.signal.db-shm
+device.json
+device.json.*
+
+# --- Datos de la aplicacion ---
+data/
+!data/.gitkeep
+
+# --- Diagnostico (puede contener metadata sensible) ---
+diagnostics/
+!diagnostics/.gitkeep
+
+# --- Dumps de base de datos ---
+*.sql
+*.dump
+*.backup
+
+# --- Sistema operativo / editores ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

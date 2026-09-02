@@ -1,0 +1,168 @@
+// Descriptores que pywhats 0.2.0 NO define y que este proyecto necesita.
+//
+// pywhats menciona "WebMessageInfo" solo en comentarios: no existe como
+// protobuf en ninguna parte del paquete. Por eso declara
+// HistorySyncMsg.message como `bytes`. Esos bytes son un WebMessageInfo
+// serializado, y sin este descriptor no hay forma de normalizarlo.
+//
+// PROCEDENCIA DE LOS NUMEROS DE CAMPO
+// Tomados de la definicion publica de whatsmeow (consulta permitida como
+// referencia tecnica del protocolo):
+//   proto/waWeb/WAWebProtobufsWeb.proto   -> WebMessageInfo
+//   proto/waCommon/WACommon.proto         -> MessageKey
+// No hay ni un numero inventado. Se incluye solo el subconjunto que la
+// aplicacion usa de verdad; los campos ausentes siguen viajando en
+// messages.raw_proto, que conserva los bytes originales intactos.
+//
+// Regenerar tras cualquier cambio:
+//   python -m grpc_tools.protoc -I app/proto --python_out=app/proto \
+//          app/proto/whatsapp_backup.proto
+
+syntax = "proto2";
+
+package whatsapp_backup;
+
+// WACommon.MessageKey. Identifica un mensaje dentro de un chat.
+// El campo `ID` es el identificador REAL de WhatsApp: el unico valido como
+// ancla para HISTORY_SYNC_ON_DEMAND.
+message MessageKey {
+  optional string remoteJID = 1;
+  optional bool fromMe = 2;
+  optional string ID = 3;
+  optional string participant = 4;
+}
+
+// WAWeb.WebMessageInfo, recortado a lo que se normaliza.
+//
+// `message` se declara como bytes a proposito: en el formato de cable un
+// campo de mensaje embebido y uno de bytes son identicos (ambos
+// length-delimited), asi que estos bytes se reparsean despues con el
+// `Message` de pywhats, que si existe y esta mantenido por el paquete. Asi se
+// evita duplicar aqui todo el arbol de tipos E2E.
+message WebMessageInfo {
+  required MessageKey key = 1;
+  optional bytes message = 2;
+  optional uint64 messageTimestamp = 3;
+  optional int32 status = 4;
+  optional string participant = 5;
+  optional uint64 messageC2STimestamp = 6;
+
+  optional bool ignore = 16;
+  optional bool starred = 17;
+  optional bool broadcast = 18;
+  optional string pushName = 19;
+  optional bytes mediaCiphertextSHA256 = 20;
+  optional bool multicast = 21;
+
+  // Mensajes de sistema (altas y bajas de grupo, cambios de numero, llamadas
+  // perdidas...). No son texto, pero forman parte de la conversacion y no se
+  // descartan.
+  optional int32 messageStubType = 24;
+  repeated string messageStubParameters = 26;
+
+  optional uint32 duration = 27;
+  repeated string labels = 28;
+
+  optional uint64 ephemeralStartTimestamp = 32;
+  optional uint32 ephemeralDuration = 33;
+
+  optional string verifiedBizName = 37;
+}
+
+// ---------------------------------------------------------------------------
+// HISTORY_SYNC_ON_DEMAND
+//
+// pywhats tiene el VALOR del enum (ProtocolMessage.Type
+// PEER_DATA_OPERATION_REQUEST_MESSAGE = 16) pero NO el campo que lo transporta,
+// asi que con su descriptor es imposible emitir la peticion.
+//
+// Numeros tomados de whatsmeow proto/waE2E/WAWebProtobufsE2E.proto:
+//   ProtocolMessage.peerDataOperationRequestMessage = 16
+//   Message.protocolMessage                         = 12
+//   PeerDataOperationRequestMessage.peerDataOperationRequestType = 1
+//   PeerDataOperationRequestMessage.historySyncOnDemandRequest   = 4
+//   PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND          = 3
+//
+// Los mensajes de abajo son SUBCONJUNTOS de los reales. En el formato de cable
+// eso es equivalente: los campos que no se declaran simplemente no se emiten.
+// ---------------------------------------------------------------------------
+
+enum PeerDataOperationRequestType {
+  UPLOAD_STICKER = 0;
+  SEND_RECENT_STICKER_BOOTSTRAP = 1;
+  GENERATE_LINK_PREVIEW = 2;
+  HISTORY_SYNC_ON_DEMAND = 3;
+  PLACEHOLDER_MESSAGE_RESEND = 4;
+}
+
+// La peticion en si. El chat objetivo viaja DENTRO; el destinatario del
+// mensaje es nuestro propio telefono principal, no el contacto.
+message HistorySyncOnDemandRequest {
+  optional string chatJID = 1;
+  // Ancla: un ID REAL de WhatsApp. Un identificador sintetico produce un ACK
+  // y luego silencio, que es el bug historico que documenta el brief.
+  optional string oldestMsgID = 2;
+  optional bool oldestMsgFromMe = 3;
+  optional int32 onDemandMsgCount = 4;
+  // OJO: en MILISEGUNDOS. En la base se guardan segundos.
+  optional int64 oldestMsgTimestampMS = 5;
+  optional string accountLid = 6;
+  optional bool supportInlineResponse = 7;
+}
+
+message PeerDataOperationRequestMessage {
+  optional PeerDataOperationRequestType peerDataOperationRequestType = 1;
+  optional HistorySyncOnDemandRequest historySyncOnDemandRequest = 4;
+}
+
+// Subconjunto de ProtocolMessage con el campo que a pywhats le falta.
+message OnDemandProtocolMessage {
+  optional int32 type = 2;  // PEER_DATA_OPERATION_REQUEST_MESSAGE = 16
+  optional PeerDataOperationRequestMessage peerDataOperationRequestMessage = 16;
+}
+
+// Subconjunto de Message. Se serializa y se reparsea con el Message de
+// pywhats: protobuf conserva los campos desconocidos al reserializar, asi que
+// el campo 16 sobrevive intacto sin tocar el paquete.
+message OnDemandMessage {
+  optional OnDemandProtocolMessage protocolMessage = 12;
+}
+
+// ---------------------------------------------------------------------------
+// Campos de la RESPUESTA que pywhats 0.2.0 no modela.
+//
+// Su HistorySyncNotification llega solo hasta el campo 8. Faltan, entre otros,
+// el 12, que es el que permite correlacionar una respuesta con la peticion que
+// la provoco en vez de adivinar por JID de chat.
+//
+// Numeros de whatsmeow:
+//   waE2E: HistorySyncNotification.originalMessageID        =  8
+//                                  peerDataRequestSessionID = 12
+//   waHistorySync: Conversation.endOfHistoryTransfer        =  8
+//                               endOfHistoryTransferType    = 11
+//
+// Nota: el campo 10 se llama oldestMsgInChunkTimestampSec -- "Sec". Es
+// corroboracion independiente de que en este area WhatsApp cuenta en SEGUNDOS,
+// igual que el ancla que enviamos.
+// ---------------------------------------------------------------------------
+
+message OnDemandNotification {
+  optional string originalMessageID = 8;
+  optional int64 oldestMsgInChunkTimestampSec = 10;
+  optional string peerDataRequestSessionID = 12;
+}
+
+// Marca el final del historial de una conversacion.
+// COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY (0) NO significa terminar:
+// quedan mensajes en el telefono y hay que seguir pidiendo.
+enum EndOfHistoryTransferType {
+  COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY = 0;
+  COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY = 1;
+  COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY = 2;
+  COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS = 3;
+}
+
+message ConversationEndMarker {
+  optional bool endOfHistoryTransfer = 8;
+  optional EndOfHistoryTransferType endOfHistoryTransferType = 11;
+}

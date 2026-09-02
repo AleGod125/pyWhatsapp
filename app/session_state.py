@@ -1,0 +1,174 @@
+"""Estado de la sesion: unica autoridad sobre lo que la GUI puede mostrar.
+
+REGLA (seccion 1 del encargo): que existan ``session/device.json`` y filas en
+PostgreSQL NO significa que la sesion sea valida. Solo lo es cuando el
+servidor acepta el login.
+
+Por que hace falta una senal explicita
+-------------------------------------
+pywhats emite ``connected`` en cuanto termina el handshake Noise, ANTES de
+que el servidor conteste. Si la sesion esta revocada, la secuencia real es::
+
+    connected                       <- pywhats, optimista
+    receiver: server <failure> reason=401 -- login rejected
+    logged_out 401
+
+Por eso ``connected`` no puede abrir el visor: es provisional. La confirmacion
+de verdad es el ``<success>`` que procesa ``SessionActivator.on_success`` (el
+servidor no lo envia si rechaza el login), y el rechazo es ``logged_out``.
+
+Los datos locales NUNCA se borran al invalidarse una sesion: PostgreSQL es el
+backup y sobrevive a la desvinculacion (seccion 5).
+"""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable
+
+from app.logging_setup import get_logger
+
+log = get_logger("WA")
+
+
+class AppState(str, Enum):
+    """Estados explicitos de la aplicacion."""
+
+    STARTING = "STARTING"
+    CHECKING_SESSION = "CHECKING_SESSION"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    SESSION_INVALID = "SESSION_INVALID"
+    PAIRING_REQUIRED = "PAIRING_REQUIRED"
+    DISCONNECTED = "DISCONNECTED"
+    ERROR = "ERROR"
+
+
+# Estados en los que se puede mostrar el visor de conversaciones.
+VIEWER_ALLOWED = frozenset({AppState.CONNECTED})
+
+# Estados terminales de una sesion que ya no sirve.
+SESSION_DEAD = frozenset({AppState.SESSION_INVALID, AppState.PAIRING_REQUIRED})
+
+
+@dataclass(frozen=True)
+class StateChange:
+    previous: AppState
+    current: AppState
+    generation: int
+    reason: str | None = None
+
+
+class SessionState:
+    """Maquina de estados con generacion, para descartar eventos tardios.
+
+    Cada vez que la sesion muere o se reinicia, la generacion avanza. Un
+    worker lento que termine despues trae su generacion vieja y su resultado
+    se ignora, en vez de repintar chats sobre una pantalla de "sesion
+    invalida" (seccion 9).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._state = AppState.STARTING
+        self._generation = 0
+        self._listeners: list[Callable[[StateChange], None]] = []
+
+    # -- Consulta ------------------------------------------------------------
+
+    @property
+    def state(self) -> AppState:
+        with self._lock:
+            return self._state
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    @property
+    def viewer_allowed(self) -> bool:
+        """``True`` solo si la sesion esta confirmada por el servidor."""
+        return self.state in VIEWER_ALLOWED
+
+    def is_current(self, generation: int) -> bool:
+        """``False`` si este resultado pertenece a una sesion ya superada."""
+        return generation == self.generation
+
+    # -- Transiciones --------------------------------------------------------
+
+    def on_change(self, listener: Callable[[StateChange], None]) -> None:
+        self._listeners.append(listener)
+
+    def set(self, new_state: AppState, *, reason: str | None = None) -> StateChange:
+        with self._lock:
+            previous = self._state
+            if new_state in SESSION_DEAD and previous not in SESSION_DEAD:
+                # La sesion muere: todo lo que estuviera en vuelo caduca.
+                self._generation += 1
+            self._state = new_state
+            change = StateChange(
+                previous=previous,
+                current=new_state,
+                generation=self._generation,
+                reason=reason,
+            )
+
+        if previous != new_state:
+            log.info(
+                "Estado: %s -> %s%s",
+                previous.value,
+                new_state.value,
+                f" ({reason})" if reason else "",
+            )
+        for listener in list(self._listeners):
+            try:
+                listener(change)
+            except Exception:  # noqa: BLE001 - un listener roto no bloquea el estado
+                log.exception("Un listener de estado fallo")
+        return change
+
+
+# ---------------------------------------------------------------------------
+# Senal de sesion aceptada por el servidor
+# ---------------------------------------------------------------------------
+
+_success_callback: Callable[[], None] | None = None
+_MARKER = "_whatsapp_backup_success_hook"
+
+
+def set_success_callback(callback: Callable[[], None] | None) -> None:
+    global _success_callback
+    _success_callback = callback
+
+
+def install_success_hook() -> bool:
+    """Avisa cuando llega el ``<success>`` del servidor. Idempotente.
+
+    Es la unica confirmacion fiable de que el login fue aceptado: si la
+    sesion esta revocada el servidor manda ``<failure reason="401">`` y este
+    camino no se ejecuta nunca.
+
+    pywhats no expone ese momento como evento, asi que se envuelve
+    ``SessionActivator.on_success``. El comportamiento original se mantiene
+    intacto: solo se anade el aviso.
+    """
+    from pywhats.messaging.activator import SessionActivator
+
+    original = SessionActivator.on_success
+    if getattr(original, _MARKER, False):
+        return True
+
+    async def on_success(self: Any, node: Any) -> None:
+        if _success_callback is not None:
+            try:
+                _success_callback()
+            except Exception:  # noqa: BLE001 - no romper la activacion
+                log.exception("El callback de <success> fallo")
+        await original(self, node)
+
+    setattr(on_success, _MARKER, True)
+    SessionActivator.on_success = on_success  # type: ignore[method-assign]
+    return True

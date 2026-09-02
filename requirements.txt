@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# whatsapp_backup - dependencias
+#
+# Versiones fijadas a lo verificado como funcional en Windows 11 + Python 3.11.9
+# el 2026-09-01. pywhats 0.2.0 es la ultima release publicada en PyPI
+# (2026-07-10); no existe version posterior.
+# ---------------------------------------------------------------------------
+
+# --- Cliente WhatsApp multi-device (protocolo nativo, sin navegador) ---
+# Arrastra: cryptography, protobuf, websockets, qrcode[pil] -> pillow
+pywhats==0.2.0
+
+# --- Persistencia: PostgreSQL ---
+SQLAlchemy==2.0.52
+alembic==1.19.1
+psycopg[binary]==3.3.5
+
+# --- Configuracion ---
+python-dotenv==1.2.3
+
+# --- Interfaz de terminal ---
+rich==15.0.0
+
+# --- QR / imagenes (declarado explicitamente: lo usamos directamente,
+#     no solo como dependencia transitiva de pywhats) ---
+qrcode==8.2
+pillow==12.3.0
+
+# --- Tests ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
