@@ -1,7 +1,7 @@
 """Entorno de Alembic.
 
 La URL de conexion NO vive en alembic.ini: se toma de la misma configuracion
-que usa la aplicacion (``app.config.load_settings``), para que exista una sola
+que usa la aplicacion (``app.core.config.load_settings``), para que exista una sola
 fuente de verdad y para que alembic.ini pueda versionarse sin secretos.
 """
 
@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import load_settings  # noqa: E402
+from app.core.config import load_settings  # noqa: E402
 from app.models import Base  # noqa: E402
 
 config = context.config

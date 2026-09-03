@@ -36,7 +36,7 @@ import asyncio
 import contextlib
 from typing import Any
 
-from app.logging_setup import get_logger
+from app.core.logging_setup import get_logger
 
 log = get_logger("PAIRING")
 

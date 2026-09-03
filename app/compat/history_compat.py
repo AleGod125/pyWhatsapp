@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from app.logging_setup import get_logger
+from app.core.logging_setup import get_logger
 
 log = get_logger("SYNC")
 
@@ -137,7 +137,7 @@ def parse_full(raw: bytes) -> FullHistorySync:
         Se reserializa la conversacion y se reparsea con nuestro descriptor:
         protobuf conserva los campos desconocidos, asi que siguen ahi.
         """
-        from app.proto import ConversationEndMarker
+        from app.models.proto import ConversationEndMarker
 
         marker = ConversationEndMarker()
         try:

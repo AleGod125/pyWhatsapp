@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.logging_setup import get_logger
+from app.core.logging_setup import get_logger
 
 log = get_logger("COMPAT")
 

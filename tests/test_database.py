@@ -10,9 +10,9 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
-from app import repository as repo
+from app.services import repository as repo
 from app.models import Chat, Message
-from app.repository import IncomingMessage
+from app.services.repository import IncomingMessage
 
 CHAT_JID = "34600111222@s.whatsapp.net"
 

@@ -16,8 +16,8 @@ import pytest
 
 tk = pytest.importorskip("tkinter")
 
-from app import repository as repo  # noqa: E402
-from app.repository import IncomingMessage  # noqa: E402
+from app.services import repository as repo  # noqa: E402
+from app.services.repository import IncomingMessage  # noqa: E402
 
 CHAT_JID = "34600999888@s.whatsapp.net"
 
@@ -128,7 +128,7 @@ def big_chat(session):
 
 def test_no_se_cargan_todos_los_mensajes(session, big_chat):
     """Abrir un chat de 1.000 mensajes trae solo una pagina."""
-    from app.chat_view import PAGE_SIZE
+    from app.gui.chat_view import PAGE_SIZE
 
     assert repo.count_messages(session, CHAT_JID) == 1000
     page = repo.get_recent_messages(session, big_chat, limit=PAGE_SIZE)
@@ -139,7 +139,7 @@ def test_no_se_cargan_todos_los_mensajes(session, big_chat):
 
 def test_paginacion_recorre_toda_la_conversacion(session, big_chat):
     """Paginando hacia atras se llega al principio sin repetir ni perder filas."""
-    from app.chat_view import PAGE_SIZE
+    from app.gui.chat_view import PAGE_SIZE
 
     seen: list[int] = []
     page = repo.get_recent_messages(session, big_chat, limit=PAGE_SIZE)
@@ -163,8 +163,8 @@ def test_la_pagina_no_consulta_raw_proto(session, big_chat):
 
 def test_el_prepend_conserva_la_posicion(app, session, big_chat):
     """Al insertar mensajes anteriores, el viewport no debe saltar."""
-    from app.chat_view import PAGE_SIZE
-    from app.repository import ChatSummary
+    from app.gui.chat_view import PAGE_SIZE
+    from app.services.repository import ChatSummary
 
     summary = ChatSummary(
         id=big_chat,
@@ -214,7 +214,7 @@ def test_el_prepend_conserva_la_posicion(app, session, big_chat):
 
 def test_cambiar_de_chat_invalida_la_carga_anterior(app, session, big_chat):
     """Cambiar de chat sube la generacion: una carga en vuelo se descarta."""
-    from app.repository import ChatSummary
+    from app.services.repository import ChatSummary
 
     conversation = app.viewer.conversation
     summary = ChatSummary(

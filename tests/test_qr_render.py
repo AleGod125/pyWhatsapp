@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.qr_render import BORDER_MODULES, MAX_SIZE, MIN_BOX_SIZE, MIN_SIZE, render_qr
+from app.core.qr_render import BORDER_MODULES, MAX_SIZE, MIN_BOX_SIZE, MIN_SIZE, render_qr
 
 # Forma real del payload de pywhats: cuatro campos separados por comas, el
 # ref y tres claves en base64 (ver pairing.encode_qr_payload).

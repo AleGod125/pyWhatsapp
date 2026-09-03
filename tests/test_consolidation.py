@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.message_classifier import (
+from app.core.message_classifier import (
     MessageClass,
     classify_message_bytes,
     is_internal,
@@ -58,7 +58,7 @@ def message_with_image() -> bytes:
 
 def peer_data_operation_request() -> bytes:
     """Exactamente la peticion ON_DEMAND que emitimos nosotros."""
-    from app.backfill_service import build_on_demand_message
+    from app.services.backfill_service import build_on_demand_message
 
     message = build_on_demand_message(
         chat_jid="34600111222@s.whatsapp.net",
@@ -168,7 +168,7 @@ def test_el_contexto_no_anula_el_contenido():
 
 
 def test_A_pn_y_lid_propios_se_reconocen(settings, database):
-    from app.backfill_service import BackfillService
+    from app.services.backfill_service import BackfillService
 
     service = BackfillService(settings, database)
     service.set_own_identity("573002389304@s.whatsapp.net", "86531142340710@lid")
@@ -181,7 +181,7 @@ def test_A_pn_y_lid_propios_se_reconocen(settings, database):
 
 def test_G_el_canary_nunca_elige_el_chat_propio(settings, database):
     """El ultimo canary eligio nuestra cuenta y acabo en ACK + timeout."""
-    from app.backfill_service import BackfillService
+    from app.services.backfill_service import BackfillService
 
     service = BackfillService(settings, database)
     service.set_own_identity("573002389304@s.whatsapp.net", "86531142340710@lid")
@@ -202,8 +202,8 @@ def test_G_el_canary_nunca_elige_el_chat_propio(settings, database):
 
 def test_H_filas_desordenadas_se_ordenan(session):
     """Insertadas en desorden, deben leerse cronologicamente."""
-    from app import repository as repo
-    from app.repository import IncomingMessage
+    from app.services import repository as repo
+    from app.services.repository import IncomingMessage
 
     jid = "34600777888@s.whatsapp.net"
     chat_id = repo.upsert_chat(session, jid=jid, chat_type="individual")
@@ -236,8 +236,8 @@ def test_H_filas_desordenadas_se_ordenan(session):
 
 
 def test_M_mismo_timestamp_orden_estable_por_id(session):
-    from app import repository as repo
-    from app.repository import IncomingMessage
+    from app.services import repository as repo
+    from app.services.repository import IncomingMessage
 
     jid = "34600777999@s.whatsapp.net"
     chat_id = repo.upsert_chat(session, jid=jid, chat_type="individual")
@@ -266,8 +266,8 @@ def test_I_separadores_en_orden_al_insertar_arriba(session):
     Se comprueba sobre el modelo de datos, que es lo que decide el orden:
     la pagina anterior debe ser INTEGRAMENTE mas antigua que la actual.
     """
-    from app import repository as repo
-    from app.repository import IncomingMessage
+    from app.services import repository as repo
+    from app.services.repository import IncomingMessage
 
     jid = "34600777000@s.whatsapp.net"
     chat_id = repo.upsert_chat(session, jid=jid, chat_type="individual")
@@ -302,8 +302,8 @@ def test_I_separadores_en_orden_al_insertar_arriba(session):
 
 
 def test_K_L_paginacion_completa_sin_duplicados(session):
-    from app import repository as repo
-    from app.repository import IncomingMessage
+    from app.services import repository as repo
+    from app.services.repository import IncomingMessage
 
     jid = "34600666000@s.whatsapp.net"
     chat_id = repo.upsert_chat(session, jid=jid, chat_type="individual")
@@ -348,6 +348,6 @@ def test_K_L_paginacion_completa_sin_duplicados(session):
     ],
 )
 def test_Q_R_fin_de_historial(end_type, queda_mas):
-    from app.backfill_service import _MORE_REMAINS
+    from app.services.backfill_service import _MORE_REMAINS
 
     assert (end_type in _MORE_REMAINS) is queda_mas

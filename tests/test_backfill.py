@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.backfill_service import (
+from app.services.backfill_service import (
     PEER_DATA_OPERATION_REQUEST_MESSAGE,
     build_on_demand_message,
 )
@@ -21,7 +21,7 @@ CURSOR = "3EB0C767D82B1B4459F1"
 
 def _decode(message):
     """Reparsea con NUESTRO descriptor lo que produjo el de pywhats."""
-    from app.proto import OnDemandMessage
+    from app.models.proto import OnDemandMessage
 
     decoded = OnDemandMessage()
     decoded.ParseFromString(message.SerializeToString())
@@ -116,7 +116,7 @@ def test_el_ancla_nunca_es_sintetica():
     El cursor lo elige ``get_oldest_valid_history_cursor``, que ya los filtra;
     esto documenta la invariante desde el lado del emisor.
     """
-    from app.repository import is_valid_history_cursor_id
+    from app.services.repository import is_valid_history_cursor_id
 
     assert is_valid_history_cursor_id(CURSOR)
     assert not is_valid_history_cursor_id("opaque-deadbeef")
@@ -130,7 +130,7 @@ def test_el_ancla_nunca_es_sintetica():
 @pytest.mark.asyncio
 async def test_la_respuesta_despierta_a_su_chat(settings, database):
     """Un History Sync que contiene el chat esperado debe desbloquear la espera."""
-    from app.backfill_service import BackfillService, _Pending
+    from app.services.backfill_service import BackfillService, _Pending
     from app.compat.history_compat import FullHistorySync, HistoryConversation
 
     service = BackfillService(settings, database)
@@ -158,7 +158,7 @@ async def test_la_respuesta_despierta_a_su_chat(settings, database):
 @pytest.mark.asyncio
 async def test_otro_chat_no_despierta_la_espera(settings, database):
     """Un blob de otra conversacion no debe darse por respuesta nuestra."""
-    from app.backfill_service import BackfillService, _Pending
+    from app.services.backfill_service import BackfillService, _Pending
     from app.compat.history_compat import FullHistorySync, HistoryConversation
 
     service = BackfillService(settings, database)

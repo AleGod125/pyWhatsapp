@@ -34,7 +34,7 @@ from __future__ import annotations
 import contextlib
 from typing import Any, Iterator
 
-from app.logging_setup import get_logger
+from app.core.logging_setup import get_logger
 
 log = get_logger("COMPAT")
 

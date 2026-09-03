@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-backup-web-bootstrap",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Obtiene UNA clave de mensaje real para un chat sin ancla. No guarda historial.",
+  "type": "commonjs",
+  "main": "seed.js",
+  "scripts": {
+    "seed": "node seed.js"
+  },
+  "dependencies": {
+    "baileys": "^6.7.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

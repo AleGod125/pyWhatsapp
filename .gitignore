@@ -21,6 +21,8 @@ session/
 *.signal.db-shm
 device.json
 device.json.*
+# Cerrojo de proceso: quien tiene abierta la sesion de WhatsApp.
+runtime.lock
 
 # --- Datos de la aplicacion ---
 data/
@@ -41,3 +43,12 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+backups/
+
+# Plan D: proveedor de semillas auxiliar. Las dependencias se instalan con
+# `npm install` dentro de web_bootstrap/, y la sesion auxiliar es una
+# vinculacion mas de la cuenta: ninguna de las dos cosas va al repositorio.
+web_bootstrap/node_modules/
+web_bootstrap/package-lock.json
+session/web_bootstrap/
+session/backups/

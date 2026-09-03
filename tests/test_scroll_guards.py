@@ -14,8 +14,8 @@ import pytest
 
 tk = pytest.importorskip("tkinter")
 
-from app import repository as repo  # noqa: E402
-from app.repository import ChatSummary, IncomingMessage  # noqa: E402
+from app.services import repository as repo  # noqa: E402
+from app.services.repository import ChatSummary, IncomingMessage  # noqa: E402
 
 CHAT_JID = "34600444333@s.whatsapp.net"
 TOTAL = 452
@@ -34,7 +34,7 @@ def app(tk_app):
 
 @pytest.fixture
 def conversation(app, session):
-    from app.chat_view import PAGE_SIZE
+    from app.gui.chat_view import PAGE_SIZE
 
     chat_id = repo.upsert_chat(session, jid=CHAT_JID, chat_type="individual")
     repo.bulk_upsert_messages(
@@ -119,7 +119,7 @@ def test_el_cooldown_frena_los_disparos_seguidos(app, conversation, monkeypatch)
 def test_scroll_y_boton_comparten_funcion():
     import inspect
 
-    from app.chat_view import ConversationPanel
+    from app.gui.chat_view import ConversationPanel
 
     assert "load_previous_page" in inspect.getsource(ConversationPanel._maybe_prefetch)
 

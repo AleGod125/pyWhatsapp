@@ -21,8 +21,8 @@ import pytest
 
 tk = pytest.importorskip("tkinter")
 
-from app import repository as repo  # noqa: E402
-from app.repository import ChatSummary, IncomingMessage  # noqa: E402
+from app.services import repository as repo  # noqa: E402
+from app.services.repository import ChatSummary, IncomingMessage  # noqa: E402
 
 CHAT_JID = "34600777888@s.whatsapp.net"
 TOTAL = 452
@@ -95,7 +95,7 @@ class _SesionCompartida:
 
 
 def _abrir(app, session, chat_id, total=TOTAL):
-    from app.chat_view import PAGE_SIZE
+    from app.gui.chat_view import PAGE_SIZE
 
     panel = app.viewer.conversation
     panel.bind_loader(
@@ -202,7 +202,7 @@ def test_el_prepend_conserva_la_posicion_visual(
     corresponder a una sola insercion. Que haga eso es lo correcto; solo
     estorba a esta medida concreta.
     """
-    import app.chat_view as chat_view
+    import app.gui.chat_view as chat_view
 
     monkeypatch.setattr(chat_view, "AUTO_PREFETCH", False)
     panel = _abrir(app, session, chat_largo)
@@ -238,7 +238,7 @@ def test_el_prepend_conserva_la_posicion_visual(
 
 
 def test_llamada_perdida_se_clasifica_desde_el_stub():
-    from app.system_message import CALL_KINDS, SystemMessageClassifier
+    from app.core.system_message import CALL_KINDS, SystemMessageClassifier
 
     clasificador = SystemMessageClassifier()
 
@@ -256,7 +256,7 @@ def test_llamada_perdida_se_clasifica_desde_el_stub():
 
 def test_stub_desconocido_no_se_inventa():
     """Lo que no se sabe se dice que no se sabe, conservando el numero."""
-    from app.system_message import SystemMessageClassifier
+    from app.core.system_message import SystemMessageClassifier
 
     evento = SystemMessageClassifier().classify_stub(9999)
     assert evento.known is False
@@ -266,7 +266,7 @@ def test_stub_desconocido_no_se_inventa():
 
 def test_los_stubs_verificados_salen_de_datos_reales():
     """Los marcados VERIFICADO se comprobaron contra este backup."""
-    from app.system_message import STUB_TYPES
+    from app.core.system_message import STUB_TYPES
 
     for numero in (1, 24, 27, 28, 39, 72, 75):
         assert STUB_TYPES[numero].verified is True, (
@@ -276,7 +276,7 @@ def test_los_stubs_verificados_salen_de_datos_reales():
 
 def test_el_protocolo_interno_sigue_oculto():
     """Un PeerDataOperation nuestro NO es un mensaje del chat (seccion 6)."""
-    from app.message_classifier import (
+    from app.core.message_classifier import (
         MessageClass,
         classify_message_bytes,
         is_internal,
@@ -291,7 +291,7 @@ def test_el_protocolo_interno_sigue_oculto():
 
 
 def test_un_evento_de_sistema_visible_no_se_descarta():
-    from app.message_classifier import MessageClass, classify_parsed, is_visible
+    from app.core.message_classifier import MessageClass, classify_parsed, is_visible
 
     @dataclass
     class Falso:
@@ -304,7 +304,7 @@ def test_un_evento_de_sistema_visible_no_se_descarta():
 
 def test_el_evento_de_llamada_se_lee_del_call_log():
     """``callLogMesssage`` con outcome MISSED e isVideo."""
-    from app.system_message import classify_call_log
+    from app.core.system_message import classify_call_log
 
     # isVideo=1 (campo 1), callOutcome=1 MISSED (campo 2), durationSecs=18.
     payload = bytes([0x08, 0x01, 0x10, 0x01, 0x18, 18])
@@ -335,13 +335,13 @@ def test_el_evento_de_llamada_se_lee_del_call_log():
     ],
 )
 def test_previa_por_tipo_de_media(tipo, esperado):
-    from app.previews import preview_for
+    from app.core.previews import preview_for
 
     assert preview_for(tipo, None) == esperado
 
 
 def test_la_previa_nunca_dice_unknown_para_un_tipo_conocido():
-    from app.previews import preview_for
+    from app.core.previews import preview_for
 
     for tipo in ("image", "video", "audio", "sticker", "document", "poll"):
         previa = preview_for(tipo, None)
@@ -350,13 +350,13 @@ def test_la_previa_nunca_dice_unknown_para_un_tipo_conocido():
 
 
 def test_el_texto_manda_sobre_la_etiqueta_de_tipo():
-    from app.previews import preview_for
+    from app.core.previews import preview_for
 
     assert preview_for("image", "mira esta foto") == "mira esta foto"
 
 
 def test_la_previa_de_un_evento_de_sistema_dice_que_paso():
-    from app.previews import preview_for
+    from app.core.previews import preview_for
 
     previa = preview_for("system", None, metadata={"stub_type": 40})
     assert "Llamada perdida" in previa
@@ -479,7 +479,7 @@ def test_documento_descargado_muestra_nombre_y_tamano(app, tmp_path):
 def test_imagen_descargada_genera_miniatura_cacheada(app, tmp_path):
     """Se crea el archivo derivado y NO se vuelve a generar (seccion 37)."""
     Image = pytest.importorskip("PIL.Image")
-    from app.thumbnails import ensure_thumbnail, thumbnail_path
+    from app.services.thumbnails import ensure_thumbnail, thumbnail_path
 
     original = tmp_path / "foto.jpg"
     Image.new("RGB", (1200, 900), "#336699").save(original)
@@ -542,7 +542,7 @@ def test_la_imagen_se_situa_respecto_al_contenido_no_a_su_burbuja(app, tmp_path)
 
 def test_la_miniatura_se_regenera_si_cambia_el_original(tmp_path):
     Image = pytest.importorskip("PIL.Image")
-    from app.thumbnails import cache_key
+    from app.services.thumbnails import cache_key
 
     original = tmp_path / "foto.jpg"
     Image.new("RGB", (400, 400), "#111111").save(original)
@@ -573,7 +573,7 @@ def test_historial_confirmado_no_espera_bootstrap():
     import asyncio
     import time
 
-    from app.history_gate import InitialHistoryGate
+    from app.services.history_gate import InitialHistoryGate
 
     gate = InitialHistoryGate(settle_seconds=1.0, max_wait=180.0, already_confirmed=True)
     comenzo = time.monotonic()
@@ -586,7 +586,7 @@ def test_pairing_nuevo_si_vuelve_a_esperar():
     import asyncio
     import time
 
-    from app.history_gate import InitialHistoryGate
+    from app.services.history_gate import InitialHistoryGate
 
     gate = InitialHistoryGate(settle_seconds=0.2, max_wait=2.0)
     comenzo = time.monotonic()
@@ -594,23 +594,39 @@ def test_pairing_nuevo_si_vuelve_a_esperar():
     assert time.monotonic() - comenzo >= 1.5, "debe agotar su plazo esperando"
 
 
-def test_la_confirmacion_va_por_huella_de_sesion(database):
-    """Una huella distinta (pairing nuevo) NO hereda la confirmacion."""
-    from app.history_gate import confirm_initial_history, initial_history_confirmed
+def test_la_confirmacion_va_por_huella_de_sesion(session):
+    """Una huella distinta (pairing nuevo) NO hereda la confirmacion.
 
-    original = initial_history_confirmed(database, "huella-de-prueba-a")
-    try:
-        confirm_initial_history(database, "huella-de-prueba-a", chunks=3)
-        assert initial_history_confirmed(database, "huella-de-prueba-a") is True
-        assert initial_history_confirmed(database, "huella-de-prueba-b") is False
-        assert initial_history_confirmed(database, None) is False
-    finally:
-        if not original:
-            from app import repository as repo_mod
-            from app.history_gate import INITIAL_HISTORY_KEY
+    Usa la sesion transaccional del test, no la base directamente. La version
+    anterior llamaba a ``confirm_initial_history(database, ...)``, que hace
+    COMMIT de verdad: escribia en la base de produccion y luego "limpiaba"
+    dejando la clave a NULL. Se encontro esa fila fantasma en una auditoria.
+    Una prueba no puede escribir fuera de su transaccion.
+    """
+    from contextlib import contextmanager
 
-            with database.transaction() as sesion:
-                repo_mod.set_app_state(sesion, INITIAL_HISTORY_KEY, None)
+    from app.services.history_gate import confirm_initial_history, initial_history_confirmed
+
+    class BaseDeLaPrueba:
+        """Expone ``transaction()`` sobre la sesion que se revierte al final."""
+
+        def __init__(self, sesion) -> None:
+            self._sesion = sesion
+
+        def transaction(self):
+            @contextmanager
+            def scope():
+                yield self._sesion
+                self._sesion.flush()
+
+            return scope()
+
+    base = BaseDeLaPrueba(session)
+
+    confirm_initial_history(base, "huella-de-prueba-a", chunks=3)
+    assert initial_history_confirmed(base, "huella-de-prueba-a") is True
+    assert initial_history_confirmed(base, "huella-de-prueba-b") is False
+    assert initial_history_confirmed(base, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +635,7 @@ def test_la_confirmacion_va_por_huella_de_sesion(database):
 
 
 def test_el_mantenimiento_es_idempotente(database, settings):
-    from app.maintenance_service import MaintenanceService
+    from app.services.maintenance_service import MaintenanceService
 
     servicio = MaintenanceService(database, settings)
     servicio.run_all()
@@ -633,7 +649,12 @@ def test_el_mantenimiento_es_idempotente(database, settings):
 
 def test_el_mantenimiento_no_es_destructivo():
     """No hay ni un DELETE en el modulo. Es la garantia de la seccion 16."""
-    fuente = Path("app/maintenance_service.py").read_text(encoding="utf-8")
+    import app.services.maintenance_service as modulo
+
+    # La ruta se pregunta al propio modulo en vez de escribirla a mano: asi
+    # reorganizar el paquete no convierte esta garantia en un test que pasa
+    # porque ya no encuentra el archivo.
+    fuente = Path(modulo.__file__).read_text(encoding="utf-8")
     cuerpo = "\n".join(
         linea for linea in fuente.splitlines()
         if not linea.strip().startswith("#")
@@ -642,6 +663,36 @@ def test_el_mantenimiento_no_es_destructivo():
         assert prohibido not in cuerpo, (
             f"el mantenimiento automatico no puede contener {prohibido!r}"
         )
+
+
+@dataclass
+class _Fuente:
+    nombre: str
+    texto: str
+
+
+def _fuentes_del_arranque_automatico() -> list[_Fuente]:
+    """Los archivos que SI corren solos al arrancar.
+
+    Se localizan por modulo, no por ruta escrita a mano: reorganizar el
+    paquete no puede convertir esta garantia en un test que pasa porque ya no
+    encuentra el archivo.
+    """
+    import app.core.orchestrator as orquestador
+    import app.services.maintenance_service as mantenimiento
+
+    fuentes = [
+        _Fuente("main.py", Path("main.py").read_text(encoding="utf-8")),
+        _Fuente(
+            "maintenance_service",
+            Path(mantenimiento.__file__).read_text(encoding="utf-8"),
+        ),
+    ]
+    for modulo in (orquestador,):
+        fuentes.append(
+            _Fuente(modulo.__name__, Path(modulo.__file__).read_text(encoding="utf-8"))
+        )
+    return fuentes
 
 
 def test_repair_db_no_se_ejecuta_automaticamente():
@@ -657,15 +708,15 @@ def test_repair_db_no_se_ejecuta_automaticamente():
         "repair_db.main",
         "repair_db.apply",
     )
-    for archivo in ("main.py", "app/orchestrator.py", "app/maintenance_service.py"):
-        fuente = Path(archivo).read_text(encoding="utf-8")
+    for fuente in _fuentes_del_arranque_automatico():
         for invocacion in invocaciones:
-            assert invocacion not in fuente, (
-                f"{archivo} no puede invocar repair_db: es destructivo y va a mano"
+            assert invocacion not in fuente.texto, (
+                f"{fuente.nombre} no puede invocar repair_db: es destructivo "
+                "y va a mano"
             )
         # Y tampoco por subproceso, que seria la puerta de atras.
-        assert "repair_db.py" not in fuente.replace("``repair_db.py``", ""), (
-            f"{archivo} no puede lanzar repair_db.py como subproceso"
+        assert "repair_db.py" not in fuente.texto.replace("``repair_db.py``", ""), (
+            f"{fuente.nombre} no puede lanzar repair_db.py como subproceso"
         )
 
 
@@ -673,7 +724,7 @@ def test_el_mantenimiento_conserva_los_mensajes(database, settings, session):
     """Contar antes y despues: la reconciliacion no puede perder filas."""
     from sqlalchemy import func, select
 
-    from app.maintenance_service import MaintenanceService
+    from app.services.maintenance_service import MaintenanceService
     from app.models import MediaFile, Message
 
     def cuenta(modelo):
@@ -695,7 +746,7 @@ def test_la_gui_nunca_hace_un_select_global_de_mensajes():
     """Ninguna consulta de la GUI puede recorrer la tabla entera."""
     import inspect
 
-    from app import repository
+    from app.services import repository
 
     for nombre in (
         "get_recent_messages",
@@ -713,7 +764,7 @@ def test_la_gui_nunca_hace_un_select_global_de_mensajes():
 def test_la_paginacion_usa_keyset_y_no_offset():
     import inspect
 
-    from app.repository import get_messages_before
+    from app.services.repository import get_messages_before
 
     fuente = inspect.getsource(get_messages_before)
     assert ".offset(" not in fuente, "OFFSET degrada con cientos de miles de filas"
@@ -826,7 +877,7 @@ def test_la_busqueda_no_consulta_en_cada_tecla(app, monkeypatch):
 
 
 def test_la_barra_de_estado_resume_el_trabajo_de_fondo(app):
-    from app.orchestrator import RuntimeStatus
+    from app.core.orchestrator import RuntimeStatus
 
     barra = app.viewer.status_bar
     app.viewer.update_status(
@@ -883,9 +934,9 @@ def test_un_mensaje_nuevo_se_anade_al_final_sin_repintar(app, session, chat_larg
 def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
     """Ambas huellas DEBEN salir iguales o la marca nunca casaria.
 
-    ``main`` la calcula del ``device.json`` antes de conectar, para decidir si
-    hay que esperar el bootstrap; ``BackfillService`` la calcula del
-    dispositivo vivo, y es la que se escribe al confirmarlo. Si divergieran,
+    ``app.core.identity`` la calcula del ``device.json`` antes de conectar,
+    para decidir si hay que esperar el bootstrap; ``BackfillService`` la
+    calcula del dispositivo vivo, y es la que se escribe al confirmarlo. Si divergieran,
     la marca se guardaria bajo una huella y se buscaria bajo otra: la espera de
     180 segundos volveria en cada arranque sin que nada lo delatara.
     """
@@ -895,7 +946,7 @@ def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
     if not settings.session_file.exists():
         pytest.skip("no hay sesion guardada en este equipo")
 
-    from main import session_fingerprint_from_disk
+    from app.core.identity import session_fingerprint
 
     datos = json.loads(settings.session_file.read_text(encoding="utf-8"))
     jid = datos.get("jid") or {}
@@ -907,4 +958,4 @@ def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
     crudo = f"{jid['user']}:{jid.get('server')}:{datos.get('device_id', '')}"
     como_el_backfill = hashlib.sha256(crudo.encode()).hexdigest()[:16]
 
-    assert session_fingerprint_from_disk(settings) == como_el_backfill
+    assert session_fingerprint(settings) == como_el_backfill

@@ -24,9 +24,9 @@ import sys
 import threading
 from typing import Any
 
-from app.config import ConfigError, Settings, load_settings
-from app.database import Database, DatabaseError
-from app.logging_setup import get_logger, setup_logging
+from app.core.config import ConfigError, Settings, load_settings
+from app.core.database import Database, DatabaseError
+from app.core.logging_setup import get_logger, setup_logging
 from app.whatsapp_client import ClientEvent, WhatsAppClient, archive_session, prepare_pywhats
 
 log = get_logger("APP")
@@ -64,21 +64,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def start_database(settings: Settings) -> Database:
-    """Conecta y comprueba que las migraciones estan aplicadas."""
-    database = Database(settings)
-    database.connect()
-
-    revision = database.applied_migration()
-    if revision is None:
-        raise DatabaseError(
-            "no hay ninguna migracion aplicada en esta base de datos.\n"
-            "        Ejecuta:  python -m alembic upgrade head"
-        )
-    log.info("Migraciones verificadas (revision=%s)", revision)
-    return database
-
-
 def stored_summary(database: Database) -> dict[str, int]:
     """Cuantos datos hay ya guardados. Se consulta a PostgreSQL, no a memoria."""
     from sqlalchemy import func, select
@@ -93,22 +78,6 @@ def stored_summary(database: Database) -> dict[str, int]:
         }
 
 
-def own_jid_from_session(session_file: Any) -> str | None:
-    """JID propio del DeviceStore, para marcar el emisor de los mensajes propios."""
-    import json
-
-    if not session_file.exists():
-        return None
-    try:
-        data = json.loads(session_file.read_text(encoding="utf-8"))
-        jid = data.get("jid")
-        if isinstance(jid, dict) and jid.get("user"):
-            return f"{jid['user']}@{jid.get('server', 's.whatsapp.net')}"
-    except (OSError, ValueError):
-        log.debug("No se pudo leer el JID propio del DeviceStore")
-    return None
-
-
 def describe_environment(settings: Settings, summary: dict[str, Any]) -> None:
     version = summary.get("wa_version")
     origin = summary.get("wa_version_origin")
@@ -121,22 +90,22 @@ def describe_environment(settings: Settings, summary: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def wire_gui(
-    app: Any,
-    client: WhatsAppClient,
-    database: Database,
-    settings: Settings,
-    state: Any,
-) -> None:
+def wire_gui(app: Any, runtime: Any) -> None:
     """Conecta eventos y estado con las vistas.
 
-    La regla que gobierna todo esto: el visor NO se abre hasta que el servidor
+    Es lo UNICO especifico de Tkinter que queda aqui. Todo lo demas (base,
+    sesion, ingesta, backfill, multimedia, mantenimiento) lo monta
+    ``AppRuntime``, que es exactamente el mismo que usa ``service.py``.
+
+    La regla que gobierna esto: el visor NO se abre hasta que el servidor
     confirma el login. ``connected`` de pywhats no basta, porque se emite en
     cuanto termina el handshake, antes de que el servidor conteste.
     """
     from app.gui import ACCENT, ERROR, FG, MUTED, WARN
-    from app.session_state import AppState
+    from app.core.session_state import AppState
 
+    settings = runtime.settings
+    state = runtime.state
     pairing = app.pairing
     app.session_state = state
 
@@ -211,7 +180,8 @@ def wire_gui(
     def _teardown_invalid_session(reason: Any) -> None:
         """Cierra el cliente y archiva la sesion. NUNCA toca PostgreSQL."""
         wa_log.info("Cerrando cliente...")
-        client.stop()
+        if runtime.client is not None:
+            runtime.client.stop()
         wa_log.info("Signal Store cerrado")
         archived = archive_session(settings, reason=f"invalid-{reason}")
         if archived is not None:
@@ -306,170 +276,6 @@ def wire_gui(
     app.on("maintenance_done", on_maintenance)
 
 
-def wire_history_ingestion(
-    client: WhatsAppClient,
-    database: Database,
-    own_jid: str | None,
-    signal_db_path: Any,
-) -> None:
-    """Persiste cada History Sync en cuanto llega.
-
-    ``signal_db_path`` se inyecta por parametro a proposito: la version
-    anterior lo tomaba de un ``settings`` que no existia en este ambito y
-    reventaba con NameError JUSTO al persistir, despues de que el blob ya
-    hubiera llegado. Un dato que hace falta aqui dentro se pasa, no se busca
-    en un global.
-
-    El callback corre en el hilo del cliente, NO en el de Tkinter: asi las
-    escrituras en PostgreSQL no congelan la interfaz. Cuando termina, avisa a
-    la GUI por la cola de eventos para que se refresque.
-    """
-    from app.compat import history_compat
-    from app.history_service import ingest_history_sync
-
-    sync_log = get_logger("SYNC")
-
-    def ingest(full: Any) -> None:
-        # Se avisa ANTES de persistir: el backfill solo necesita saber que su
-        # chat aparecio en un blob para dejar de esperar.
-        if _HISTORY_GATE is not None:
-            _HISTORY_GATE.note_history_sync(full.sync_type)
-        if _BACKFILL is not None:
-            _BACKFILL.notify_history(full)
-        try:
-            with database.transaction() as session:
-                result = ingest_history_sync(
-                    session, full, own_jid=own_jid,
-                    signal_db=signal_db_path,
-                )
-        except Exception as exc:  # noqa: BLE001 - el blob ya esta archivado en disco
-            sync_log.exception("Fallo al persistir el History Sync: %s", exc)
-            sync_log.warning(
-                "El blob sigue en data/history/; se puede reintentar con "
-                "'python ingest_blobs.py' sin volver a pedir nada al servidor"
-            )
-            return
-        client._publish("history_ingested", str(result))
-
-    history_compat.set_callback(ingest)
-
-
-# Instancias unicas del backfill, la barrera de historial y el orquestador.
-# Se guardan a nivel de modulo porque los cableados corren en hilos distintos
-# y necesitan la misma referencia.
-_BACKFILL: Any = None
-_HISTORY_GATE: Any = None
-_ORCHESTRATOR: Any = None
-
-
-def session_fingerprint_from_disk(settings: Settings) -> str | None:
-    """Huella de la sesion guardada, ANTES de conectar.
-
-    El backfill la calcula del dispositivo vivo, que aqui todavia no existe.
-    Se deriva de lo mismo (JID y device_id del ``DeviceStore``) para que
-    ambas coincidan: es lo que permite saber, ya en el arranque, si esta
-    sesion necesita esperar el bootstrap o no (seccion 18).
-
-    Ni el JID ni el device_id son material criptografico, y ademas solo se
-    guarda su SHA-256 truncado: nunca se registra el identificador en claro.
-    """
-    import hashlib
-    import json
-
-    if not settings.session_file.exists():
-        return None
-    try:
-        datos = json.loads(settings.session_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    jid = datos.get("jid") or {}
-    if not jid.get("user"):
-        return None
-    crudo = (
-        f"{jid['user']}:{jid.get('server', 's.whatsapp.net')}:"
-        f"{datos.get('device_id', '')}"
-    )
-    return hashlib.sha256(crudo.encode()).hexdigest()[:16]
-
-
-def wire_backfill(
-    client: WhatsAppClient, database: Database, settings: Settings
-) -> Any:
-    """Prepara la recuperacion historica ON_DEMAND y la barrera de historial."""
-    from app.backfill_service import BackfillService
-    from app.history_gate import InitialHistoryGate, initial_history_confirmed
-
-    global _BACKFILL, _HISTORY_GATE
-
-    # Si esta sesion YA recibio su History Sync inicial, no hay nada que
-    # esperar: el servidor no lo reenvia. Antes se agotaban 180 segundos en
-    # cada arranque para acabar escribiendo "sesion ya sincronizada".
-    huella = session_fingerprint_from_disk(settings)
-    ya_confirmado = initial_history_confirmed(database, huella)
-    _HISTORY_GATE = InitialHistoryGate(
-        settle_seconds=settings.history_settle_seconds,
-        already_confirmed=ya_confirmado,
-    )
-    if ya_confirmado:
-        log.info("Historial inicial ya confirmado para esta sesion")
-
-    _BACKFILL = BackfillService(settings, database)
-    # El backfill debe saber quienes somos para no pedirse historial a si mismo.
-    from inspect_db import own_identity
-
-    own_pn, own_lid = own_identity(settings)
-    _BACKFILL.set_own_identity(own_pn, own_lid)
-    log.info("Identidad propia: pn=%s lid=%s", bool(own_pn), bool(own_lid))
-    return _BACKFILL
-
-
-def wire_contacts(client: WhatsAppClient, database: Database) -> Any:
-    """Guarda los nombres que llegan por app-state (agenda del telefono)."""
-    from app.contacts_service import ContactService
-
-    service = ContactService(database)
-    client.sinks["contact"] = service.handle_contact
-    client.sinks["pushname"] = service.handle_pushname
-    return service
-
-
-def wire_live_messages(
-    client: WhatsAppClient, database: Database, own_jid: str | None
-) -> None:
-    """Guarda en PostgreSQL cada mensaje que llega en vivo."""
-    from app.live_service import LiveMessageService
-
-    service = LiveMessageService(database, own_jid=own_jid)
-    client.sinks["message"] = service.handle
-
-
-def wire_orchestrator(
-    client: WhatsAppClient, database: Database, settings: Settings
-) -> Any:
-    """Instala el orquestador como ``post_connect`` del cliente.
-
-    Todo el trabajo posterior a la conexion (identidad, historial, contactos,
-    multimedia, backfill y mantenimiento periodico) vive en un unico sitio con
-    un orden explicito, en lugar de repartido por closures de este modulo
-    (seccion 15).
-    """
-    from app.orchestrator import Orchestrator
-
-    global _ORCHESTRATOR
-    _ORCHESTRATOR = Orchestrator(
-        settings, database, client, publish=client._publish
-    )
-    _ORCHESTRATOR.backfill = _BACKFILL
-    _ORCHESTRATOR.gate = _HISTORY_GATE
-
-    # Comprobacion ligera y reconciliacion segura ANTES de conectar: la GUI
-    # abre ya con contadores, previas y cursores al dia.
-    _ORCHESTRATOR.prepare()
-
-    client.post_connect = _ORCHESTRATOR.post_connect
-    return _ORCHESTRATOR
-
-
 def wire_logging(events: queue.Queue[ClientEvent]) -> None:
     """Modo sin GUI: vuelca los eventos al log desde el hilo principal."""
     import time
@@ -515,6 +321,19 @@ def wire_logging(events: queue.Queue[ClientEvent]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _verificar_migraciones(runtime: Any) -> bool:
+    """Sin migraciones aplicadas no se arranca: el esquema no existiria."""
+    revision = runtime.database.applied_migration()
+    if revision is None:
+        get_logger("DB").error(
+            "no hay ninguna migracion aplicada en esta base de datos.\n"
+            "        Ejecuta:  python -m alembic upgrade head"
+        )
+        return False
+    log.info("Migraciones verificadas (revision=%s)", revision)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -527,24 +346,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[CONFIG] ERROR: {exc}", file=sys.stderr)
         return 2
 
-    setup_logging(settings.log_level, log_file=settings.diagnostics_dir / "app.log")
-    settings.ensure_directories()
     get_logger("CONFIG").info("Configuracion cargada (entorno=%s)", settings.app_env)
+
+    # AppRuntime es la MISMA capa que usa service.py: configuracion, base,
+    # sesion, ingesta, backfill, multimedia y mantenimiento. Aqui no se
+    # duplica ninguna de esas cosas; solo se les pone una ventana delante.
+    from app.core.lock import SessionLockedError, explain
+    from app.core.runtime import build_runtime
+
+    runtime = build_runtime(owner="main.py", settings=settings)
 
     # -- PostgreSQL --
     try:
-        database = start_database(settings)
+        runtime.start_local()
     except DatabaseError as exc:
         get_logger("DB").error("%s", exc)
+        runtime.stop()
+        return 3
+    if not _verificar_migraciones(runtime):
+        runtime.stop()
         return 3
 
     exit_code = 0
-    client: WhatsAppClient | None = None
     try:
-        # -- Compatibilidades y version --
-        summary = prepare_pywhats(settings)
-        describe_environment(settings, summary)
-
         if args.fresh:
             archived = archive_session(settings, reason="fresh")
             if archived is None:
@@ -556,8 +380,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if args.check:
+            summary = prepare_pywhats(settings)
+            describe_environment(settings, summary)
             log.info("Comprobacion completada correctamente")
-            health = database.health()
+            health = runtime.database.health()
             log.info(
                 "PostgreSQL %s, base=%s, encoding=%s",
                 health["server_version"],
@@ -566,126 +392,40 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        # -- Cliente de WhatsApp --
-        events: queue.Queue[ClientEvent] = queue.Queue()
-        client = WhatsAppClient(settings, events)
-
-        # VERIFICACION DE ESTADO: se decide que ensenar ANTES de conectar.
-        has_session = client.session_exists
-        stored = stored_summary(database)
-        log.info(
-            "Sesion %s | en PostgreSQL: %d chats, %d mensajes",
-            "detectada" if has_session else "no encontrada",
-            stored["chats"],
-            stored["messages"],
-        )
-
         use_gui = settings.gui_enabled and not args.no_gui
         if args.viewer and not use_gui:
             log.error("--viewer necesita la GUI; quita --no-gui o pon GUI_ENABLED=true")
             return 4
 
-        if not use_gui:
-            # Sin ventana tambien hay que hacer el trabajo. Antes este camino
-            # arrancaba el cliente pelado: los blobs de History Sync llegaban
-            # y quedaban solo archivados en data/history/, sin persistirse, y
-            # ni multimedia ni backfill corrian. Se cablea lo mismo que en el
-            # modo grafico, menos la GUI.
-            wire_history_ingestion(
-                client,
-                database,
-                own_jid_from_session(settings.session_file),
-                signal_db_path=settings.signal_store_file,
-            )
-            wire_live_messages(
-                client, database, own_jid_from_session(settings.session_file)
-            )
-            wire_contacts(client, database)
-            wire_backfill(client, database, settings)
-            wire_orchestrator(client, database, settings)
-
-            def _stop_headless() -> None:
-                if _ORCHESTRATOR is not None:
-                    _ORCHESTRATOR.stop()
-
-            client.on_shutdown = _stop_headless
-
-            client.start()
-            wire_logging(events)
-            return exit_code
-
-        from app.gui import App
-        from app.session_state import AppState, SessionState, install_success_hook, set_success_callback
-
-        state = SessionState()
-        # El <success> del servidor es la unica confirmacion de que el login
-        # fue aceptado: pywhats no lo expone como evento.
-        install_success_hook()
-        set_success_callback(lambda: client._publish("session_valid", None))
-
-        def _stop_workers() -> None:
-            """Detiene el trabajo de fondo antes de cerrar la sesion.
-
-            Solo SENALIZA. Cerrar el cliente desde fuera de su event loop es
-            lo que producia el 'Task was destroyed but it is pending' del
-            cierre; esa parte la hace el propio cliente en su hilo.
-            """
-            if _ORCHESTRATOR is not None:
-                _ORCHESTRATOR.stop()
-            elif _BACKFILL is not None:
-                _BACKFILL.stop()
-
-        client.on_shutdown = _stop_workers
-
-        def _on_close() -> None:
-            log.info("Cerrando: deteniendo trabajos y sesion...")
-            if client is not None:
-                client.stop()
-            log.info("Cierre completado")
-
-        app = App(events, on_close=_on_close)
-        app.attach_viewer(database.session, settings.media_dir)
-        wire_gui(app, client, database, settings, state)
-
+        # -- Modo visor: SOLO lectura, sin abrir la sesion ni pedir el cerrojo --
+        # Por eso funciona con service.py abierto: dos lectores de PostgreSQL
+        # no estorban; dos duenos de la sesion si.
         if args.viewer:
-            # Modo explicito de solo lectura: el usuario pide ver la copia
-            # local a sabiendas de que no hay conexion.
-            log.info("Modo visor: no se conectara a WhatsApp")
-            state.set(AppState.DISCONNECTED, reason="--viewer")
-            state.set(AppState.CONNECTED, reason="modo local explicito")
-            app.show_viewer(connected=False)
-            app.run()
+            return _run_viewer(runtime)
+
+        # -- Se abre la sesion: aqui si hace falta el cerrojo --
+        try:
+            runtime.start(connect=False)
+        except SessionLockedError as exc:
+            log.error("%s", explain(exc))
+            return 5
+
+        stored = stored_summary(runtime.database)
+        log.info(
+            "Sesion %s | en PostgreSQL: %d chats, %d mensajes",
+            "detectada" if runtime.session_exists else "no encontrada",
+            stored["chats"],
+            stored["messages"],
+        )
+
+        if not use_gui:
+            # Sin ventana se hace exactamente el mismo trabajo; lo unico que
+            # falta es la interfaz. Los eventos se vuelcan al log.
+            runtime.client.start()
+            wire_logging(runtime.subscribe().queue)
             return exit_code
 
-        wire_history_ingestion(
-            client,
-            database,
-            own_jid_from_session(settings.session_file),
-            signal_db_path=settings.signal_store_file,
-        )
-        wire_live_messages(client, database, own_jid_from_session(settings.session_file))
-        wire_contacts(client, database)
-        # El backfill y la barrera primero: el orquestador los recibe ya hechos.
-        wire_backfill(client, database, settings)
-        wire_orchestrator(client, database, settings)
-
-        if has_session:
-            # Hay credenciales en disco, pero eso NO significa que sigan
-            # siendo validas: el visor espera al <success> del servidor.
-            log.info("Sesion existente detectada")
-            state.set(AppState.CHECKING_SESSION, reason="device.json presente")
-            wa_log.info("Validando sesion existente...")
-            app.show_status(
-                "Conectando con WhatsApp...",
-                "Comprobando que la sesion guardada sigue vinculada.",
-            )
-        else:
-            log.info("Sin sesion: hay que vincular el dispositivo")
-            state.set(AppState.PAIRING_REQUIRED, reason="no hay device.json")
-            app.show_pairing()
-
-        client.start()
-        app.run()  # bloquea hasta que se cierra la ventana
+        return _run_gui(runtime)
 
     except KeyboardInterrupt:
         log.info("Interrumpido por el usuario")
@@ -693,12 +433,62 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("Fallo no controlado: %s", exc)
         exit_code = 1
     finally:
-        if client is not None:
-            client.stop()
-        database.dispose()
+        runtime.stop()
         log.info("Terminado")
 
     return exit_code
+
+
+def _run_viewer(runtime: Any) -> int:
+    """``--viewer``: la copia local, sin conectar con WhatsApp."""
+    from app.core.session_state import AppState
+    from app.gui import App
+
+    log.info("Modo visor: no se conectara a WhatsApp")
+    app = App(runtime.subscribe().queue, on_close=runtime.stop)
+    app.attach_viewer(runtime.database.session, runtime.settings.media_dir)
+    wire_gui(app, runtime)
+    runtime.state.set(AppState.DISCONNECTED, reason="--viewer")
+    runtime.state.set(AppState.CONNECTED, reason="modo local explicito")
+    app.show_viewer(connected=False)
+    app.run()
+    return 0
+
+
+def _run_gui(runtime: Any) -> int:
+    """Arranque normal: ventana Tkinter sobre la sesion ya cableada."""
+    from app.core.session_state import AppState
+    from app.gui import App
+
+    def _on_close() -> None:
+        log.info("Cerrando: deteniendo trabajos y sesion...")
+        runtime.stop()
+        log.info("Cierre completado")
+
+    # La ventana recibe SU PROPIA cola del bus. Cada cliente SSE recibira otra:
+    # por eso el bus reparte copias en vez de repartirse los eventos.
+    app = App(runtime.subscribe().queue, on_close=_on_close)
+    app.attach_viewer(runtime.database.session, runtime.settings.media_dir)
+    wire_gui(app, runtime)
+
+    if runtime.session_exists:
+        # Hay credenciales en disco, pero eso NO significa que sigan siendo
+        # validas: el visor espera al <success> del servidor.
+        log.info("Sesion existente detectada")
+        runtime.state.set(AppState.CHECKING_SESSION, reason="device.json presente")
+        wa_log.info("Validando sesion existente...")
+        app.show_status(
+            "Conectando con WhatsApp...",
+            "Comprobando que la sesion guardada sigue vinculada.",
+        )
+    else:
+        log.info("Sin sesion: hay que vincular el dispositivo")
+        runtime.state.set(AppState.PAIRING_REQUIRED, reason="no hay device.json")
+        app.show_pairing()
+
+    runtime.client.start()
+    app.run()  # bloquea hasta que se cierra la ventana
+    return 0
 
 
 if __name__ == "__main__":

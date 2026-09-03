@@ -15,7 +15,7 @@ import queue
 
 import pytest
 
-from app.session_state import AppState, SessionState
+from app.core.session_state import AppState, SessionState
 
 tk = pytest.importorskip("tkinter")
 
@@ -141,7 +141,7 @@ def test_B_login_rechazado_bloquea_el_visor(app, state):
 
 def test_C_datos_locales_sin_sesion_no_se_muestran(app, state, session):
     """PostgreSQL con chats no autoriza a mostrarlos si la sesion murio."""
-    from app import repository as repo
+    from app.services import repository as repo
 
     repo.upsert_chat(session, jid="34600111222@s.whatsapp.net", chat_type="individual")
     session.flush()
@@ -224,8 +224,8 @@ def test_E_revinculacion_solo_muestra_chats_tras_connected(app, state):
 
 def test_invalidar_sesion_no_borra_datos(session, state):
     """PostgreSQL es el backup: desvincularse no puede costar mensajes."""
-    from app import repository as repo
-    from app.repository import IncomingMessage
+    from app.services import repository as repo
+    from app.services.repository import IncomingMessage
 
     jid = "34600999000@s.whatsapp.net"
     chat_id = repo.upsert_chat(session, jid=jid, chat_type="individual")

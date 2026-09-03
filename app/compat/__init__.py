@@ -30,10 +30,46 @@ def apply_all(settings) -> list[str]:  # type: ignore[no-untyped-def]
     Se importa cada modulo de forma perezosa para que desactivar un flag
     signifique tambien no cargar su codigo.
     """
-    from app.logging_setup import get_logger
+    from app.core.logging_setup import get_logger
 
     log = get_logger("COMPAT")
     applied: list[str] = []
+
+    # Historial completo al vincular. Va PRIMERO: el DeviceProps se
+    # construye durante el registro del companion, antes que nada mas.
+    if settings.pairing_full_sync:
+        from app.compat import history_config
+
+        if history_config.apply(settings):
+            applied.append("full_history")
+
+    # Nuestro propio par PN<->LID en el mapa de Signal. Sin el, los mensajes
+    # que el usuario envia desde su telefono llegan pero no se descifran:
+    # "no session for peer <nuestro propio LID>".
+    if settings.compat_own_lid_map:
+        from app.compat import own_lid_map
+
+        if own_lid_map.apply(settings):
+            applied.append("own_lid_map")
+
+    # Observacion del camino real del receptor cuando llega un mensaje
+    # NUESTRO. No cambia nada: solo dice por que encuentra (o no) la sesion.
+    if settings.compat_own_lid_map:
+        from app.compat import lid_diagnostics
+
+        if lid_diagnostics.apply(settings):
+            applied.append("lid_diagnostics")
+
+    # Busca anclas en las mutaciones de app-state. APAGADA por defecto: se
+    # midio contra la cuenta real y no aparecio ni una clave de mensaje
+    # (61 mutaciones, con_clave=0). Se conserva como diagnostico, para poder
+    # repetir la medicion sin volver a escribir nada, pero no forma parte del
+    # arranque normal. Se enciende con COMPAT_APPSTATE_SEEDS=true.
+    if settings.compat_appstate_seeds:
+        from app.compat import appstate_seeds
+
+        if appstate_seeds.apply(settings):
+            applied.append("appstate_seeds")
 
     if settings.compat_windows_store:
         from app.compat import windows_store

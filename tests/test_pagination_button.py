@@ -11,8 +11,8 @@ import pytest
 
 tk = pytest.importorskip("tkinter")
 
-from app import repository as repo  # noqa: E402
-from app.repository import IncomingMessage  # noqa: E402
+from app.services import repository as repo  # noqa: E402
+from app.services.repository import IncomingMessage  # noqa: E402
 
 CHAT_JID = "34600555444@s.whatsapp.net"
 TOTAL = 452
@@ -52,7 +52,7 @@ def chat_452(session):
 @pytest.fixture
 def sin_scroll_automatico(monkeypatch):
     """Apaga el prefetch para poder medir el boton en aislamiento."""
-    import app.chat_view as chat_view
+    import app.gui.chat_view as chat_view
 
     monkeypatch.setattr(chat_view, "AUTO_PREFETCH", False)
 
@@ -69,8 +69,8 @@ def test_A_progresion_200_400_452(app, session, chat_452, sin_scroll_automatico)
     con el visor mapeado cargaria paginas por su cuenta y ya no se estaria
     midiendo lo que pulsa el usuario.
     """
-    from app.chat_view import LOAD_DONE_LABEL, PAGE_SIZE
-    from app.repository import ChatSummary
+    from app.gui.chat_view import LOAD_DONE_LABEL, PAGE_SIZE
+    from app.services.repository import ChatSummary
 
     stats = repo.get_chat_stats(session, chat_452)
     assert stats.total == TOTAL
@@ -107,8 +107,8 @@ def test_A_progresion_200_400_452(app, session, chat_452, sin_scroll_automatico)
 
 def test_A_el_boton_no_contacta_con_whatsapp(app, session, chat_452):
     """El boton SOLO pagina PostgreSQL. Nunca dispara ON_DEMAND."""
-    from app.chat_view import PAGE_SIZE
-    from app.repository import ChatSummary
+    from app.gui.chat_view import PAGE_SIZE
+    from app.services.repository import ChatSummary
 
     llamadas: list[tuple] = []
 
@@ -136,7 +136,7 @@ def test_A_boton_y_scroll_comparten_implementacion():
     """Una sola funcion: el scroll llamara a la misma que el boton."""
     import inspect
 
-    from app.chat_view import ConversationPanel
+    from app.gui.chat_view import ConversationPanel
 
     fuente = inspect.getsource(ConversationPanel._maybe_prefetch)
     assert "load_previous_page" in fuente
@@ -157,7 +157,7 @@ def test_A_boton_y_scroll_comparten_implementacion():
     ],
 )
 def test_B_estados_terminales(settings, database, mensaje, esperado):
-    from app.media_service import MediaService
+    from app.services.media_service import MediaService
 
     service = MediaService(settings, database, client=None)
     registrados: list[tuple] = []
@@ -171,7 +171,7 @@ def test_B_terminales_no_se_reintentan(settings, database, session):
     """404/410 son definitivos: no vuelven a la cola en el siguiente arranque."""
     import inspect
 
-    from app.media_service import MediaService
+    from app.services.media_service import MediaService
 
     fuente = inspect.getsource(MediaService.pending_ids)
     assert '"pending", "failed"' in fuente
@@ -179,7 +179,7 @@ def test_B_terminales_no_se_reintentan(settings, database, session):
 
 
 def test_B_las_estadisticas_distinguen_caducado_de_no_disponible():
-    from app.media_service import MediaStats
+    from app.services.media_service import MediaStats
 
     stats = MediaStats(downloaded=10, unavailable=3, expired=2, failed=1, deduplicated=4)
     assert stats.processed == 20
@@ -193,7 +193,7 @@ def test_B_las_estadisticas_distinguen_caducado_de_no_disponible():
 
 
 def test_C_capability_sin_sesion_no_se_confirma(settings, database):
-    from app.backfill_service import BackfillService
+    from app.services.backfill_service import BackfillService
 
     service = BackfillService(settings, database)
     service._client = None
@@ -204,7 +204,7 @@ def test_C_capability_sin_sesion_no_se_confirma(settings, database):
 def test_C_el_fingerprint_cambia_al_revincular(settings, database):
     from types import SimpleNamespace
 
-    from app.backfill_service import BackfillService
+    from app.services.backfill_service import BackfillService
 
     service = BackfillService(settings, database)
 

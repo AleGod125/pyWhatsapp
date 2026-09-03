@@ -11,11 +11,11 @@ import pytest
 from pywhats.events import JID, MediaAttachment, Message
 from sqlalchemy import select
 
-from app import repository as repo
-from app.live_service import LiveMessageService, jid_to_string, message_type_for
+from app.services import repository as repo
+from app.services.live_service import LiveMessageService, jid_to_string, message_type_for
 from app.models import MediaFile
 from app.models import Message as MessageRow
-from app.repository import IncomingMessage
+from app.services.repository import IncomingMessage
 
 CHAT = JID(user="34600111222", server="s.whatsapp.net")
 CHAT_JID = "34600111222@s.whatsapp.net"
@@ -223,7 +223,7 @@ def test_tope_de_mensajes_por_peticion(monkeypatch, count, expected):
     modos, asi que esto solo evita pedir una barbaridad; el limite real se
     observa en ``history_requests.response_count``.
     """
-    import app.config as config
+    import app.core.config as config
 
     monkeypatch.setenv("HISTORY_ON_DEMAND_COUNT", str(count))
     assert config._history_count() == expected

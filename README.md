@@ -59,6 +59,44 @@ python main.py --check
 
 ## Ejecucion
 
+Hay DOS entrypoints. Los dos usan el MISMO `.env` y los MISMOS servicios.
+
+```powershell
+py main.py       # ventana Tkinter
+py service.py    # API HTTP en http://127.0.0.1:5000/api/v1
+```
+
+```
+                       +-- main.py     -> Tkinter   (app/gui)
+    AppRuntime/Services +
+                       +-- service.py  -> Flask     (app/api)
+```
+
+`AppRuntime` (`app/core/runtime.py`) monta configuracion, base de datos, sesion
+de WhatsApp, ingesta, backfill, multimedia y mantenimiento. Los dos entrypoints
+solo le ponen una interfaz delante; el cableado NO esta duplicado, y hay una
+prueba que lo verifica.
+
+### Un solo dueno de la sesion
+
+`main.py` y `service.py` no pueden abrir el companion a la vez: dos procesos
+escribiendo en `session/device.json` y en la base Signal producen una sesion
+corrupta y obligan a volver a vincular. Lo impide `session/runtime.lock`.
+
+El segundo proceso sale con codigo 5 y un mensaje que dice QUIEN tiene la
+sesion y que hacer. Si un proceso murio de mala manera, su cerrojo se detecta
+como huerfano (se comprueba si el PID sigue vivo) y se retira solo ESE archivo:
+`device.json` y la base Signal no se tocan nunca.
+
+Leer la copia local NO pide el cerrojo. Con la sesion abierta en otro proceso:
+
+```powershell
+py main.py --viewer      # ventana, solo lectura
+py service.py --local    # API, solo lectura
+```
+
+### main.py
+
 ```powershell
 python main.py
 ```
@@ -75,6 +113,160 @@ Opciones:
 | `--check` | Verifica entorno, PostgreSQL, migraciones y compatibilidades. No conecta a WhatsApp. |
 | `--no-gui` | Sin ventana. Util para ver el flujo en logs; el QR no se puede escanear. |
 | `--fresh` | Archiva la sesion actual en `diagnostics/` y vuelve a vincular. **No** borra PostgreSQL, ni multimedia, ni diagnosticos. |
+| `--viewer` | Solo el visor sobre PostgreSQL. No conecta ni pide el cerrojo. |
+
+### service.py
+
+```powershell
+py service.py
+```
+
+| Flag | Efecto |
+|---|---|
+| `--check` | Verifica entorno, PostgreSQL y migraciones. No conecta ni escucha. |
+| `--local` | Sirve la copia local sin abrir la sesion de WhatsApp. |
+| `--host` / `--port` | Sobrescriben `API_HOST` / `API_PORT` solo en esa ejecucion. |
+
+El servidor HTTP **no espera a WhatsApp**: la sesion se abre en un hilo aparte
+y el puerto queda escuchando de inmediato. `GET /api/v1/session` responde
+`CONNECTING` mientras tanto.
+
+#### Endpoints
+
+| Metodo | Ruta | Que hace |
+|---|---|---|
+| GET | `/api/v1/health` | Comprobacion ligera. No recorre la tabla de mensajes. |
+| GET | `/api/v1/session` | Estado real de la sesion. |
+| POST | `/api/v1/session/pair` | Arranca la vinculacion. |
+| GET | `/api/v1/session/qr` | Si hay QR vigente. **No** devuelve el payload. |
+| GET | `/api/v1/session/qr/image` | El QR como PNG. |
+| GET | `/api/v1/chats` | Sidebar, por `last_message_timestamp` DESC. |
+| GET | `/api/v1/chats/<id>` | Un chat con sus cifras. |
+| GET | `/api/v1/chats/<id>/messages` | Ultimos N, o anteriores a un cursor. |
+| GET | `/api/v1/media/<id>` | Metadatos del adjunto. |
+| GET | `/api/v1/media/<id>/file` | El archivo. `410` si ya no esta en WhatsApp. |
+| GET | `/api/v1/media/<id>/thumbnail` | Miniatura cacheada. |
+| GET | `/api/v1/sync/status` | Progreso del trabajo de fondo y del ciclo manual. |
+| POST | `/api/v1/sync/run` | Lanza un ciclo manual. `202`, o `409` si ya hay uno. |
+| GET | `/api/v1/events/stream` | Server-Sent Events. |
+
+Paginacion por **keyset**, nunca OFFSET:
+
+```
+GET /api/v1/chats/12/messages?limit=200
+    -> next_cursor: {before_timestamp, before_id}
+GET /api/v1/chats/12/messages?limit=200&before_timestamp=...&before_id=...
+```
+
+Las respuestas NUNCA llevan una ruta del disco: el frontend recibe URLs
+(`/api/v1/media/123/file`), no rutas de Windows. Tampoco sale `raw_proto`, ni
+`media_key`, ni el payload del QR en texto. Hay pruebas que lo comprueban.
+
+Eventos SSE: `session.state`, `session.qr`, `chat.updated`, `message.created`,
+`media.updated`, `history.progress`, `backfill.progress`, `sync.status`.
+
+### Mensajes en tiempo real
+
+Mientras `py service.py` este conectado, los mensajes nuevos entran SOLOS. No
+dependen del boton de sincronizar:
+
+```
+receptor WhatsApp -> live_service -> clasificador -> PostgreSQL
+                  -> bus de eventos -> SSE -> frontend
+```
+
+El orden no es casual: primero se persiste, luego se avisa. Al reves, el
+frontend podria pedir un mensaje que todavia no existe.
+
+Un mensaje nuevo produce DOS eventos SSE:
+
+```
+event: message.created      {"chat_id": 123, "message": { ...burbuja completa... }}
+event: chat.updated         {"chat_id": 123, "preview": "...",
+                             "last_message_at": "...", "message_count": 453}
+```
+
+`message.created` lleva la burbuja entera, para poder anadirla sin volver a
+preguntar. Y un DUPLICADO no emite nada: History Sync y el receptor en vivo se
+solapan a proposito, la base deduplica por wamid, y dejar pasar el aviso haria
+aparecer la burbuja dos veces.
+
+Cuando un adjunto termina de descargarse:
+
+```
+event: media.updated        {"media_id": 9, "message_id": 5, "status": "downloaded",
+                             "file_url": "...", "thumbnail_url": "..."}
+```
+
+El bus entrega el MISMO objeto a todos los suscriptores, asi que la traduccion
+se memoriza en el evento: cinco pestanas abiertas hacen UNA consulta, no cinco.
+
+### Sincronizacion manual
+
+`POST /api/v1/sync/run` lanza el ciclo que NO es automatico: reconciliar,
+revalidar cursores, pedir historial pendiente y recoger multimedia.
+
+```
+202  {"started": true, "job_id": "a1b2c3", "state": "running"}
+409  SYNC_ALREADY_RUNNING     ya hay un ciclo en curso
+409  WHATSAPP_DISABLED        el backend esta en modo --local
+409  SESSION_NOT_CONNECTED    WhatsApp no esta conectado
+```
+
+Responde y vuelve: el ciclo puede durar minutos y corre en el event loop del
+cliente. `GET /sync/status` cuenta como va (`state`, `phase`, `chats_total`,
+`chats_processed`, `messages_new`, `media_pending`, `last_error`), y lo mismo
+llega por SSE como `sync.status`.
+
+No ejecuta NINGUN script: llama a `MaintenanceService`, `BackfillService` y
+`MediaService` directamente. Lanzar `probe_chat.py` como subproceso abriria un
+segundo proceso que pelearia por el cerrojo de la sesion con este. Hay una
+prueba que lo verifica sobre el AST.
+
+### Vinculacion automatica
+
+Si el backend arranca sin sesion valida, el QR se genera SOLO. Nadie tiene que
+pulsar nada:
+
+```
+[WA]      Estado: STARTING -> NO_SESSION (no hay device.json)
+[APP]     Se requiere vinculacion: iniciando automaticamente
+[WA]      Estado: NO_SESSION -> PAIRING
+[PAIRING] Vigilante de vinculacion en marcha (TTL=300s)
+[PAIRING] QR generation=1 expires_in=300s
+[WA]      Estado: PAIRING -> QR_READY
+```
+
+`GET /session/qr` devuelve `generated_at`, `expires_at`, `expires_in_seconds`,
+`generation` y `ttl_seconds`. **Nunca el payload**: es una credencial de
+vinculacion, vive solo en memoria, no se escribe en disco y no se registra.
+
+`GET /session/qr/image` sirve el PNG con `no-store` y `Pragma: no-cache`, y
+responde `410 QR_EXPIRED` si caduco (distinto de `404 QR_NOT_AVAILABLE`, que
+es "no hubo ninguno").
+
+`PAIRING_QR_TTL` (300 s por defecto) es una ventana de EXPERIENCIA, no la vida
+del `ref`. pywhats lo rota antes —el primero a los 60 s, luego cada 20 s— y
+cada rotacion publica un QR nuevo, sube `generation` y emite `session.qr`. El
+TTL es el tope: pasado ese plazo sin ninguno nuevo, se pide otra vinculacion
+sola. Reportar 300 s y no renovar seria mentir; lo que hace cierto el numero es
+la renovacion.
+
+`POST /session/pair` sigue existiendo como reintento manual y es idempotente:
+con un QR vigente devuelve ese, sin generar otro. Un cerrojo interno impide dos
+vinculaciones simultaneas, que produirian dos QR de los que solo uno serviria.
+
+Al conectar, el QR se invalida y el vigilante se para.
+
+Estados de sesion: `STARTING`, `CHECKING_SESSION`, `NO_SESSION`,
+`PAIRING_REQUIRED`, `PAIRING`, `QR_READY`, `CONNECTING`, `CONNECTED`,
+`WAITING_INITIAL_HISTORY`, `SESSION_INVALID`, `DISCONNECTED`, `ERROR`.
+
+Perder la conexion da `DISCONNECTED`, no `SESSION_INVALID`: al reconectar se
+vuelve a procesar todo sin pasar por vincular.
+
+El frontend vivira en un repositorio aparte (`WhatsappBackup`). Este proyecto
+es el backend; aqui no hay nada de Angular.
 
 `--fresh` separa a proposito el *reset de sesion* del *reset de base de datos*.
 No existe ninguna opcion que borre PostgreSQL por accidente.
@@ -104,31 +296,72 @@ compatibilidad (ver mas abajo). Tampoco es el Signal Store.
 ## Estructura
 
 ```
-main.py                 punto de entrada
+main.py                 entrypoint Tkinter
+service.py              entrypoint Flask (API HTTP)
 alembic.ini             migraciones (sin secretos: la URL sale de .env)
+.env                    UNA sola configuracion para los dos entrypoints
+
 app/
-  config.py             carga y valida .env; nunca expone la password
-  logging_setup.py      logs [APP] [DB] [WA] ... + filtro anti-secretos
-  database.py           motor y transacciones de PostgreSQL
-  models.py             esquema (7 tablas)
-  repository.py         upserts en lote, paginacion, cursor historico
-  whatsapp_client.py    pywhats en su propio hilo + event loop
-  qr_render.py          imagen del QR
-  gui.py                Tkinter (hilo principal, una sola ventana)
-  chat_view.py          visor: sidebar + conversacion con scroll automatico
-  ui_theme.py           paleta y tipografia, en un solo sitio
-  previews.py           vista previa de un mensaje (una sola definicion)
-  system_message.py     que significa un evento de sistema, leido del protobuf
-  thumbnails.py         miniaturas cacheadas en disco
-  orchestrator.py       el ciclo completo: arranque, fondo y cierre
-  maintenance_service.py  reconciliacion automatica y NO destructiva
+  core/                 lo que la aplicacion ES, sin interfaz
+    config.py           carga y valida .env; nunca expone la password
+    logging_setup.py    logs [APP] [DB] [WA] [API] ... + filtro anti-secretos
+    database.py         motor y transacciones de PostgreSQL
+    runtime.py          AppRuntime: la capa que comparten ambos entrypoints
+    orchestrator.py     arranque, trabajo de fondo y cierre
+    lock.py             cerrojo de sesion entre procesos
+    identity.py         identidad propia y enmascarado de identificadores
+    session_state.py    maquina de estados de la sesion
+    message_parser.py   normalizacion de WebMessageInfo
+    message_classifier.py  visible vs. control del protocolo
+    system_message.py   que significa un evento de sistema
+    previews.py         vista previa de un mensaje
+    avatars.py          iniciales y color por contacto
+    qr_render.py        imagen del QR
+  services/             logica de negocio; no conoce ninguna interfaz
+    repository.py       upserts en lote, paginacion, cursor historico
+    history_service.py  ingesta de History Sync
+    history_gate.py     barrera del historial inicial
+    backfill_service.py recuperacion ON_DEMAND
+    media_service.py    descarga de adjuntos
+    live_service.py     mensajes en vivo
+    contacts_service.py nombres de la agenda
+    maintenance_service.py  reconciliacion automatica NO destructiva
+    thumbnails.py       miniaturas cacheadas
+  models/               esquema PostgreSQL + protobuf propio
+    schema.py           las 7 tablas
+    proto/              descriptores que pywhats no trae
+  events/               bus de eventos con reparto a varios consumidores
+  gui/                  adaptador Tkinter
+    app_window.py, chat_view.py, ui_theme.py
+  api/                  adaptador HTTP (Flask + SSE)
+    app_factory.py, routes.py, serializers.py
   compat/               adaptaciones sobre pywhats 0.2.0
+  whatsapp_client.py    pywhats en su propio hilo + event loop
+
+scripts/                herramientas de diagnostico, se ejecutan a mano
+  inspect_db.py  inspect_history_gaps.py  probe_chat.py
+  repair_db.py   ingest_blobs.py
+
 migrations/             Alembic
-session/                estado del companion (NO versionado)
+session/                estado del companion + runtime.lock (NO versionado)
 data/                   media, cache, blobs de history (NO versionado)
 diagnostics/            logs y sesiones archivadas (NO versionado)
 tests/
 ```
+
+Las dependencias van en un solo sentido:
+
+```
+    api  ---+
+            +--> services --> models
+    gui  ---+        |
+                     +--> core
+```
+
+`app/api` no importa `tkinter` ni `app.gui`. `app/gui` no importa `flask` ni
+`app.api`. `app/services` no importa ninguno de los dos. `app/core` no importa
+`tkinter`. Hay una prueba por cada una de esas reglas, y miran el AST, no el
+texto: los comentarios que explican la regla mencionan la palabra prohibida.
 
 ---
 

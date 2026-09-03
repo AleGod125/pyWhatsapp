@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.config import Settings
-from app.logging_setup import get_logger
+from app.core.config import Settings
+from app.core.logging_setup import get_logger
 
 log = get_logger("WA")
 
@@ -96,6 +96,13 @@ class WhatsAppClient:
         # publicar el evento a la GUI. Sirven para persistir en PostgreSQL sin
         # pasar por el hilo de Tkinter.
         self.sinks: dict[str, Any] = {}
+        # Reconexion. El socket se muere solo (WiFi que cae, portatil que se
+        # suspende, el servidor que cierra): se midio "app ping failed 3/3 ->
+        # peer presumed dead -> closing connection", y despues de eso el
+        # proceso seguia vivo pero sordo. Detectar el socket muerto estaba
+        # bien; lo que faltaba era volver a levantarlo.
+        self._logged_out = False
+        self._reconnects = 0
         # Aviso a los servicios de fondo (backfill, multimedia) para que
         # dejen de trabajar antes de cerrar la sesion.
         self.on_shutdown: Any = None
@@ -213,25 +220,142 @@ class WhatsAppClient:
         # Se espera a que la sesion se cierre O a que alguien pida parar. Asi
         # el cierre ordenado ocurre DENTRO de esta corrutina y el loop no
         # termina con _shutdown() a medias (el "Task was destroyed").
-        closed = asyncio.create_task(self._client.wait_closed(), name="wait-closed")
-        requested = asyncio.create_task(
-            self._shutdown_requested.wait(), name="shutdown-requested"
-        )
-        try:
-            done, pending = await asyncio.wait(
-                {closed, requested}, return_when=asyncio.FIRST_COMPLETED
+        while True:
+            # Se espera a que la sesion se cierre O a que alguien pida parar.
+            # Asi el cierre ordenado ocurre DENTRO de esta corrutina y el loop
+            # no termina con _shutdown() a medias (el "Task was destroyed").
+            closed = asyncio.create_task(
+                self._client.wait_closed(), name="wait-closed"
             )
-        finally:
-            for task in (closed, requested):
-                if not task.done():
-                    task.cancel()
-            # CancelledError propia del cierre: se absorbe a proposito. Una
-            # cancelacion inesperada seguiria propagandose desde otro sitio.
-            await asyncio.gather(closed, requested, return_exceptions=True)
+            requested = asyncio.create_task(
+                self._shutdown_requested.wait(), name="shutdown-requested"
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {closed, requested}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for task in (closed, requested):
+                    if not task.done():
+                        task.cancel()
+                # CancelledError propia del cierre: se absorbe a proposito.
+                # Una cancelacion inesperada seguiria propagandose.
+                await asyncio.gather(closed, requested, return_exceptions=True)
 
-        if requested in done:
-            log.info("Parada solicitada: cerrando la sesion")
-            await self._shutdown(self._shutdown_timeout)
+            if requested in done:
+                log.info("Parada solicitada: cerrando la sesion")
+                await self._shutdown(self._shutdown_timeout)
+                return
+
+            # El socket se cerro sin que nadie lo pidiera. Lo primero es
+            # cortar lo que este esperando una respuesta que ya no puede
+            # llegar: si no, esas esperas agotan su tiempo y se apuntan como
+            # "el telefono no contesto", que seria una conclusion falsa.
+            self._publish("transport_lost", None)
+
+            if self._logged_out:
+                log.warning(
+                    "La sesion fue rechazada por el servidor: no se reconecta"
+                )
+                # Y se cierra ORDENADAMENTE, aunque no vayamos a reconectar.
+                #
+                # Salir sin cerrar dejaba el Signal Store abierto, porque quien
+                # lo cierra es ``Client.disconnect()``. Con el handle vivo,
+                # archivar la sesion revocada no podia mover
+                # ``device.json.signal.db``: se saltaba por bloqueado y el
+                # pairing siguiente nacia con un device.json NUEVO sobre un
+                # store VIEJO. Se midio esa mezcla: un dispositivo recien
+                # vinculado con 14 sesiones Signal y 8 sender keys heredadas,
+                # y "unknown one-time pre-key id 66" en cada mensaje.
+                #
+                # De paso se cancelan las tareas en vuelo, que era el origen de
+                # los "Task was destroyed but it is pending! post-connect".
+                await self._shutdown(self._shutdown_timeout)
+                return
+            if not await self._reconectar():
+                return
+
+    # Espera entre intentos de reconexion. Escala corta al principio (un
+    # corte de WiFi de dos segundos no debe costar un minuto de silencio) y
+    # techo bajo al final, para no golpear el servidor si el corte dura horas.
+    RECONEXION_ESPERAS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+    RECONEXION_MAXIMA = 30.0
+
+    def _espera_reconexion(self, intento: int) -> float:
+        """Segundos antes del intento ``intento`` (1-based), con jitter.
+
+        El jitter evita que, si algo tira la conexion de varios clientes a la
+        vez, todos vuelvan a llamar en el mismo instante.
+        """
+        import random
+
+        indice = min(intento, len(self.RECONEXION_ESPERAS)) - 1
+        base = self.RECONEXION_ESPERAS[max(0, indice)]
+        return base + random.uniform(0.0, base * 0.25)
+
+    async def _reconectar(self) -> bool:
+        """Levanta la sesion otra vez, con la MISMA identidad y el mismo Signal.
+
+        No se borra nada: ni ``device.json``, ni el Signal Store, ni las
+        prekeys. Un socket muerto no invalida la vinculacion, y tratarlo como
+        si lo hiciera obligaria a escanear un QR cada vez que se cae el WiFi.
+
+        Devuelve ``False`` cuando hay que rendirse (parada solicitada o sesion
+        rechazada); ``True`` cuando ya esta reconectado.
+        """
+        from pywhats import Client
+
+        while not self._shutdown_requested.is_set():
+            self._reconnects += 1
+            espera = self._espera_reconexion(self._reconnects)
+            log.warning(
+                "Conexion perdida. Reintento %d en %.0fs (la sesion NO se toca)",
+                self._reconnects,
+                espera,
+            )
+            self._publish(
+                "reconnecting",
+                {"attempt": self._reconnects, "delay_seconds": espera},
+            )
+
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_requested.wait(), timeout=espera
+                )
+                # Han pedido parar mientras se esperaba.
+                await self._shutdown(self._shutdown_timeout)
+                return False
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                self._client = Client(session_path=str(self._settings.session_file))
+                self._register_handlers(self._client)
+                await self._client.connect()
+            except Exception as exc:  # noqa: BLE001 - se reintenta
+                log.warning("Reintento %d fallido: %s", self._reconnects, exc)
+                continue
+
+            log.info("Reconectado tras %d intento(s)", self._reconnects)
+            self._reconnects = 0
+            self._publish("reconnected", None)
+
+            # El backfill y la multimedia tienen una referencia al cliente
+            # ANTERIOR. ``post_connect`` la renueva y, de paso, reconcilia lo
+            # que haya entrado mientras el socket estaba muerto: los eventos
+            # de ese rato no llegaron, y no se pueden dar por recibidos.
+            if self.post_connect is not None:
+                # Se avisa de que esto es una RECONEXION: hay que reconciliar
+                # lo que entro mientras el socket estaba muerto.
+                destino = getattr(self.post_connect, "__self__", None)
+                if destino is not None:
+                    setattr(destino, "_reconexion", True)
+                asyncio.create_task(
+                    self._run_post_connect(), name="post-connect-reconexion"
+                )
+            return True
+
+        return False
 
     async def _run_post_connect(self) -> None:
         """Trabajo posterior a la conexion (multimedia). Nunca tumba la sesion."""
@@ -284,8 +408,17 @@ class WhatsAppClient:
 
         def make_handler(event_name: str):
             async def handler(*args: Any) -> None:
-                # pywhats invoca con 0 o 1 argumento segun el evento.
+                # pywhats invoca con 0, 1 o 2 argumentos segun el evento.
+                # ``decrypt_error`` manda (message_id, motivo): quedarse solo
+                # con el primero perdia justo el dato que dice POR QUE fallo.
                 payload = args[0] if args else None
+                detalles = {"args": list(args[1:])} if len(args) > 1 else {}
+
+                if event_name == "logged_out":
+                    # El servidor rechazo la sesion. Aqui NO se reconecta:
+                    # reintentar con una sesion muerta es el bucle que ya
+                    # costo 74 logins en segundos.
+                    self._logged_out = True
 
                 sink = self.sinks.get(event_name)
                 if sink is not None:
@@ -299,7 +432,7 @@ class WhatsAppClient:
                     except Exception:  # noqa: BLE001 - el receptor manda
                         log.exception("El sink de %r fallo; se sigue escuchando", event_name)
 
-                self._publish(event_name, payload)
+                self._publish(event_name, payload, **detalles)
 
             return handler
 
@@ -414,23 +547,68 @@ def prepare_pywhats(settings: Settings) -> dict[str, Any]:
 def archive_session(settings: Settings, reason: str) -> Path | None:
     """Mueve la sesion actual a diagnostics/ en vez de borrarla.
 
-    Se usa solo cuando el usuario lo pide de forma explicita (``--fresh``).
-    Nunca de forma automatica ante un error: un 401 puede ser transitorio y
-    tirar la sesion convierte un diagnostico en una perdida.
+    NUNCA lanza. Se midio por que hace falta: al archivar tras un 401, Windows
+    devolvia ``WinError 32`` sobre ``compat_prekey.db`` porque nuestro propio
+    proceso lo tenia abierto. La excepcion abortaba el resto del manejo del
+    error y el sistema entraba en un bucle de reintentos.
+
+    Si un archivo esta bloqueado se salta y se deja constancia: llevarse el
+    ``device.json`` ya basta para que el siguiente arranque vincule limpio, y
+    un registro de prekeys huerfano no impide nada.
+
+    Devuelve ``None`` si no habia nada que archivar, y en ese caso no deja
+    carpeta vacia detras (se llegaron a crear 99 en un bucle).
     """
     from datetime import datetime
 
     if not settings.session_file.exists():
         return None
 
+    # El registro de prekeys es nuestro y lo tenemos abierto: cerrarlo antes
+    # evita el bloqueo en Windows.
+    try:
+        from app.compat import prekey_compat
+
+        if getattr(prekey_compat, "_registry", None) is not None:
+            prekey_compat._registry.close()
+            prekey_compat._registry = None
+    except Exception:  # noqa: BLE001 - cerrarlo es una mejora, no un requisito
+        log.debug("No se pudo cerrar el registro de prekeys antes de archivar")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     destination = settings.diagnostics_dir / f"session-{stamp}-{reason}"
     destination.mkdir(parents=True, exist_ok=True)
 
-    moved = []
-    for path in settings.session_dir.iterdir():
-        if path.is_file():
+    moved: list[str] = []
+    bloqueados: list[str] = []
+    for path in sorted(settings.session_dir.iterdir()):
+        if not path.is_file():
+            continue
+        try:
             path.replace(destination / path.name)
             moved.append(path.name)
-    log.info("Sesion archivada en %s (%d archivos: %s)", destination, len(moved), ", ".join(moved))
+        except OSError as exc:
+            # Bloqueado por otro proceso (o por nosotros). No es motivo para
+            # abortar: lo importante es que device.json salga de en medio.
+            bloqueados.append(path.name)
+            log.debug("No se pudo archivar %s: %s", path.name, exc)
+
+    if not moved:
+        # Sin nada movido, la carpeta sobra.
+        try:
+            destination.rmdir()
+        except OSError:  # pragma: no cover
+            pass
+        log.warning(
+            "No se pudo archivar la sesion (%d archivos bloqueados)", len(bloqueados)
+        )
+        return None
+
+    log.info(
+        "Sesion archivada en %s (%d archivos: %s%s)",
+        destination,
+        len(moved),
+        ", ".join(moved),
+        f"; bloqueados: {', '.join(bloqueados)}" if bloqueados else "",
+    )
     return destination
