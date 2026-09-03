@@ -1,6 +1,6 @@
 """Descarga y almacenamiento de multimedia.
 
-Pipeline (seccion 41 del brief):
+Pipeline:
 
     mensaje -> media_files(pending) -> worker -> descarga -> verificacion
     -> archivo en data/media/<tipo>/ -> status=downloaded
@@ -268,7 +268,7 @@ class MediaService:
     async def run_forever(
         self, *, interval: float = 20.0, on_progress: Any = None
     ) -> None:
-        """Worker permanente: descarga lo que vaya apareciendo (seccion 13).
+        """Worker permanente: descarga lo que vaya apareciendo.
 
         Antes habia que reiniciar la aplicacion para que un adjunto llegado
         despues del arranque se descargara. Ahora el pipeline se cierra solo::
@@ -276,7 +276,7 @@ class MediaService:
             mensaje -> media_files(pending) -> este worker -> downloaded
                     -> aviso a la GUI -> la burbuja se actualiza
 
-        Vive en su propia tarea y la GUI nunca espera por el (seccion 14).
+        Vive en su propia tarea y la GUI nunca espera por el.
         Entre rondas duerme: no es un bucle ocupado. Termina limpiamente al
         cancelarse.
         """
@@ -504,7 +504,7 @@ class MediaService:
         message = str(exc) or type(exc).__name__
         lowered = message.lower()
 
-        # Estados TERMINALES distintos, como pide la seccion 30:
+        # Estados TERMINALES distintos:
         #   410 Gone      -> expired      (el CDN lo tuvo y ya no)
         #   404 Not Found -> unavailable  (el CDN no lo sirve)
         # El detalle individual va a DEBUG: con cientos de adjuntos antiguos

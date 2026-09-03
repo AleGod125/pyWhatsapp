@@ -211,9 +211,19 @@ class Settings:
     api_port: int
     frontend_origin: str
 
-    # --- Interfaz ---
-    gui_enabled: bool
-    terminal_progress_enabled: bool
+
+    # Cada vez que se abre el panel se intenta una extraccion. Reinterpretar
+    # los blobs de decenas de chats no es gratis, asi que la automatica
+    # respeta esta espera; el boton manual no la respeta nunca. 0 la desactiva.
+    auto_recheck_cooldown_seconds: float
+
+    # --- Recuperacion auxiliar (Web Bootstrap / Baileys) ---
+    #
+    # Vincula un SEGUNDO dispositivo a la cuenta del usuario, con su propio QR.
+    # El producto normal funciona entero sin ella y no debe pedir dos codigos,
+    # asi que viene apagada. Sigue en el codigo y se reactiva con
+    # ``WEB_BOOTSTRAP_ENABLED=true`` cuando haya algo que ganar con ella.
+    web_bootstrap_enabled: bool
 
     # --- Compatibilidades pywhats 0.2.0 ---
     compat_wa_version: bool
@@ -369,8 +379,10 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         allow_remote_api=_bool("ALLOW_REMOTE_API", False),
         api_port=_int("API_PORT", 5000, minimum=1),
         frontend_origin=_str("FRONTEND_ORIGIN", "http://localhost:4200"),
-        gui_enabled=_bool("GUI_ENABLED", True),
-        terminal_progress_enabled=_bool("TERMINAL_PROGRESS_ENABLED", True),
+        auto_recheck_cooldown_seconds=_float(
+            "AUTO_RECHECK_COOLDOWN_SECONDS", 300.0, minimum=0.0
+        ),
+        web_bootstrap_enabled=_bool("WEB_BOOTSTRAP_ENABLED", False),
         compat_wa_version=_bool("COMPAT_WA_VERSION", True),
         wa_version_fetch_timeout=_float("WA_VERSION_FETCH_TIMEOUT", 10.0, minimum=1.0),
         compat_windows_store=_bool("COMPAT_WINDOWS_STORE", True),

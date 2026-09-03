@@ -39,7 +39,7 @@ def create_app(runtime: Any, *, cors_origin: str | None = None) -> Flask:
     # Herramientas de diagnostico. Solo se montan si la instrumentacion esta
     # encendida: no forman parte del funcionamiento normal.
     if runtime.settings.compat_appstate_seeds:
-        from app.api.diagnostics import diagnostics as diagnostics_bp
+        from app.experimental.diagnostics_api import diagnostics as diagnostics_bp
 
         app.register_blueprint(diagnostics_bp)
         log.info("Endpoints de diagnostico montados (COMPAT_APPSTATE_SEEDS activo)")

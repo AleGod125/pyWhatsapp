@@ -34,7 +34,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Callable
 
 from app.core.logging_setup import get_logger
 

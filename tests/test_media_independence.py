@@ -27,7 +27,7 @@ from sqlalchemy import select
 
 from app.models import MediaFile
 from tests.test_live_types import FakeDatabase, _fila
-from tests.test_outgoing_routing import ISAAC, ISAAC_LID, OWN_LID, OWN_PN, entrante, envuelto, evento
+from tests.test_outgoing_routing import ISAAC_LID, OWN_LID, OWN_PN, envuelto, evento
 
 from app.services.live_service import LiveMessageService
 

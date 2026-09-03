@@ -54,8 +54,9 @@ def test_archivar_sigue_disponible_para_cuando_el_usuario_lo_pide():
     from app.whatsapp_client import archive_session
 
     assert callable(archive_session)
-    fuente = Path("main.py").read_text(encoding="utf-8")
+    fuente = Path("service.py").read_text(encoding="utf-8")
     assert 'reason="fresh"' in fuente, "--fresh es la via explicita para archivar"
+    assert '"--fresh"' in fuente, "y tiene que estar expuesta en la linea de ordenes"
 
 
 def test_tres_rechazos_de_la_misma_sesion_detienen_el_intento():

@@ -1,6 +1,6 @@
 """Persistencia de los mensajes que llegan en vivo.
 
-Pipeline (seccion 26 del brief):
+Pipeline:
 
     WhatsApp -> evento 'message' -> normalizacion -> PostgreSQL -> aviso a la GUI
 
@@ -199,7 +199,7 @@ class LiveMessageService:
         # pywhats no desenvuelve ``deviceSentMessage``: las fotos que el
         # usuario se envia a si mismo llegaban con ``media=None`` y acababan
         # guardadas como 'unknown'. Cuando pywhats no sabe que es, se mira el
-        # protobuf, que si lo dice (seccion 32).
+        # protobuf, que si lo dice.
         propio_metadata: dict[str, Any] | None = None
         if message_type == "unknown" and raw_proto:
             from app.core.message_parser import interpret_message_bytes

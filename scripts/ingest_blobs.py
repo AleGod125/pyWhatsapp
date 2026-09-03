@@ -24,7 +24,6 @@ if str(_RAIZ) not in _sys.path:
     _sys.path.insert(0, str(_RAIZ))
 
 import argparse
-import sys
 from pathlib import Path
 
 from app.compat.history_compat import parse_full

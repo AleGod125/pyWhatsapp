@@ -2,7 +2,7 @@
 
 QUE RESUELVE
 ------------
-``main.py`` cableaba a mano configuracion, base de datos, cliente de WhatsApp,
+Antes se cableaban a mano configuracion, base de datos, cliente de WhatsApp,
 ingesta, backfill, multimedia y mantenimiento. Con un segundo adaptador (la API
 Flask) ese cableado tendria que existir dos veces, y dos copias de un cableado
 divergen: se arregla un fallo en una y la otra se queda con el.
@@ -14,7 +14,7 @@ Aqui vive UNA vez. Los adaptadores solo lo encienden y escuchan.
 
 LO QUE NO SABE
 --------------
-Ni Tkinter, ni Flask, ni HTTP. No importa nada de ``app.gui`` ni de
+Ni interfaz, ni Flask, ni HTTP. No importa nada de
 ``app.api``. Se comunica publicando en el bus de eventos.
 
 DOS MODOS
@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from app.core.config import Settings, load_settings
 from app.core.database import Database
@@ -185,6 +185,15 @@ class AppRuntime:
     def fingerprint(self) -> str | None:
         return session_fingerprint(self.settings)
 
+    @property
+    def rechazos_seguidos(self) -> int:
+        """Rechazos 401 seguidos de la sesion guardada. Para poder informar.
+
+        Al tercero se archiva y se pide un codigo nuevo; mientras tanto el
+        frontend puede decir por donde va en vez de girar sin explicacion.
+        """
+        return self._rechazos_seguidos
+
     def info(self) -> RuntimeInfo:
         return RuntimeInfo(
             owner=self.owner,
@@ -200,7 +209,7 @@ class AppRuntime:
     def start_local(self) -> "AppRuntime":
         """Solo PostgreSQL. NO abre la sesion ni pide el cerrojo.
 
-        Es lo que usa ``main.py --viewer`` y lo que permite leer la copia
+        Es lo que usa ``service.py --local`` y lo que permite leer la copia
         mientras otro proceso tiene la sesion: dos lectores de la base no
         estorban, dos duenos de la sesion si.
         """
@@ -1114,7 +1123,7 @@ class AppRuntime:
 def build_runtime(
     *, owner: str, settings: Settings | None = None, configure_logging: bool = True
 ) -> AppRuntime:
-    """Fabrica unica. La usan ``main.py`` y ``service.py``."""
+    """Fabrica unica del runtime. La usa ``service.py``."""
     return AppRuntime(settings, owner=owner, configure_logging=configure_logging)
 
 

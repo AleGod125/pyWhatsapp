@@ -128,7 +128,19 @@ def _matches(pkmsg: Any, recorded: tuple[bytes, bytes] | None) -> bool:
 
 
 def apply(store_path: Path | None = None) -> bool:
-    """Instala el parche sobre ``Receiver._decrypt_enc``. Idempotente."""
+    """Instala el parche sobre ``Receiver._decrypt_enc``. Idempotente.
+
+    El parche se pone una sola vez, pero el REGISTRO se reabre siempre. Son
+    dos cosas con vidas distintas y confundirlas costo caro:
+
+    ``archive_session`` cierra el registro y lo deja en ``None`` para poder
+    mover el archivo en Windows. Si al arrancar el cliente nuevo esta funcion
+    saliera pronto por estar ya parcheada, ``_registry`` se quedaria en
+    ``None`` para siempre y el cuerpo del parche caeria de largo al camino
+    original. Resultado: tras un re-pairing en el mismo proceso, la
+    reutilizacion de ratchet deja de existir en silencio y vuelve
+    ``unknown one-time pre-key id N`` en cada PKMSG reenviado.
+    """
     global _registry
 
     from pywhats.messaging.addressing import session_id
@@ -136,13 +148,24 @@ def apply(store_path: Path | None = None) -> bool:
     from pywhats.signal.experimental.ratchet import ratchet_decrypt
     from pywhats.signal.experimental.types import PreKeySignalMessage
 
+    if store_path is None:
+        raise ValueError("prekey_compat.apply() necesita la ruta del registro")
+
+    # Primero el registro, este parcheado o no: es lo que la sesion nueva
+    # necesita, y apunta al archivo de la sesion nueva.
+    if _registry is not None and getattr(_registry, "_path", None) != store_path:
+        # Cambio de sesion: el registro anterior describe otra identidad.
+        try:
+            _registry.close()
+        except Exception:  # noqa: BLE001 - cerrar no puede impedir seguir
+            log.debug("No se pudo cerrar el registro anterior")
+        _registry = None
+    if _registry is None:
+        _registry = EstablishmentRegistry(store_path)
+
     original = Receiver._decrypt_enc
     if getattr(original, _MARKER, False):
         return True
-
-    if store_path is None:
-        raise ValueError("prekey_compat.apply() necesita la ruta del registro")
-    _registry = EstablishmentRegistry(store_path)
 
     def _decrypt_enc(self: Any, sender: Any, enc_type: str, ciphertext: bytes) -> bytes:
         if enc_type != "pkmsg" or _registry is None:

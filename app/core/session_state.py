@@ -1,6 +1,6 @@
 """Estado de la sesion: unica autoridad sobre lo que la GUI puede mostrar.
 
-REGLA (seccion 1 del encargo): que existan ``session/device.json`` y filas en
+REGLA: que existan ``session/device.json`` y filas en
 PostgreSQL NO significa que la sesion sea valida. Solo lo es cuando el
 servidor acepta el login.
 
@@ -18,7 +18,7 @@ de verdad es el ``<success>`` que procesa ``SessionActivator.on_success`` (el
 servidor no lo envia si rechaza el login), y el rechazo es ``logged_out``.
 
 Los datos locales NUNCA se borran al invalidarse una sesion: PostgreSQL es el
-backup y sobrevive a la desvinculacion (seccion 5).
+backup y sobrevive a la desvinculacion.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ class SessionState:
     Cada vez que la sesion muere o se reinicia, la generacion avanza. Un
     worker lento que termine despues trae su generacion vieja y su resultado
     se ignora, en vez de repintar chats sobre una pantalla de "sesion
-    invalida" (seccion 9).
+    invalida".
     """
 
     def __init__(self) -> None:

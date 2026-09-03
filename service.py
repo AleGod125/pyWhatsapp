@@ -61,7 +61,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "servir solo la copia local de PostgreSQL, sin abrir la sesion de "
-            "WhatsApp. Util con main.py abierto en otra ventana."
+            "WhatsApp."
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "archivar la sesion actual en diagnostics/ y vincular de nuevo. "
+            "NO borra PostgreSQL, ni multimedia, ni diagnosticos."
         ),
     )
     parser.add_argument(
@@ -232,6 +240,22 @@ def main(argv: list[str] | None = None) -> int:
     if not _verificar_migraciones(runtime):
         runtime.stop()
         return 3
+
+    if args.fresh:
+        # La via EXPLICITA para apartar una sesion. El descarte automatico
+        # solo ocurre tras tres rechazos seguidos del servidor, y cuando ese
+        # descarte no puede completarse el runtime remite justamente aqui.
+        from app.whatsapp_client import archive_session
+
+        archivada = archive_session(settings, reason="fresh")
+        if archivada is None:
+            log.info("--fresh: no habia sesion que archivar")
+        else:
+            log.info(
+                "--fresh: sesion archivada en %s. PostgreSQL, multimedia y "
+                "diagnosticos NO se han tocado.",
+                archivada.name,
+            )
 
     if args.check:
         salud = runtime.database.health()

@@ -53,8 +53,7 @@ import re
 import shutil
 import subprocess
 import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -116,39 +115,6 @@ class WebSeed:
         }
 
 
-@dataclass
-class SeedJob:
-    """Estado de una busqueda. Lo consulta el frontend mientras corre."""
-
-    job_id: str
-    chat_id: int
-    state: str = "starting"
-    qr: str | None = None
-    seed: WebSeed | None = None
-    error: str | None = None
-    started_at: float = field(default_factory=time.time)
-    finished_at: float | None = None
-    # Que paso DESPUES de tener la semilla. Se separa a proposito: obtenerla y
-    # conseguir excavar con ella son dos resultados distintos.
-    candidate_emitted: bool = False
-    backfill_enqueued: bool = False
-    transport_available: bool | None = None
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "job_id": self.job_id,
-            "chat_id": self.chat_id,
-            "state": self.state,
-            "qr_available": self.qr is not None,
-            "seed": self.seed.to_json() if self.seed else None,
-            "candidate_emitted": self.candidate_emitted,
-            "backfill_enqueued": self.backfill_enqueued,
-            "transport_available": self.transport_available,
-            "error": self.error,
-            "elapsed_seconds": int(
-                (self.finished_at or time.time()) - self.started_at
-            ),
-        }
 
 
 def _corto(jid: str) -> str:

@@ -1,9 +1,12 @@
 # ---------------------------------------------------------------------------
 # whatsapp_backup - dependencias
 #
-# Versiones fijadas a lo verificado como funcional en Windows 11 + Python 3.11.9
-# el 2026-09-01. pywhats 0.2.0 es la ultima release publicada en PyPI
-# (2026-07-10); no existe version posterior.
+# Versiones fijadas a lo verificado como funcional en Windows 11 + Python 3.11.9.
+# pywhats 0.2.0 es la ultima release publicada en PyPI (2026-07-10).
+#
+# alembic y psycopg no se importan directamente: el primero se ejecuta como
+# herramienta (``python -m alembic upgrade head``) y el segundo es el driver
+# que SQLAlchemy carga desde la URL ``postgresql+psycopg://``.
 # ---------------------------------------------------------------------------
 
 # --- Cliente WhatsApp multi-device (protocolo nativo, sin navegador) ---
@@ -18,16 +21,12 @@ psycopg[binary]==3.3.5
 # --- Configuracion ---
 python-dotenv==1.2.3
 
-# --- Interfaz de terminal ---
-rich==15.0.0
-
 # --- QR / imagenes (declarado explicitamente: lo usamos directamente,
 #     no solo como dependencia transitiva de pywhats) ---
 qrcode==8.2
 pillow==12.3.0
 
-# --- API HTTP (service.py). La ventana Tkinter NO depende de esto:
-#     main.py sigue funcionando sin Flask instalado. ---
+# --- API HTTP: es el producto. service.py es el unico entrypoint. ---
 flask==3.1.3
 flask-cors==6.0.1
 

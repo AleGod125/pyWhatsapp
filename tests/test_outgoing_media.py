@@ -114,7 +114,6 @@ def test_no_se_pierden_los_datos_de_descarga(servicio, session, crudo):
     Se comprueba su PRESENCIA, nunca su valor: son material sensible y no
     aparecen ni en el log ni aqui.
     """
-    from tests.test_outgoing_routing import mensaje_interno
     from pywhats.proto import Message as WAMessage
 
     interno = WAMessage()

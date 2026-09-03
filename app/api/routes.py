@@ -2,7 +2,7 @@
 
 NADA DE TKINTER
 ---------------
-Este modulo, y todo ``app/api``, no puede importar ``tkinter``, ni widgets, ni
+Este modulo, y todo ``app/api``, no puede importar ninguna capa de interfaz ni
 ``root.after``, ni tocar frames. Toda la comunicacion pasa por ``AppRuntime``,
 los servicios y el bus de eventos. Hay una prueba que lo verifica recorriendo
 el paquete.
@@ -861,8 +861,14 @@ EVENT_NAMES: dict[str, str] = {
     # pintando "Conectado" seria mentir.
     "reconnecting": "session.state",
     "reconnected": "session.state",
-    # Recuperacion de historiales pendientes. Se pasan tal cual: el nombre ya
-    # esta en el vocabulario del frontend.
+    # Revision local de historiales pendientes: la ruta normal del producto,
+    # sin sesion auxiliar. Se pasan tal cual: el nombre ya esta en el
+    # vocabulario del frontend.
+    "history.recheck.started": "history.recheck.started",
+    "history.recheck.progress": "history.recheck.progress",
+    "history.recheck.completed": "history.recheck.completed",
+    "history.backfill.completed": "history.backfill.completed",
+    # Recuperacion auxiliar (Web Bootstrap). Apagada por defecto.
     "history.recovery.started": "history.recovery.started",
     "history.recovery.progress": "history.recovery.progress",
     "history.recovery.completed": "history.recovery.completed",
@@ -1018,6 +1024,25 @@ def _serializable(valor: Any) -> Any:
 # ``/session/qr/image`` y son cosas distintas.
 
 
+def _web_bootstrap_apagado():
+    """``None`` si esta encendida; si no, la respuesta que lo explica.
+
+    La ruta SIGUE registrada estando apagada, y es deliberado: si no
+    existiera, el navegador recibiria un 404 sin cabeceras CORS y lo
+    reportaria como un error de CORS, que manda a diagnosticar el sitio
+    equivocado. Registrada, el frontend obtiene un motivo legible.
+    """
+    if runtime().settings.web_bootstrap_enabled:
+        return None
+    return _error_code(
+        "WEB_BOOTSTRAP_DISABLED",
+        "La recuperacion auxiliar esta desactivada. El producto no la "
+        "necesita: usa POST /history/recheck-pending, que revisa lo mismo "
+        "sin vincular un segundo dispositivo.",
+        404,
+    )
+
+
 def _recovery():
     """El servicio de recuperacion, creado una sola vez por proceso."""
     rt = runtime()
@@ -1025,7 +1050,7 @@ def _recovery():
     if existente is not None:
         return existente
 
-    from app.services.history_recovery import HistoryRecoveryService
+    from app.experimental.history_recovery import HistoryRecoveryService
 
     servicio = HistoryRecoveryService(rt.settings, rt.database, publish=rt.bus.publish)
     rt.history_recovery = servicio
@@ -1074,12 +1099,20 @@ def recover_pending():
     puede pedir un QR auxiliar, asi que bloquear la peticion dejaria al
     navegador esperando sin poder leer el progreso.
     """
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     return _lanzar_recuperacion(None)
 
 
 @api.get("/history/web-bootstrap/recover-pending/status/<job_id>")
 def recover_pending_status(job_id: str):
     """Progreso del intento. ``qr_required`` significa QR AUXILIAR."""
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     trabajo = _recovery().get(job_id)
     if trabajo is None:
         return _error("trabajo no encontrado", 404)
@@ -1089,6 +1122,10 @@ def recover_pending_status(job_id: str):
 @api.post("/chats/<int:chat_id>/history/recover")
 def chat_history_recover(chat_id: int):
     """Lo mismo, para una sola conversacion."""
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     from sqlalchemy import select
 
     from app.models import SEEDLESS_STATUSES, Chat, ChatHistoryState
@@ -1126,6 +1163,10 @@ def web_bootstrap_qr():
     Vincula un dispositivo ADICIONAL a la cuenta, con su propia sesion. El QR
     de pywhats sigue estando en ``/session/qr/image`` y son cosas distintas.
     """
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     import io
 
     from app.core.qr_render import render_qr
@@ -1153,6 +1194,10 @@ def web_bootstrap_qr():
 @api.get("/history/web-bootstrap/session")
 def web_bootstrap_session():
     """Si la sesion auxiliar ya esta vinculada (para saber si hara falta QR)."""
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     servicio = _recovery()
     disponible, motivo = servicio.provider.available()
     return jsonify(
@@ -1171,4 +1216,72 @@ def web_bootstrap_forget():
     La principal, el Signal Store y PostgreSQL quedan intactos. Es lo que
     permite quitar toda esta funcion sin consecuencias.
     """
+    apagado = _web_bootstrap_apagado()
+    if apagado is not None:
+        return apagado
+
     return jsonify({"removed": _recovery().provider.forget()})
+
+
+# ---------------------------------------------------------------------------
+# Revision de historiales pendientes (ruta normal del producto)
+# ---------------------------------------------------------------------------
+#
+# Es la version en bloque del boton "volver a comprobar" de cada chat. Todo
+# local: resuelve alias, busca un ancla real y reinterpreta los blobs que
+# WhatsApp YA entrego. No vincula ningun dispositivo ni pide un segundo QR.
+
+
+def _recheck_pendientes():
+    """El servicio de revision, creado una sola vez por proceso."""
+    rt = runtime()
+    existente = getattr(rt, "pending_recheck", None)
+    if existente is not None:
+        return existente
+
+    from app.services.pending_recheck import PendingRecheckService
+
+    servicio = PendingRecheckService(rt.settings, rt.database, publish=rt.bus.publish)
+    rt.pending_recheck = servicio
+    return servicio
+
+
+@api.post("/history/recheck-pending")
+def history_recheck_pending():
+    """Revisa TODOS los chats que esperan un ancla, sin salir de casa.
+
+    Responde ``202`` enseguida: reinterpretar los blobs de decenas de chats
+    tarda, y el progreso llega por SSE (``history.recheck.*``).
+
+    Con ``?auto=1`` es la revision que el panel dispara al abrirse: respeta una
+    espera entre ejecuciones y, si ya hay una en marcha, devuelve ESA en vez de
+    fallar. Sin el parametro es el boton, que se ejecuta siempre.
+    """
+    rt = runtime()
+    if rt.database is None:
+        return _error("la base de datos no esta disponible", 503)
+
+    auto = request.args.get("auto", "").lower() in ("1", "true", "yes")
+    servicio = _recheck_pendientes()
+    try:
+        trabajo = servicio.start(rt, auto=auto)
+    except RuntimeError as exc:
+        # Ya hay una en marcha: se devuelve ESA, para que el frontend pueda
+        # seguirla en vez de reintentar a ciegas.
+        activo = servicio.active_job()
+        return _error_code(
+            "RECHECK_BUSY",
+            str(exc),
+            409,
+            job=activo.to_json() if activo else None,
+        )
+    return jsonify(trabajo.to_json()), 202
+
+
+@api.get("/history/recheck-pending/status/<job_id>")
+def history_recheck_pending_status(job_id: str):
+    """Progreso de la revision, para quien no pueda usar SSE."""
+    trabajo = _recheck_pendientes().get(job_id)
+    if trabajo is None:
+        return _error("trabajo no encontrado", 404)
+    return jsonify(trabajo.to_json())

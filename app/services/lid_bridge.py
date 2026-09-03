@@ -13,7 +13,7 @@ pywhats mantiene el mapeo que va aprendiendo en su Signal Store, tabla
 Este modulo lo lee en SOLO LECTURA y copia lo aprendido a ``contacts.lid``, que
 es NUESTRA columna. No se escribe una sola fila en el Signal Store, no se
 mueve a PostgreSQL y no se abre en modo escritura mientras el cliente lo usa:
-solo se consulta (seccion 19 del brief).
+solo se consulta.
 
 Ojo con las expectativas: el mapeo crece segun WhatsApp lo va revelando. Al
 principio puede tener una sola entrada. No se inventa ninguna correspondencia

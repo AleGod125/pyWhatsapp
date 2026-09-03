@@ -1,6 +1,6 @@
 """Recuperacion historica mediante HISTORY_SYNC_ON_DEMAND.
 
-Arquitectura (seccion 27 del brief). La peticion NO se envia al contacto cuya
+Arquitectura. La peticion NO se envia al contacto cuya
 conversacion queremos: el destinatario es NUESTRO PROPIO telefono principal, y
 el chat objetivo viaja dentro del mensaje::
 
@@ -21,7 +21,7 @@ dispositivo principal y marca la stanza como ``category="peer"``.
 ``Sender.send_message`` de pywhats 0.2.0 no ofrece ese modo, asi que aqui se
 envia como un mensaje normal dirigido a la propia cuenta. Puede que el
 servidor no lo acepte. Mientras no se observe una respuesta ON_DEMAND real,
-esta capa NO puede darse por funcionando (seccion 60).
+esta capa NO puede darse por funcionando.
 """
 
 from __future__ import annotations
@@ -393,7 +393,7 @@ class BackfillService:
 
         # Una respuesta VALIDA con 0 mensajes agota ESE chat; no dice nada
         # malo del protocolo. Si el telefono contesto, ON_DEMAND funciona y el
-        # backfill global debe continuar con los demas chats (seccion 13).
+        # backfill global debe continuar con los demas chats.
         if self.stats.responses_received > 0:
             log.info(
                 "CANARY: el protocolo responde (respuestas=%d) pero este chat no "
@@ -538,7 +538,7 @@ class BackfillService:
     async def _process_chat(self, chat_id: int, chat_jid: str, max_rounds: int) -> None:
         """Pide historial de un chat hasta agotarlo DE VERDAD.
 
-        Condiciones de parada, todas basadas en evidencia (seccion 14):
+        Condiciones de parada, todas basadas en evidencia:
 
         * no hay cursor real que anclar           -> no_valid_cursor
         * el telefono dice que no le queda nada   -> exhausted
@@ -573,7 +573,7 @@ class BackfillService:
             with self._database.transaction() as session:
                 # El cursor se RECALCULA en cada vuelta desde PostgreSQL: tras
                 # insertar un bloque puede existir un mensaje mas antiguo con
-                # ID real que el usado la vez anterior (seccion 13).
+                # ID real que el usado la vez anterior.
                 cursor = repo.get_oldest_valid_history_cursor(session, chat_jid)
                 before = repo.count_messages(session, chat_jid)
 
@@ -954,14 +954,25 @@ class BackfillService:
         device = getattr(self._client, "device", None)
         if device is None or getattr(device, "jid", None) is None:
             return None
-        raw = f"{device.jid.user}:{device.jid.server}:{getattr(device, 'device_id', '')}"
+        # ``registration_id`` entra a proposito. ``device_id`` es un NUMERO DE
+        # RANURA que el servidor reutiliza: al desvincular todos los
+        # dispositivos la numeracion puede volver atras, y dos identidades
+        # distintas acabarian con la misma huella. Entonces se daria por
+        # confirmado el historial inicial de una sesion que ya no existe y la
+        # espera del bootstrap se saltaria sin que nada lo delatara. El
+        # registration_id se genera nuevo en cada vinculacion.
+        raw = (
+            f"{device.jid.user}:{device.jid.server}:"
+            f"{getattr(device, 'device_id', '')}:"
+            f"{getattr(device, 'registration_id', '')}"
+        )
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def capability_confirmed(self) -> bool:
         """``True`` si ESTA sesion ya demostro que ON_DEMAND funciona.
 
         No basta con un booleano eterno: tras revincular hay otra sesion y la
-        capacidad debe volver a comprobarse (seccion 35).
+        capacidad debe volver a comprobarse.
         """
         fingerprint = self.session_fingerprint()
         if fingerprint is None:
@@ -1096,7 +1107,7 @@ class BackfillService:
         """Una vez que ON_DEMAND funciona, se deja constancia permanente.
 
         A partir de ahi un timeout es un problema DE ESE CHAT, y no vuelve a
-        declararse que "WhatsApp no soporta historial" (seccion 30).
+        declararse que "WhatsApp no soporta historial".
         """
         fingerprint = self.session_fingerprint()
         with self._database.transaction() as session:

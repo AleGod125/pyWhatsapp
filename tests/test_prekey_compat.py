@@ -36,7 +36,7 @@ from pywhats.signal.experimental import (
     x3dh_initiator,
     xeddsa_sign,
 )
-from pywhats.signal.experimental.keys import secure_random, signal_pubkey
+from pywhats.signal.experimental.keys import signal_pubkey
 from pywhats.socket.crypto import generate_keypair
 
 SENDER = JID(user="34600111222", server="s.whatsapp.net", device=0)

@@ -1,6 +1,6 @@
 """Cliente de WhatsApp: pywhats corriendo en su propio hilo con event loop.
 
-Modelo de concurrencia (seccion 34 del brief):
+Modelo de concurrencia:
 
     hilo principal            hilo "wa-client"
     ---------------           ----------------
@@ -52,7 +52,7 @@ PYWHATS_EVENTS = (
     "history_sync",
     "decrypt_error",
     # App state: 'contact' y 'pushname' son la fuente de los nombres que
-    # necesita el sidebar (seccion 36 del brief).
+    # necesita el sidebar.
     "contact",
     "pushname",
     "mute",
@@ -482,8 +482,8 @@ class WhatsAppClient:
             # una tarea que el loop, ya cerrandose, destruiria sin ejecutar:
             # justo el "Task was destroyed but it is pending" que aparecia.
             log.debug("El cliente ya habia terminado; no hace falta desconectar")
-        elif loop is not None and client is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
+        elif loop is not None and self._client is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._client.disconnect(), loop)
             try:
                 future.result(timeout=timeout)
                 log.info("Cliente desconectado limpiamente")

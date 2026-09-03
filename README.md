@@ -54,66 +54,44 @@ python -m alembic upgrade head
 Comprobar que todo responde antes de tocar WhatsApp:
 
 ```powershell
-python main.py --check
+py service.py --check
 ```
 
 ## Ejecucion
 
-Hay DOS entrypoints. Los dos usan el MISMO `.env` y los MISMOS servicios.
-
-```powershell
-py main.py       # ventana Tkinter
-py service.py    # API HTTP en http://127.0.0.1:5000/api/v1
+```bash
+py service.py
 ```
 
-```
-                       +-- main.py     -> Tkinter   (app/gui)
-    AppRuntime/Services +
-                       +-- service.py  -> Flask     (app/api)
+Levanta la API en `http://127.0.0.1:5000/api/v1` y abre la sesion del
+companion. Es el **unico** entrypoint: no hay interfaz de escritorio.
+
+El frontend vive en un repositorio aparte
+([`WhatsappBackup`](https://github.com/AleGod125/WhatsappBackup), Angular):
+
+```bash
+ng serve            # http://localhost:4200
 ```
 
-`AppRuntime` (`app/core/runtime.py`) monta configuracion, base de datos, sesion
-de WhatsApp, ingesta, backfill, multimedia y mantenimiento. Los dos entrypoints
-solo le ponen una interfaz delante; el cableado NO esta duplicado, y hay una
-prueba que lo verifica.
+| Opcion | Para que |
+|---|---|
+| `--local` | Servir solo la copia de PostgreSQL, sin abrir la sesion de WhatsApp. |
+| `--check` | Verificar entorno, PostgreSQL y migraciones, y salir. |
+| `--fresh` | Archivar la sesion actual en `diagnostics/` y volver a vincular. No borra PostgreSQL, ni multimedia, ni diagnosticos. |
+| `--host` / `--port` | Sobrescribir `API_HOST` / `API_PORT` solo en esa ejecucion. |
 
 ### Un solo dueno de la sesion
 
-`main.py` y `service.py` no pueden abrir el companion a la vez: dos procesos
-escribiendo en `session/device.json` y en la base Signal producen una sesion
-corrupta y obligan a volver a vincular. Lo impide `session/runtime.lock`.
+Dos procesos no pueden abrir el companion a la vez: el estado del protocolo se
+corromperia y habria que volver a vincular. Lo impide `session/runtime.lock`,
+que guarda PID y heartbeat. Un cerrojo cuyo proceso ya no existe se recupera
+solo.
 
-El segundo proceso sale con codigo 5 y un mensaje que dice QUIEN tiene la
-sesion y que hacer. Si un proceso murio de mala manera, su cerrojo se detecta
-como huerfano (se comprueba si el PID sigue vivo) y se retira solo ESE archivo:
-`device.json` y la base Signal no se tocan nunca.
+Para leer la copia local mientras otro proceso tiene la sesion:
 
-Leer la copia local NO pide el cerrojo. Con la sesion abierta en otro proceso:
-
-```powershell
-py main.py --viewer      # ventana, solo lectura
-py service.py --local    # API, solo lectura
+```bash
+py service.py --local
 ```
-
-### main.py
-
-```powershell
-python main.py
-```
-
-- **Primera vez**: se abre una ventana con un codigo QR. En el telefono:
-  WhatsApp -> Dispositivos vinculados -> Vincular un dispositivo -> escanear.
-- **Siguientes veces**: detecta `session/device.json` y hace login directo,
-  sin QR.
-
-Opciones:
-
-| Flag | Efecto |
-|---|---|
-| `--check` | Verifica entorno, PostgreSQL, migraciones y compatibilidades. No conecta a WhatsApp. |
-| `--no-gui` | Sin ventana. Util para ver el flujo en logs; el QR no se puede escanear. |
-| `--fresh` | Archiva la sesion actual en `diagnostics/` y vuelve a vincular. **No** borra PostgreSQL, ni multimedia, ni diagnosticos. |
-| `--viewer` | Solo el visor sobre PostgreSQL. No conecta ni pide el cerrojo. |
 
 ### service.py
 
@@ -296,74 +274,28 @@ compatibilidad (ver mas abajo). Tampoco es el Signal Store.
 ## Estructura
 
 ```
-main.py                 entrypoint Tkinter
-service.py              entrypoint Flask (API HTTP)
-alembic.ini             migraciones (sin secretos: la URL sale de .env)
-.env                    UNA sola configuracion para los dos entrypoints
-
+service.py              entrypoint unico (API HTTP + runtime)
 app/
-  core/                 lo que la aplicacion ES, sin interfaz
-    config.py           carga y valida .env; nunca expone la password
-    logging_setup.py    logs [APP] [DB] [WA] [API] ... + filtro anti-secretos
-    database.py         motor y transacciones de PostgreSQL
-    runtime.py          AppRuntime: la capa que comparten ambos entrypoints
-    orchestrator.py     arranque, trabajo de fondo y cierre
-    lock.py             cerrojo de sesion entre procesos
-    identity.py         identidad propia y enmascarado de identificadores
-    session_state.py    maquina de estados de la sesion
-    message_parser.py   normalizacion de WebMessageInfo
-    message_classifier.py  visible vs. control del protocolo
-    system_message.py   que significa un evento de sistema
-    previews.py         vista previa de un mensaje
-    avatars.py          iniciales y color por contacto
-    qr_render.py        imagen del QR
-  services/             logica de negocio; no conoce ninguna interfaz
-    repository.py       upserts en lote, paginacion, cursor historico
-    history_service.py  ingesta de History Sync
-    history_gate.py     barrera del historial inicial
-    backfill_service.py recuperacion ON_DEMAND
-    media_service.py    descarga de adjuntos
-    live_service.py     mensajes en vivo
-    contacts_service.py nombres de la agenda
-    maintenance_service.py  reconciliacion automatica NO destructiva
-    thumbnails.py       miniaturas cacheadas
-  models/               esquema PostgreSQL + protobuf propio
-    schema.py           las 7 tablas
-    proto/              descriptores que pywhats no trae
-  events/               bus de eventos con reparto a varios consumidores
-  gui/                  adaptador Tkinter
-    app_window.py, chat_view.py, ui_theme.py
-  api/                  adaptador HTTP (Flask + SSE)
-    app_factory.py, routes.py, serializers.py
-  compat/               adaptaciones sobre pywhats 0.2.0
-  whatsapp_client.py    pywhats en su propio hilo + event loop
-
-scripts/                herramientas de diagnostico, se ejecutan a mano
-  inspect_db.py  inspect_history_gaps.py  probe_chat.py
-  repair_db.py   ingest_blobs.py
-
+  api/                  Flask: rutas, serializadores, SSE
+  core/                 config, runtime, orquestador, estado, cerrojo, Signal helpers
+  compat/               parches sobre pywhats 0.2.0 (ver mas abajo)
+  events/               bus de eventos -> SSE
+  models/               esquema SQLAlchemy
+  services/             ingesta, backfill, multimedia, mantenimiento, repositorio
+  experimental/         NO es producto. Apagado por defecto (ver docs/)
 migrations/             Alembic
-session/                estado del companion + runtime.lock (NO versionado)
-data/                   media, cache, blobs de history (NO versionado)
-diagnostics/            logs y sesiones archivadas (NO versionado)
-tests/
+tests/                  pytest contra el PostgreSQL real
+tools/                  utilidades de desarrollo (reset de prueba)
+scripts/                diagnostico puntual
+docs/                   documentacion tecnica
 ```
 
-Las dependencias van en un solo sentido:
+Reglas de dependencia, cada una con su prueba que mira el AST:
 
-```
-    api  ---+
-            +--> services --> models
-    gui  ---+        |
-                     +--> core
-```
-
-`app/api` no importa `tkinter` ni `app.gui`. `app/gui` no importa `flask` ni
-`app.api`. `app/services` no importa ninguno de los dos. `app/core` no importa
-`tkinter`. Hay una prueba por cada una de esas reglas, y miran el AST, no el
-texto: los comentarios que explican la regla mencionan la palabra prohibida.
-
----
+- `app/api` no importa ninguna capa de interfaz.
+- `app/core` y `app/services` no importan `app.experimental`.
+- `app/api` no importa `app.experimental` en la cabecera del modulo: lo
+  experimental se carga solo si un flag lo pide.
 
 ## Compatibilidades sobre pywhats 0.2.0
 
@@ -451,7 +383,7 @@ serializado y se conservan en `messages.raw_proto`.
 
 ## Mantenimiento automatico, y la linea que no cruza
 
-`main.py` se mantiene solo. Al arrancar, y luego cada
+El sistema se mantiene solo. Al arrancar, y luego cada
 `MAINTENANCE_INTERVAL_SECONDS`, `MaintenanceService` reconcilia lo que se
 deriva de los datos:
 

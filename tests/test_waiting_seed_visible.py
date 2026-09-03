@@ -17,7 +17,6 @@ seguir visibles hasta que algo los recupere de verdad.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import select
 
 from app.models import COMPLETE_STATUSES, Chat, ChatHistoryState
 

@@ -49,6 +49,5 @@ backups/
 # `npm install` dentro de web_bootstrap/, y la sesion auxiliar es una
 # vinculacion mas de la cuenta: ninguna de las dos cosas va al repositorio.
 web_bootstrap/node_modules/
-web_bootstrap/package-lock.json
 session/web_bootstrap/
 session/backups/

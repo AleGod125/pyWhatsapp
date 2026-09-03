@@ -11,7 +11,6 @@ login, y los datos locales nunca se borran al invalidarse una sesion.
 
 from __future__ import annotations
 
-import queue
 
 import pytest
 
@@ -98,14 +97,6 @@ def test_un_listener_roto_no_bloquea_el_estado(state):
 # ---------------------------------------------------------------------------
 
 
-def test_A_sesion_valida_abre_el_visor(app, state):
-    app.session_state = state
-    state.set(AppState.CONNECTED, reason="<success>")
-
-    app.show_viewer(connected=True)
-    app.root.update()
-
-    assert app.viewer.winfo_ismapped() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -113,25 +104,6 @@ def test_A_sesion_valida_abre_el_visor(app, state):
 # ---------------------------------------------------------------------------
 
 
-def test_B_login_rechazado_bloquea_el_visor(app, state):
-    app.session_state = state
-    state.set(AppState.CONNECTED)
-    app.show_viewer(connected=True)
-    app.root.update()
-
-    # Llega el 401.
-    state.set(AppState.SESSION_INVALID, reason="login rechazado 401")
-    app.show_status("Esta sesion ya no esta vinculada", "...")
-    app.root.update()
-
-    assert app.viewer.winfo_ismapped() == 0, "el visor debe quedar oculto"
-    assert app.status.winfo_ismapped() == 1
-
-    # Y un intento posterior de abrirlo no debe prosperar.
-    app.show_viewer(connected=False)
-    app.root.update()
-    assert app.viewer.winfo_ismapped() == 0
-    assert state.viewer_allowed is False
 
 
 # ---------------------------------------------------------------------------
@@ -139,20 +111,6 @@ def test_B_login_rechazado_bloquea_el_visor(app, state):
 # ---------------------------------------------------------------------------
 
 
-def test_C_datos_locales_sin_sesion_no_se_muestran(app, state, session):
-    """PostgreSQL con chats no autoriza a mostrarlos si la sesion murio."""
-    from app.services import repository as repo
-
-    repo.upsert_chat(session, jid="34600111222@s.whatsapp.net", chat_type="individual")
-    session.flush()
-    assert len(repo.list_chat_summaries(session)) >= 1, "hay datos locales"
-
-    app.session_state = state
-    state.set(AppState.PAIRING_REQUIRED, reason="sin vinculacion")
-
-    app.show_viewer(connected=False)
-    app.root.update()
-    assert app.viewer.winfo_ismapped() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -160,23 +118,6 @@ def test_C_datos_locales_sin_sesion_no_se_muestran(app, state, session):
 # ---------------------------------------------------------------------------
 
 
-def test_D_refresco_tardio_se_ignora(app, state):
-    """Un worker lento no puede repintar chats sobre la pantalla de error."""
-    app.session_state = state
-    state.set(AppState.SESSION_INVALID, reason="401")
-
-    llamadas = []
-    original = app.viewer.refresh_chats
-    app.viewer.refresh_chats = lambda *a, **k: llamadas.append(1)
-    try:
-        app.schedule_sidebar_refresh(delay_ms=1)
-        app.root.update()
-        app.root.after(30, app.root.quit)
-        app.root.mainloop()
-    finally:
-        app.viewer.refresh_chats = original
-
-    assert llamadas == [], "el sidebar no debe refrescarse sin sesion activa"
 
 
 def test_D_generacion_descarta_resultados_viejos(state):
@@ -194,27 +135,6 @@ def test_D_generacion_descarta_resultados_viejos(state):
 # ---------------------------------------------------------------------------
 
 
-def test_E_revinculacion_solo_muestra_chats_tras_connected(app, state):
-    app.session_state = state
-
-    state.set(AppState.PAIRING_REQUIRED, reason="QR")
-    app.show_pairing()
-    app.root.update()
-    app.show_viewer(connected=False)
-    app.root.update()
-    assert app.viewer.winfo_ismapped() == 0, "durante el QR no hay chats"
-
-    # paired todavia NO es connected.
-    state.set(AppState.CONNECTING, reason="handshake")
-    app.show_viewer(connected=False)
-    app.root.update()
-    assert app.viewer.winfo_ismapped() == 0, "el handshake no basta"
-
-    # Ahora si: el servidor acepto.
-    state.set(AppState.CONNECTED, reason="<success>")
-    app.show_viewer(connected=True)
-    app.root.update()
-    assert app.viewer.winfo_ismapped() == 1
 
 
 # ---------------------------------------------------------------------------

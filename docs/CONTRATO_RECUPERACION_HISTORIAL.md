@@ -1,61 +1,69 @@
-# Recuperar historiales pendientes — contrato para el frontend
+# Historiales pendientes — contrato de API
 
-Para el repo de Angular (`WhatsappBackup`). Base: `http://127.0.0.1:5000/api/v1`.
+Base: `http://127.0.0.1:5000/api/v1`. Frontend: `WhatsappBackup` (Angular, `http://localhost:4200`).
+
+> **Cambio importante.** La recuperación con sesión auxiliar (Web Bootstrap /
+> Baileys) está **apagada** por defecto. El producto usa un solo QR y una sola
+> sesión. Los endpoints `/history/web-bootstrap/*` siguen registrados pero
+> devuelven `404 WEB_BOOTSTRAP_DISABLED`.
 
 ---
 
-## 1. El problema que resuelve, en una frase
+## 1. Qué es un chat pendiente
 
 Algunas conversaciones llegaron del emparejamiento como **pura metadata**:
-nombre, identificador, contadores... y ni un solo identificador de mensaje.
-`HISTORY_SYNC_ON_DEMAND` va **anclado por definición** — hay que decirle *desde
-qué mensaje* seguir hacia atrás — así que sin esa primera referencia no se
-puede pedir nada. Esos chats quedan en `waiting_seed`.
+nombre, identificador, contadores… y ni un solo identificador de mensaje.
+`HISTORY_SYNC_ON_DEMAND` va **anclado por definición** —hay que decirle *desde
+qué mensaje* seguir hacia atrás—, así que sin esa referencia no se puede pedir
+nada. Esos chats quedan en `waiting_seed`.
 
-`waiting_seed` **NO significa "chat vacío"**. Significa: *WhatsApp todavía no
-ha entregado un punto desde el que pedir el historial*. Es reintentable, y el
-chat despierta solo si llega un mensaje real.
+`waiting_seed` **NO significa "chat vacío"** y **no es un error**. Significa:
+*WhatsApp todavía no ha entregado un punto desde el que pedir el historial*. Es
+reintentable, y el chat **despierta solo** si llega un mensaje real.
 
-Esta función abre una **sesión auxiliar independiente** (su propio QR, su
-propia vinculación) cuyo único trabajo es conseguir esa referencia. Si la
-consigue, se la entrega al motor de siempre. Su único efecto sobre la base de
-datos es dejar el cursor del chat: no escribe mensajes ni multimedia.
+Texto recomendado para la UI:
 
-### Expectativa realista
+> WhatsApp todavía no proporcionó una referencia válida para recuperar mensajes
+> anteriores.
 
-**`no_seed` va a ser el resultado habitual.** Las fuentes nativas se agotaron
-con medidas (bootstrap, blobs de historial, PostgreSQL, alias PN/LID, app-state
-incremental y snapshot completo: cero claves), y en la prueba la sesión
-auxiliar tampoco recibió eventos de historial al reconectar — la entrega
-parece ser de una sola vez, en el emparejamiento.
-
-Diséñalo para que **`no_seed` se vea como un estado normal y reintentable**, no
-como un fallo. Si la UI lo pinta en rojo, el usuario va a creer que algo se
-rompió cuando no se rompió nada.
+En ámbar o neutro. **Nunca en rojo.**
 
 ---
 
-## 2. Los dos botones
+## 2. Un solo QR
 
-### A. Global — "Recuperar historiales pendientes"
+El único código que se muestra es el de la sesión principal:
 
 ```
-POST /api/v1/history/web-bootstrap/recover-pending
+GET /api/v1/session/qr          → { available, generation, ... }
+GET /api/v1/session/qr/image    → image/png
 ```
 
-Sin cuerpo. Responde **`202`** enseguida (el proceso tarda minutos y puede
-pedir un QR, así que no bloquea):
+No hay QR auxiliar en el flujo normal. Nada arranca Baileys al iniciar — hay
+un test que lo comprueba leyendo `runtime.py`, `orchestrator.py` y `service.py`.
+
+---
+
+## 3. Los dos botones
+
+### Global — "Revisar historiales pendientes"
+
+```
+POST /api/v1/history/recheck-pending
+```
+
+Sin cuerpo. Responde **`202`** enseguida:
 
 ```json
 {
   "job_id": "a3f81c92",
   "state": "starting",
-  "total": 30,
+  "total": 29,
   "processed": 0,
   "recovered": 0,
-  "no_seed": 0,
+  "still_waiting": 0,
   "errors": 0,
-  "qr_required": false,
+  "messages_recovered": 0,
   "current_chat": null,
   "chats": [{ "id": 13, "name": "ubernel", "state": "waiting_seed" }],
   "error": null,
@@ -63,24 +71,50 @@ pedir un QR, así que no bloquea):
 }
 ```
 
-### B. Por conversación — dentro de la vista del chat
+### Por conversación — "Volver a comprobar"
 
 ```
-POST /api/v1/chats/<chat_id>/history/recover
+POST /api/v1/chats/<chat_id>/history/recheck
 ```
 
-Mismo cuerpo de respuesta, más `"chat_id": <id>`.
+Este es **síncrono** (es un solo chat) y devuelve otra forma:
 
-Muestra el botón **solo** cuando el chat esté en `waiting_seed`. Si no, la API
-lo rechaza con `409 CHAT_NOT_WAITING_SEED`.
+```json
+{
+  "chat_jid": "...",
+  "previous_status": "waiting_seed",
+  "status": "waiting_seed",
+  "aliases": ["...", "..."],
+  "blobs_reviewed": 12,
+  "messages_recovered": 0,
+  "seed_found": false,
+  "can_dig": false,
+  "history": { }
+}
+```
+
+`normalizeChatRecheck()` en el frontend lo traduce a la misma forma de trabajo
+para que el panel sea uno solo.
+
+### Qué hacen exactamente
+
+Todo local, sin salir a la red:
+
+1. resuelven los alias del contacto (el ancla puede estar guardada bajo su
+   *otro* identificador — teléfono vs LID);
+2. buscan un mensaje con ID real de WhatsApp entre ellos;
+3. si no lo hay, **reinterpretan los blobs de historial ya guardados en disco**
+   (el normalizador ha mejorado desde que se guardaron);
+4. si aparece un ancla, el chat vuelve a `pending` y se encola para que pywhats
+   pida su historial con ON_DEMAND.
+
+Si no aparece nada, el chat **se queda en `waiting_seed`**. No es un error.
 
 ---
 
-## 3. Seguir el progreso
+## 4. Progreso
 
-Dos vías. **Usa SSE**, y el sondeo solo como respaldo.
-
-### SSE (recomendado)
+### SSE — el mecanismo principal
 
 ```
 GET /api/v1/events/stream        (text/event-stream)
@@ -88,159 +122,146 @@ GET /api/v1/events/stream        (text/event-stream)
 
 | Evento | Cuándo | Datos |
 |---|---|---|
-| `history.recovery.started` | arranca | el trabajo entero |
-| `history.recovery.progress` | cada chat procesado, y al pedir QR | el trabajo entero |
-| `history.recovery.completed` | termina (también si no había nada) | el trabajo entero |
-| `history.seed.found` | aparece una referencia | `{chat_id, job_id}` |
-| `history.backfill.started` | esa referencia ya alimenta al motor | `{chat_id, job_id}` |
-| `history.seed.not_found` | ese chat sigue esperando | `{chat_id, job_id}` |
+| `history.recheck.started` | arranca | el trabajo entero |
+| `history.recheck.progress` | cada chat | el trabajo entero |
+| `history.recheck.completed` | termina | el trabajo entero |
+| `history.backfill.started` | lo despertado entra en la cola | `{job_id, chats}` |
+| `history.backfill.completed` | el backfill automático terminó | el resumen medido |
 
-Los tres `recovery.*` traen el objeto completo del trabajo: puedes redibujar
-todo el panel con cada uno sin guardar estado propio.
+Los tres `recheck.*` traen el trabajo completo: puedes redibujar el panel con
+cada uno sin llevar contabilidad propia.
 
-### Sondeo (respaldo)
+Se conservan los de siempre: `session.state`, `session.qr`, `chat.updated`,
+`message.created`, `message.updated`, `media.updated`, `sync.status`.
+
+### Sondeo — respaldo
 
 ```
-GET /api/v1/history/web-bootstrap/recover-pending/status/<job_id>
+GET /api/v1/history/recheck-pending/status/<job_id>
 ```
-
-Mismo objeto. `404` si el `job_id` no existe.
 
 ---
 
-## 4. Estados
+## 5. Estados
 
 ### Del trabajo — `state`
 
-| Valor | Significado | UI |
+| Valor | UI |
+|---|---|
+| `starting` | spinner |
+| `running` | barra `processed / total` |
+| `completed` | resumen |
+| `failed` | mensaje de `error` |
+
+### De cada chat — `chats[].state`, `current_chat.state`
+
+| Valor | Significado | Color |
 |---|---|---|
-| `starting` | arrancando | spinner |
-| `running` | buscando referencias | barra `processed / total` |
-| `qr_required` | **hace falta escanear el QR auxiliar** | mostrar el QR |
-| `completed` | terminó | resumen |
-| `failed` | no pudo arrancar; mirar `error` | mensaje de error |
+| `waiting_seed` | en cola, o sigue sin ancla | neutro / ámbar |
+| `rechecking` | revisándose ahora | spinner |
+| `seed_found` | apareció un ancla | verde |
+| `fetching_history` | ya está descargando | verde + progreso |
+| `error` | falló de verdad | rojo |
 
-### De cada chat — `chats[].state` y `current_chat.state`
-
-| Valor | Significado | Sugerencia |
-|---|---|---|
-| `waiting_seed` | en cola | neutro |
-| `recovering_seed` | buscándose ahora | spinner |
-| `seed_found` | apareció una referencia | ✔ |
-| `fetching_history` | ya está descargando historial | ✔ + progreso |
-| `no_seed` | **sigue esperando. No es error. Reintentable** | neutro / ámbar |
-| `error` | algo falló de verdad | ✖ |
-| `complete`, `timeout` | reservados | neutro |
-
-Los tres que el usuario tiene que poder distinguir de un vistazo:
-**recuperado** (`seed_found` / `fetching_history`), **sin referencia**
-(`no_seed`) y **error** (`error`).
-
----
-
-## 5. El QR auxiliar
-
-Es una **vinculación distinta** de la principal. Que pywhats esté conectado no
-implica que la auxiliar lo esté, y viceversa. **No reutilices el componente del
-QR principal sin cambiar el texto**, o el usuario va a creer que se le cayó la
-sesión.
-
-Antes de ofrecer el botón, consulta:
-
-```
-GET /api/v1/history/web-bootstrap/session
-→ {"available": true, "reason": null, "linked": false}
-```
-
-- `available: false` → la función no está instalada; oculta el botón y muestra
-  `reason` (suele ser: falta `npm install` en `web_bootstrap/`).
-- `linked: false` → habrá QR. Avisa antes: *"se vinculará un dispositivo
-  adicional a tu WhatsApp"*.
-
-Cuando el trabajo pase a `qr_required` (por SSE o sondeo):
-
-```
-GET /api/v1/history/web-bootstrap/qr        → image/png, Cache-Control: no-store
-```
-
-`404 NO_AUXILIARY_QR` si no hay ninguno pendiente. **El payload del QR nunca
-sale en JSON** — es una credencial de vinculación y solo se sirve como imagen.
-No lo caches, no lo registres, no lo pongas en la URL.
-
-Para desvincular solo la auxiliar (la principal, el Signal Store y PostgreSQL
-quedan intactos):
-
-```
-DELETE /api/v1/history/web-bootstrap/session   → {"removed": true}
-```
-
-Ofrécelo visible. Es lo que permite quitar toda esta función sin consecuencias.
+Los tres que el usuario debe distinguir de un vistazo: **recuperado**,
+**sigue pendiente**, **error**.
 
 ---
 
 ## 6. Errores
 
-Todos traen `{"error": {"code": "...", "message": "..."}}` y algún campo extra.
+`{"error": {"code": "...", "message": "..."}}` más campos extra.
 
 | Código | HTTP | Qué hacer |
 |---|---|---|
-| `RECOVERY_UNAVAILABLE` | 409 | Falta el componente auxiliar. Oculta el botón, muestra `message`. |
-| `RECOVERY_BUSY` | 409 | Ya hay uno en marcha. **La respuesta trae `job` con el trabajo activo**: engánchate a ese en vez de reintentar a ciegas. |
-| `CHAT_NOT_WAITING_SEED` | 409 | Ese chat ya tiene referencia. Trae `history_status`. Oculta el botón. |
+| `RECHECK_BUSY` | 409 | Ya hay una en marcha. Trae `job`: engánchate a ese. |
+| `WEB_BOOTSTRAP_DISABLED` | 404 | Estás llamando a la ruta apartada. Usa `/history/recheck-pending`. |
 | — | 503 | La base de datos no está disponible. |
 | — | 404 | `job_id` o `chat_id` inexistente. |
 
-Solo **un** trabajo a la vez, global o por chat: deshabilita ambos botones
-mientras haya uno activo.
+---
+
+## 7. Flujo de arranque desde cero
+
+```
+py service.py
+    ↓  PostgreSQL, cerrojo de sesión, comprobar device.json
+    ↓  sin sesión → PAIRING, se genera QR
+ng serve  +  http://localhost:4200
+    ↓  "No hay una cuenta de WhatsApp vinculada"  →  [Conectar WhatsApp]
+    ↓  se escanea UN código
+    ↓  "Conectando…"          session.state = CONNECTING
+    ↓  "Sincronizando…"       history.progress
+    ↓  "Recuperando historial…"  backfill automático (ON_DEMAND, count=50)
+    ↓  media worker + live
+    ↓  history.backfill.completed  +  [PRODUCT_TEST] en el log
+```
+
+Al terminar el backfill el backend registra el recuento medido:
+
+```
+[PRODUCT_TEST] RESULTADO FINAL
+[PRODUCT_TEST]   chats_total=40
+[PRODUCT_TEST]   messages_total=3617
+[PRODUCT_TEST]   media_total=607 (descargados=...)
+[PRODUCT_TEST]   exhausted=9 waiting_seed=29 timeout=1 errors=0
+```
+
+El mismo objeto viaja en `history.backfill.completed`, así que el frontend
+puede mostrarlo sin volver a preguntar.
 
 ---
 
-## 7. Flujo completo
+## 8. Despertar automático
 
-```
-GET  /history/web-bootstrap/session
-      available:false ─────────────────► ocultar botón, mostrar reason
-      available:true
-        │  linked:false → avisar: "se vinculará un dispositivo adicional"
-        ▼
-POST /history/web-bootstrap/recover-pending          → 202 {job_id}
-        │                                            → 409 RECOVERY_BUSY {job}
-        ▼
-GET  /events/stream  (o sondear status/<job_id>)
-        │
-        ├─ state=qr_required ──► GET /history/web-bootstrap/qr  (PNG)
-        │                        el usuario escanea → sigue solo
-        │
-        ├─ history.seed.found       → chat en verde
-        ├─ history.backfill.started → ese chat ya descarga historial
-        ├─ history.seed.not_found   → chat en ámbar, reintentable
-        │
-        ▼
-   state=completed → "N recuperadas, M siguen esperando, K errores"
-```
-
-Para el resumen final, evita decir "vacías" o "completado al 100%". Lo honesto
-es: *"M conversaciones siguen sin una referencia desde la que pedir historial.
-No están vacías; se puede reintentar más tarde."*
+Se conserva y **no requiere ningún botón**: si un chat en `waiting_seed` recibe
+o envía un mensaje real, ese mensaje sirve de ancla, el chat pasa a `pending` y
+se encola solo para ON_DEMAND.
 
 ---
 
-## 8. Endpoints relacionados que ya existían
+## 9. Endpoints del producto normal
 
 | Endpoint | Para qué |
 |---|---|
-| `POST /chats/<id>/history/recheck` | Reevalúa el estado de un chat sin sesión auxiliar. Más barato: pruébalo primero. |
-| `GET /session/qr/image` | QR de la sesión **principal** (pywhats). No confundir. |
-| `POST /media/<id>/retry` | Reintenta una descarga de multimedia. |
-| `POST /messages/<id>/media/recover` | Recupera el multimedia de un mensaje. |
+| `GET /health` | modo del backend (`whatsapp_enabled`) |
+| `GET /session` · `GET /session/qr` · `GET /session/qr/image` | la única vinculación |
+| `GET /chats` · `GET /chats/<id>` · `GET /chats/<id>/messages` | datos |
+| `GET /sync/status` · `POST /sync/run` | sincronización |
+| `GET /events/stream` | SSE |
+| `POST /history/recheck-pending` | botón global |
+| `GET /history/recheck-pending/status/<job_id>` | sondeo |
+| `POST /chats/<id>/history/recheck` | botón por chat |
+| `POST /media/<id>/retry` · `POST /messages/<id>/media/recover` | multimedia |
+
+**No usar desde el frontend normal:** `/history/web-bootstrap/*`.
 
 ---
 
-## 9. Lo que esta función NO hace
+## 10. Reactivar la sesión auxiliar (futuro)
 
-Vale la pena tenerlo presente al construir la UI, para no prometer de más:
+En `.env` del backend:
 
-- No escribe mensajes ni multimedia. Su único efecto en la base es el cursor.
-- No comparte criptografía con la sesión principal.
+```
+WEB_BOOTSTRAP_ENABLED=true
+```
+
+Entonces vuelven a responder los seis endpoints `/history/web-bootstrap/*` y
+los eventos `history.recovery.*` / `history.seed.*`. En el frontend siguen
+`WebBootstrapService` y el panel `recovery/`, sin usar.
+
+Antes de encenderla conviene saber lo que ya se midió: las fuentes nativas se
+agotaron (bootstrap, blobs, PostgreSQL, alias, app-state incremental y snapshot
+completo: cero claves) y la sesión auxiliar tampoco recibió historial al
+reconectar. **`no_seed` fue el resultado habitual.** No es una función a la que
+volver esperando mucho.
+
+---
+
+## 11. Lo que nada de esto hace
+
+- No escribe mensajes ni multimedia: el único efecto en la base es el cursor.
+- No fabrica cursores ni WAMIDs. Un ON_DEMAND anclado en un id inventado recibe
+  un ACK y después nada — es el fallo que más costó diagnosticar.
+- No toca Signal ni la criptografía.
 - No marca nada como leído ni altera ningún chat en el teléfono.
-- No es un segundo backup: consigue una referencia y se apaga.

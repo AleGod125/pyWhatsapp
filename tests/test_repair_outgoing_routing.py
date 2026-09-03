@@ -19,7 +19,6 @@ from sqlalchemy import select
 
 from app.models import Chat, Message as MessageRow
 from tests.test_outgoing_routing import (
-    ISAAC_LID,
     OWN_LID,
     OWN_PN,
     entrante,

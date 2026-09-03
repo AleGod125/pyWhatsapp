@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.web_seed_provider import WebSeed, WebSeedProvider
+from app.experimental.web_seed_provider import WebSeed, WebSeedProvider
 
 ISAAC = "64940106866902@lid"
 ISAAC_PN = "573243116421@s.whatsapp.net"
@@ -135,7 +135,7 @@ def test_el_proveedor_no_escribe_mensajes_ni_multimedia():
     from pathlib import Path
 
     arbol = ast.parse(
-        Path("app/services/web_seed_provider.py").read_text(encoding="utf-8")
+        Path("app/experimental/web_seed_provider.py").read_text(encoding="utf-8")
     )
     nombres = []
     for nodo in ast.walk(arbol):
@@ -223,7 +223,7 @@ def test_no_se_copia_criptografia_entre_sesiones():
     from pathlib import Path
 
     arbol = ast.parse(
-        Path("app/services/web_seed_provider.py").read_text(encoding="utf-8")
+        Path("app/experimental/web_seed_provider.py").read_text(encoding="utf-8")
     )
     llamadas = [
         getattr(n.func, "attr", None) or getattr(n.func, "id", None)

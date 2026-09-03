@@ -210,6 +210,44 @@ def state_to_json(runtime: Any) -> dict[str, Any]:
         # contador de diagnostico: el reintento por receipt es cosa de
         # Signal y sigue su curso sin que esto lo altere.
         "decrypt_errors": int(getattr(runtime, "decrypt_errors", 0) or 0),
+        # En que punto del camino a la vinculacion estamos. ``state`` solo no
+        # basta: con SESSION_INVALID el frontend no puede distinguir "se esta
+        # comprobando la sesion anterior" de "hace falta un QR y no llega", y
+        # acaba mostrando "Preparando tu codigo QR" durante los tres rechazos.
+        # Se midio: el usuario espero sin ninguna senal de que algo avanzaba.
+        **_fase_de_vinculacion(runtime, estado),
+    }
+
+
+def _fase_de_vinculacion(runtime: Any, estado: Any) -> dict[str, Any]:
+    """Fase legible, derivada de hechos que ya conocemos. No inventa estados."""
+    from app.core.session_state import NEEDS_PAIRING, PAIRING_STATES
+
+    pairing = getattr(runtime, "pairing", None)
+    rechazos = int(getattr(runtime, "rechazos_seguidos", 0) or 0)
+    maximo = int(getattr(runtime, "MAX_RECHAZOS_MISMA_SESION", 3) or 3)
+
+    if estado.value == "CONNECTED":
+        fase = "connected"
+    elif pairing is not None and pairing.available:
+        fase = "qr_ready"
+    elif estado.value == "SESSION_INVALID" and runtime.session_exists:
+        # Hay una vinculacion guardada que el servidor esta rechazando. Todavia
+        # no se descarta: hacen falta tres rechazos seguidos.
+        fase = "verifying_session"
+    elif estado in PAIRING_STATES or estado in NEEDS_PAIRING:
+        fase = "pairing_required"
+    elif estado.value in ("CONNECTING", "RECONNECTING"):
+        fase = "connecting"
+    else:
+        fase = "idle"
+
+    return {
+        "pairing_phase": fase,
+        # Cuantos rechazos seguidos lleva ESTA sesion. Deja decir "Verificando
+        # sesion anterior (2 de 3)" en vez de un giro sin informacion.
+        "session_rejections": rechazos,
+        "session_rejections_max": maximo,
     }
 
 

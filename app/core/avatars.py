@@ -1,7 +1,7 @@
 """Avatares: iniciales y color estable por contacto.
 
 Vive en el nucleo, no en ``app/gui``, por un motivo concreto: la API tambien
-los necesita, y ``app/gui/ui_theme`` importa ``tkinter.font``. Si la API sacara
+los necesita. Si la API sacara
 el color de alli, arrastraria Tkinter a un proceso que no tiene ventana, y eso
 esta prohibido (hay una prueba que lo verifica).
 

@@ -99,7 +99,7 @@ def ingest_history_sync(
                     chat_type=classify_chat(message.chat_jid),
                 )
             # Clasificacion central: lo interno se procesa pero no se guarda
-            # como mensaje de conversacion (seccion 6 del encargo).
+            # como mensaje de conversacion.
             clase = classify_parsed(message)
             if is_internal(clase):
                 result.protocol_filtered += 1
@@ -148,7 +148,7 @@ def ingest_history_sync(
 
 # De donde vino el mensaje, segun el tipo de History Sync. Distinguirlo
 # importa: sin esto no se puede medir si ON_DEMAND esta aportando algo
-# (seccion 6 del encargo), porque los mensajes live tapan la diferencia.
+#, porque los mensajes live tapan la diferencia.
 _SOURCE_BY_SYNC_TYPE = {
     "ON_DEMAND": "on_demand",
     "INITIAL_BOOTSTRAP": "initial_history",

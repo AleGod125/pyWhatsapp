@@ -380,21 +380,6 @@ def get_messages_after(
     return list(session.execute(stmt).all())
 
 
-def list_chats(session: Session, limit: int = 500) -> list[Any]:
-    """Chats para el sidebar, los mas recientes primero."""
-    stmt = (
-        select(
-            Chat.id,
-            Chat.jid,
-            Chat.name,
-            Chat.chat_type,
-            Chat.last_message,
-            Chat.last_message_timestamp,
-        )
-        .order_by(Chat.last_message_timestamp.desc().nulls_last())
-        .limit(limit)
-    )
-    return list(session.execute(stmt).all())
 
 
 @dataclass
@@ -418,7 +403,7 @@ class ChatSummary:
 def display_name_for(jid: str, *candidates: str | None) -> str:
     """Primer nombre util, con el JID como ultimo recurso.
 
-    Prioridad (seccion 36): nombre de la conversacion, metadata del contacto,
+    Prioridad: nombre de la conversacion, metadata del contacto,
     pushname, asunto del grupo y, si no hay nada, el identificador. Nunca se
     inventa un nombre ni se convierte un LID en telefono.
     """
@@ -509,7 +494,7 @@ def list_chat_summaries(
 
 
 def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
-    """Resumen de UN chat, para refrescar su fila del sidebar (seccion 23).
+    """Resumen de UN chat, para refrescar su fila del sidebar.
 
     Cuando llega un mensaje no hace falta reconstruir la lista entera: basta
     con volver a leer el chat afectado. Con miles de conversaciones, destruir
@@ -552,29 +537,6 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
     )
 
 
-def sender_names(session: Session, jids: Iterable[str]) -> dict[str, str]:
-    """Nombre a mostrar de cada emisor, para las burbujas de un grupo."""
-    wanted = [jid for jid in set(jids) if jid]
-    if not wanted:
-        return {}
-    # Se busca por AMBOS espacios de identificadores. En un grupo el emisor
-    # llega a veces como @lid y a veces como telefono; consultando solo por
-    # ``jid`` la mitad de los participantes salia con su numero crudo.
-    rows = session.execute(
-        select(Contact.jid, Contact.lid, Contact.display_name, Contact.push_name).where(
-            Contact.jid.in_(wanted) | Contact.lid.in_(wanted)
-        )
-    ).all()
-    resolved: dict[str, str] = {}
-    for contact_jid, contact_lid, display_name, push_name in rows:
-        nombre = display_name_for(contact_jid, display_name, push_name)
-        if contact_jid in wanted:
-            resolved[contact_jid] = nombre
-        if contact_lid and contact_lid in wanted:
-            resolved[contact_lid] = nombre
-    for jid in wanted:
-        resolved.setdefault(jid, display_name_for(jid))
-    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +599,7 @@ def refresh_chat_previews(session: Session, chat_jids: Iterable[str]) -> int:
     traducir un adjunto a "📷 Imagen" y un evento de sistema a "Llamada
     perdida". La version anterior concatenaba ``'[' || message_type || ']'``
     en SQL y por eso el chat propio mostraba ``[unknown]`` teniendo cuatro
-    imagenes dentro (seccion 32).
+    imagenes dentro.
 
     Escalabilidad: una sola consulta ``DISTINCT ON`` devuelve UN mensaje por
     chat, no la tabla entera. El coste crece con el numero de chats, no con
@@ -709,7 +671,7 @@ def get_chat_stats(session: Session, chat_id: int) -> ChatStats:
     """COUNT(*), mas antiguo y mas reciente en una sola pasada.
 
     Es la fuente para la cabecera: "N mensajes almacenados" tiene que salir de
-    la base, no de cuantos widgets haya pintados (seccion 17).
+    la base, no de cuantos widgets haya pintados.
     """
     row = session.execute(
         select(
@@ -779,13 +741,6 @@ def set_app_state(session: Session, key: str, value: Any) -> None:
     )
 
 
-def chat_ids_by_jid(session: Session, jids: Iterable[str]) -> dict[str, int]:
-    """Mapa jid -> id para resolver los FK de un lote de una sola consulta."""
-    wanted = list(jids)
-    if not wanted:
-        return {}
-    rows = session.execute(select(Chat.jid, Chat.id).where(Chat.jid.in_(wanted))).all()
-    return {jid: chat_id for jid, chat_id in rows}
 
 
 def history_state_for(session: Session, chat_jid: str) -> Any | None:

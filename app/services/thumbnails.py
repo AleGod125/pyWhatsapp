@@ -1,6 +1,6 @@
 """Miniaturas cacheadas en disco.
 
-POR QUE EN DISCO Y NO SOLO EN MEMORIA (seccion 37)
+POR QUE EN DISCO Y NO SOLO EN MEMORIA
 --------------------------------------------------
 Decodificar y reescalar una foto de 4 MB cuesta decenas de milisegundos. Con
 200 burbujas y el usuario yendo y viniendo entre chats, eso se nota. Una cache
@@ -11,7 +11,7 @@ Aqui se guarda el resultado en ``<MEDIA_DIR>/cache/thumbs/<sha1>-<w>x<h>.jpg``.
 La clave incluye ruta, tamano y fecha de modificacion del original: si el
 archivo cambia, la miniatura se regenera sola en vez de quedarse obsoleta.
 
-NUNCA se carga el original entero para pintar una burbuja (seccion 38).
+NUNCA se carga el original entero para pintar una burbuja.
 ``Image.draft()`` hace que JPEG se decodifique ya reducido, asi que un archivo
 de 20 MB no pasa por memoria a tamano completo.
 """
@@ -93,21 +93,3 @@ def ensure_thumbnail(
         return None
 
 
-def clear_cache(media_root: Path) -> int:
-    """Vacia la cache de miniaturas. Devuelve cuantos archivos borro.
-
-    Solo borra DERIVADOS: los originales no se tocan. No se llama sola en
-    ningun sitio; existe para poder regenerar las miniaturas a mano si
-    hiciera falta.
-    """
-    carpeta = cache_dir(media_root)
-    if not carpeta.is_dir():
-        return 0
-    borrados = 0
-    for archivo in carpeta.glob("*.jpg"):
-        try:
-            archivo.unlink()
-            borrados += 1
-        except OSError:
-            continue
-    return borrados

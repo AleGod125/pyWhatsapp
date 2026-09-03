@@ -1,6 +1,6 @@
 """Normalizacion de ``WebMessageInfo`` a filas de PostgreSQL.
 
-Principio rector (seccion 25 del brief): un mensaje NO se descarta porque la
+Principio rector: un mensaje NO se descarta porque la
 aplicacion no sepa interpretarlo. Los bytes originales van siempre a
 ``messages.raw_proto``; las columnas normalizadas son una comodidad para
 buscar y pintar, no la fuente de verdad.

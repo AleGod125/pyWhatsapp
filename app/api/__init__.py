@@ -9,7 +9,7 @@ contra ``AppRuntime``, los servicios y el bus de eventos.
 
 REGLA DURA
 ----------
-Nada de este paquete importa ``tkinter``, ni widgets, ni ``root.after``, ni
+Nada de este paquete importa una capa de interfaz, ni widgets, ni
 toca frames. Hay una prueba que recorre el paquete y lo verifica: si algun dia
 alguien mete un import de Tkinter aqui, la suite lo dice.
 """

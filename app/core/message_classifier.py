@@ -6,7 +6,7 @@ protocolo. Antes esa decision estaba repartida en comprobaciones sueltas
 resultado fue que 75 Peer Data Operations acabaron guardadas como mensajes
 del chat personal.
 
-REGLA (seccion 7 del encargo): la decision se toma mirando el PROTOBUF, no
+REGLA: la decision se toma mirando el PROTOBUF, no
 por si el texto viene vacio. Un mensaje sin texto puede ser una imagen, una
 ubicacion o un evento visible; y un mensaje "unknown" puede ser un tipo real
 que aun no interpretamos. Nada se descarta por no entenderlo: solo se
@@ -29,7 +29,6 @@ from enum import Enum
 
 from app.core.message_parser import (
     MESSAGE_FIELD_NAMES,
-    WRAPPER_FIELDS,
     top_level_fields,
     unwrap_message,
 )

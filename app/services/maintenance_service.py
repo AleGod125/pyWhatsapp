@@ -8,7 +8,7 @@ previas, los cursores estuvieran al dia o los adjuntos rotos se reintentaran.
 Eso no es una aplicacion, es un juego de herramientas. Este servicio hace
 automaticamente todo lo que se puede hacer SIN RIESGO.
 
-LA LINEA QUE NO SE CRUZA (seccion 16)
+LA LINEA QUE NO SE CRUZA
 -------------------------------------
 Aqui SOLO hay reconciliacion: recalcular lo que se deriva de los datos.
 
@@ -27,7 +27,7 @@ IDEMPOTENCIA
 Ejecutarlo dos veces seguidas da el mismo resultado y la segunda no cambia
 nada. Las pruebas lo comprueban ejecutandolo dos veces y comparando.
 
-ESCALABILIDAD (seccion 21)
+ESCALABILIDAD
 --------------------------
 Ninguna operacion trae la tabla de mensajes a memoria. Todo son ``UPDATE ...
 FROM`` o ``DISTINCT ON`` que devuelven, como mucho, una fila por chat.
@@ -171,7 +171,7 @@ class MaintenanceService:
         Un chat sin fila en ``chat_history_state`` es invisible para el
         backfill: nunca se le pide historial. Crearla es lo que permite que
         una extraccion interrumpida se reanude al volver a abrir la
-        aplicacion (seccion 20).
+        aplicacion.
         """
         with self._database.transaction() as session:
             faltantes = session.execute(
@@ -283,7 +283,7 @@ class MaintenanceService:
         ``deviceSentMessage``, cuyo mensaje interno va en el campo 2 y no en
         el 1. Hasta que se corrigio, cuatro imagenes del chat propio quedaron
         como ``unknown`` y el sidebar las resumia como ``[unknown]``
-        (seccion 32).
+       .
 
         Es una operacion de MEJORA, no de limpieza:
 
@@ -401,7 +401,7 @@ class MaintenanceService:
         """Crea la fila ``media_files`` de un adjunto descubierto al reparsear.
 
         Se inserta en ``pending`` para que el worker de descargas lo recoja
-        solo, sin reiniciar la aplicacion (seccion 13). El ``ON CONFLICT DO
+        solo, sin reiniciar la aplicacion. El ``ON CONFLICT DO
         NOTHING`` la hace idempotente: si el adjunto ya estaba registrado no
         se duplica ni se pierde lo ya descargado.
         """
@@ -450,12 +450,12 @@ class MaintenanceService:
 
         1. Marcado ``downloaded`` pero el archivo ya no esta en disco. La GUI
            lo pintaria como abrible y al pulsar no pasaria nada; eso es un
-           BUG (seccion 42). Vuelve a ``pending`` para que el worker lo
+           BUG. Vuelve a ``pending`` para que el worker lo
            reintente.
         2. ``pending`` sin ``direct_path`` o sin ``media_key``. No hay nada
            con que descargarlo: ni URL ni clave. Se marca ``unavailable``,
            que es TERMINAL y honesto, en vez de dejarlo eternamente
-           "pendiente" (seccion 16: marcar media terminal esta permitido).
+           "pendiente": marcar multimedia como terminal si esta permitido.
 
         El mensaje y su metadata NUNCA se tocan: que el archivo no se pueda
         recuperar no invalida el mensaje.

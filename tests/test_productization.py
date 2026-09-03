@@ -13,7 +13,6 @@ transaccion que se revierte, igual que el resto de la suite.
 
 from __future__ import annotations
 
-import queue
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -125,111 +124,10 @@ def _abrir(app, session, chat_id, total=TOTAL):
 # ---------------------------------------------------------------------------
 
 
-def test_scroll_automatico_llega_a_452_sin_pulsar_el_boton(
-    app, session, chat_largo, monkeypatch
-):
-    """200 -> 400 -> 452 con eventos de scroll, sin tocar el boton.
-
-    Cada iteracion simula que el usuario ha seguido subiendo: la vista cambia
-    y ademas se deja pasar el cooldown. Es lo que ocurre de verdad al arrastrar
-    la barra hacia arriba.
-    """
-    panel = _abrir(app, session, chat_largo)
-    # Puede que el scroll automatico ya haya traido una pagina durante el
-    # ``update()``: eso es exactamente lo que se quiere. Lo que se comprueba
-    # es que se llega al final sin tocar el boton.
-    inicial = panel._rendered
-    assert 0 < inicial < TOTAL
-
-    # monkeypatch, no asignacion directa: el panel es de ambito de modulo y
-    # dejarle un ``yview`` falso pegado envenena las pruebas siguientes.
-    vistas = [(0.0, 0.4), (0.01, 0.41), (0.02, 0.42), (0.03, 0.43)]
-    for vista in vistas:
-        monkeypatch.setattr(panel._scroll.canvas, "yview", lambda v=vista: v)
-        panel._last_prefetch_at = 0.0
-        panel._maybe_prefetch()
-        app.root.update()
-        if panel._rendered >= TOTAL:
-            break
-
-    assert panel._rendered == TOTAL, (
-        f"el scroll automatico se quedo en {panel._rendered} de {TOTAL}"
-    )
-    assert panel._exhausted is True
 
 
-def test_al_llegar_al_final_no_se_vuelve_a_consultar(
-    app, session, chat_largo, monkeypatch
-):
-    """Con todo cargado, ni un SELECT mas (seccion 4)."""
-    panel = _abrir(app, session, chat_largo)
-
-    consultas = {"n": 0}
-    original = panel._loader
-
-    def contando(*args):
-        consultas["n"] += 1
-        return original(*args)
-
-    panel.bind_loader(contando)
-
-    while panel._rendered < TOTAL:
-        panel.load_previous_page()
-    consultas_al_terminar = consultas["n"]
-
-    for i in range(5):
-        monkeypatch.setattr(
-            panel._scroll.canvas, "yview", lambda v=(i * 0.01, 0.4 + i * 0.01): v
-        )
-        panel._last_prefetch_at = 0.0
-        panel._maybe_prefetch()
-
-    assert consultas["n"] == consultas_al_terminar, (
-        "con el historial local agotado no puede lanzarse ninguna consulta mas"
-    )
 
 
-def test_el_prepend_conserva_la_posicion_visual(
-    app, session, chat_largo, monkeypatch
-):
-    """Al insertar arriba, el mensaje que se miraba sigue donde estaba.
-
-    Se compara el desplazamiento EN PIXELES, no la fraccion: la fraccion
-    cambia por definicion cuando el contenido crece.
-
-    El scroll automatico se desactiva aqui a proposito: si no, los eventos de
-    ``update_idletasks`` cargan paginas por su cuenta y la medicion deja de
-    corresponder a una sola insercion. Que haga eso es lo correcto; solo
-    estorba a esta medida concreta.
-    """
-    import app.gui.chat_view as chat_view
-
-    monkeypatch.setattr(chat_view, "AUTO_PREFETCH", False)
-    panel = _abrir(app, session, chat_largo)
-    canvas = panel._scroll.canvas
-
-    canvas.yview_moveto(0.10)
-    app.root.update()
-
-    # Se sigue a un widget concreto: el primer mensaje que ya estaba pintado.
-    # Su posicion EN PANTALLA es lo que el usuario percibe, y es lo que debe
-    # mantenerse. Medirlo asi tambien evita depender de la altura solicitada
-    # del contenedor, que no siempre esta al dia justo despues de insertar.
-    ancla = panel._scroll.body.winfo_children()[0]
-    alto_antes = panel._scroll.content_height()
-    pantalla_antes = ancla.winfo_y() - canvas.yview()[0] * alto_antes
-
-    traidos = panel.load_previous_page()
-    app.root.update()
-    assert traidos == 200
-
-    alto_despues = panel._scroll.content_height()
-    pantalla_despues = ancla.winfo_y() - canvas.yview()[0] * alto_despues
-
-    assert abs(pantalla_despues - pantalla_antes) <= 30, (
-        "el viewport salto: el mensaje que se estaba leyendo se ha movido "
-        f"{pantalla_despues - pantalla_antes:.0f} px"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -400,144 +298,18 @@ def _burbuja(app):
     return panel, contenedor
 
 
-def test_imagen_no_disponible_muestra_aviso_claro(app):
-    """El mensaje NO desaparece porque el archivo ya no este (seccion 12)."""
-    panel, bubble = _burbuja(app)
-    panel._render_media(bubble, MediaFalsa("image", "unavailable"))
-    app.root.update_idletasks()
-
-    texto = _textos(bubble)
-    assert "no disponible" in texto.lower()
-    assert "🖼" in texto
-    bubble.destroy()
 
 
-def test_video_no_disponible_muestra_aviso_claro(app):
-    panel, bubble = _burbuja(app)
-    panel._render_media(bubble, MediaFalsa("video", "expired"))
-    app.root.update_idletasks()
-
-    assert "no disponible" in _textos(bubble).lower()
-    bubble.destroy()
 
 
-def test_video_descargado_crea_tarjeta_con_accion(app, tmp_path):
-    panel, bubble = _burbuja(app)
-    panel.set_media_root(tmp_path)
-    (tmp_path / "v.mp4").write_bytes(b"0" * 1024)
-
-    panel._render_media(
-        bubble,
-        MediaFalsa("video", "downloaded", "v.mp4", file_size=1024, duration_seconds=75),
-    )
-    app.root.update_idletasks()
-
-    texto = _textos(bubble)
-    assert "Video" in texto
-    assert "1:15" in texto, "la duracion debe verse"
-    assert "Reproducir" in texto
-    bubble.destroy()
 
 
-def test_audio_descargado_crea_tarjeta_con_duracion(app, tmp_path):
-    panel, bubble = _burbuja(app)
-    panel.set_media_root(tmp_path)
-    (tmp_path / "a.ogg").write_bytes(b"0" * 512)
-
-    panel._render_media(
-        bubble, MediaFalsa("voice_note", "downloaded", "a.ogg", duration_seconds=18)
-    )
-    app.root.update_idletasks()
-
-    texto = _textos(bubble)
-    assert "Nota de voz" in texto
-    assert "0:18" in texto
-    assert "Reproducir" in texto
-    bubble.destroy()
 
 
-def test_documento_descargado_muestra_nombre_y_tamano(app, tmp_path):
-    panel, bubble = _burbuja(app)
-    panel.set_media_root(tmp_path)
-    (tmp_path / "d.pdf").write_bytes(b"0" * (2 * 1024 * 1024))
-
-    panel._render_media(
-        bubble,
-        MediaFalsa(
-            "document", "downloaded", "d.pdf", file_name="informe.pdf",
-            file_size=2 * 1024 * 1024,
-        ),
-    )
-    app.root.update_idletasks()
-
-    texto = _textos(bubble)
-    assert "informe.pdf" in texto
-    assert "2.0 MB" in texto
-    bubble.destroy()
 
 
-def test_imagen_descargada_genera_miniatura_cacheada(app, tmp_path):
-    """Se crea el archivo derivado y NO se vuelve a generar (seccion 37)."""
-    Image = pytest.importorskip("PIL.Image")
-    from app.services.thumbnails import ensure_thumbnail, thumbnail_path
-
-    original = tmp_path / "foto.jpg"
-    Image.new("RGB", (1200, 900), "#336699").save(original)
-
-    destino = ensure_thumbnail(tmp_path, original, (320, 320))
-    assert destino is not None and destino.exists()
-    assert destino == thumbnail_path(tmp_path, original, (320, 320))
-
-    with Image.open(destino) as miniatura:
-        assert miniatura.width <= 320 and miniatura.height <= 320
-
-    marca = destino.stat().st_mtime_ns
-    assert ensure_thumbnail(tmp_path, original, (320, 320)) == destino
-    assert destino.stat().st_mtime_ns == marca, "no debe regenerarse"
 
 
-def test_la_imagen_se_situa_respecto_al_contenido_no_a_su_burbuja(app, tmp_path):
-    """El hueco de una imagen cuelga de su burbuja, no del hilo.
-
-    Medir su posicion con ``winfo_y()`` devolvia siempre unos pocos pixeles,
-    asi que TODA imagen parecia estar lejisimos del viewport y el pintor
-    perezoso no materializaba ninguna. La posicion tiene que calcularse
-    respecto al contenido desplazable.
-    """
-    Image = pytest.importorskip("PIL.Image")
-
-    panel = app.viewer.conversation
-    panel.set_media_root(tmp_path)
-    (tmp_path / "img.jpg").parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (600, 400), "#224466").save(tmp_path / "img.jpg")
-
-    panel._scroll.clear()
-    panel._pending_thumbs.clear()
-    panel._photos.clear()
-
-    holder = tk.Frame(panel._scroll.body, bg="#ffffff")
-    holder.pack(fill="x", pady=400)  # empuja la burbuja hacia abajo
-    bubble = tk.Frame(holder, bg="#ffffff")
-    bubble.pack()
-    panel._render_media(
-        bubble,
-        MediaFalsa("image", "downloaded", "img.jpg", width=600, height=400),
-    )
-    app.root.update()
-
-    assert panel._pending_thumbs, "deberia haber quedado una miniatura pendiente"
-    contenedor = panel._pending_thumbs[0]["container"]
-    dentro_de_la_burbuja = contenedor.winfo_y()
-    dentro_del_hilo = panel._offset_in_body(contenedor)
-
-    assert dentro_del_hilo is not None
-    assert dentro_del_hilo > dentro_de_la_burbuja, (
-        "la posicion en el hilo tiene que reflejar el desplazamiento real, "
-        f"no los {dentro_de_la_burbuja} px que mide dentro de su burbuja"
-    )
-
-    holder.destroy()
-    panel._pending_thumbs.clear()
 
 
 def test_la_miniatura_se_regenera_si_cambia_el_original(tmp_path):
@@ -552,15 +324,6 @@ def test_la_miniatura_se_regenera_si_cambia_el_original(tmp_path):
     assert cache_key(original, (320, 320)) != primera
 
 
-def test_cambiar_de_chat_suelta_las_imagenes(app, session, chat_largo):
-    """Sin esto las ``PhotoImage`` se acumulan y la memoria solo sube."""
-    panel = _abrir(app, session, chat_largo)
-    panel._photos["ficticia"] = object()
-    panel._pending_thumbs.append({"widget": None})
-
-    _abrir(app, session, chat_largo)
-    assert panel._photos == {}
-    assert panel._pending_thumbs == []
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +445,7 @@ def _fuentes_del_arranque_automatico() -> list[_Fuente]:
     import app.services.maintenance_service as mantenimiento
 
     fuentes = [
-        _Fuente("main.py", Path("main.py").read_text(encoding="utf-8")),
+        _Fuente("service.py", Path("service.py").read_text(encoding="utf-8")),
         _Fuente(
             "maintenance_service",
             Path(mantenimiento.__file__).read_text(encoding="utf-8"),
@@ -814,121 +577,14 @@ def test_media_files_tiene_indice_por_mensaje(database):
 # ---------------------------------------------------------------------------
 
 
-def test_el_sidebar_actualiza_solo_la_fila_afectada(app, session, chat_largo):
-    """Actualizar una fila no puede reconstruir la lista entera (seccion 23)."""
-    app.viewer.refresh_chats()
-    app.root.update()
-
-    resumen = repo.chat_summary(session, chat_largo)
-    assert resumen is not None
-
-    lista = app.viewer.chats
-    lista.set_chats([resumen])
-    app.root.update()
-    fila = lista._rows[chat_largo]
-    widget_antes = fila["preview"]
-
-    cambiado = repo.ChatSummary(
-        id=resumen.id, jid=resumen.jid, display_name=resumen.display_name,
-        chat_type=resumen.chat_type, last_message="📷 Imagen",
-        last_message_timestamp=1_754_999_999, message_count=resumen.message_count + 1,
-    )
-    assert lista.update_chat(cambiado) is True
-    app.root.update()
-
-    assert lista._rows[chat_largo]["preview"] is widget_antes, (
-        "la fila debe reutilizarse, no recrearse"
-    )
-    assert widget_antes.cget("text") == "📷 Imagen"
 
 
-def test_un_chat_que_no_esta_en_la_lista_pide_recarga_completa(app, session):
-    """Si la fila no existe, ``update_chat`` lo dice en vez de fingir."""
-    lista = app.viewer.chats
-    lista.set_chats([])
-    app.root.update()
-
-    inexistente = repo.ChatSummary(
-        id=-1, jid="0@s.whatsapp.net", display_name="Nadie",
-        chat_type="individual", last_message=None,
-        last_message_timestamp=None, message_count=0,
-    )
-    assert lista.update_chat(inexistente) is False
 
 
-def test_la_busqueda_no_consulta_en_cada_tecla(app, monkeypatch):
-    """Una consulta por pausa, no por pulsacion (seccion 24)."""
-    consultas = {"n": 0}
-
-    def contando(search=None):
-        consultas["n"] += 1
-        return 0
-
-    monkeypatch.setattr(app.viewer, "refresh_chats", contando)
-
-    for texto in ("m", "ma", "mar", "marc", "marco"):
-        app.viewer._on_search(texto)
-    assert consultas["n"] == 0, "no puede consultarse antes de la pausa"
-
-    # Se deja vencer el retardo: solo entonces se consulta, y una sola vez.
-    app.root.after(app.viewer.SEARCH_DEBOUNCE_MS + 120, app.root.quit)
-    app.root.mainloop()
-    assert consultas["n"] == 1, f"deberia haber UNA consulta, hubo {consultas['n']}"
 
 
-def test_la_barra_de_estado_resume_el_trabajo_de_fondo(app):
-    from app.core.orchestrator import RuntimeStatus
-
-    barra = app.viewer.status_bar
-    app.viewer.update_status(
-        RuntimeStatus(
-            connection="Conectado", connected=True, history="sincronizando",
-            media_pending=23, backfill="excavando",
-        )
-    )
-    app.root.update()
-    detalle = barra._detail.cget("text")
-    assert "Historial: sincronizando" in detalle
-    assert "23 pendientes" in detalle
-    assert "Backfill: excavando" in detalle
-
-    app.viewer.update_status(
-        RuntimeStatus(
-            connection="Conectado", connected=True, history="sincronizado",
-            history_done=True, media_pending=0, backfill="terminado",
-            backfill_done=True,
-        )
-    )
-    app.root.update()
-    assert "Sincronizacion completa" in barra._detail.cget("text")
 
 
-def test_un_mensaje_nuevo_se_anade_al_final_sin_repintar(app, session, chat_largo):
-    """Llega un mensaje: se anade UNA burbuja, no se recarga el chat."""
-    panel = _abrir(app, session, chat_largo)
-    pintados_antes = panel._rendered
-    hijos_antes = len(panel._scroll.body.winfo_children())
-
-    repo.bulk_upsert_messages(
-        session,
-        {CHAT_JID: chat_largo},
-        [
-            IncomingMessage(
-                chat_jid=CHAT_JID, timestamp=1_755_999_999, source="live",
-                whatsapp_message_id="PRDLIVE01", text="mensaje recien llegado",
-                message_type="text",
-            )
-        ],
-    )
-    session.flush()
-
-    assert app.viewer.append_new_message(chat_largo) is True
-    app.root.update()
-
-    assert panel._rendered == pintados_antes + 1
-    assert len(panel._scroll.body.winfo_children()) > hijos_antes
-    # Y no se vuelve a anadir si se pide otra vez: ya esta pintado.
-    assert app.viewer.append_new_message(chat_largo) is False
 
 
 def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
@@ -939,23 +595,66 @@ def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
     calcula del dispositivo vivo, y es la que se escribe al confirmarlo. Si divergieran,
     la marca se guardaria bajo una huella y se buscaria bajo otra: la espera de
     180 segundos volveria en cada arranque sin que nada lo delatara.
+
+    Se llama al metodo REAL del backfill en vez de repetir su formula aqui:
+    una copia de la formula se queda atras en cuanto una de las dos cambia, y
+    entonces la prueba pasa mientras el sistema esta roto. Se midio: al anadir
+    el ``registration_id`` a la huella, esta prueba seguia comparando la
+    version vieja consigo misma.
     """
-    import hashlib
     import json
+    import types
 
     if not settings.session_file.exists():
         pytest.skip("no hay sesion guardada en este equipo")
 
     from app.core.identity import session_fingerprint
+    from app.services.backfill_service import BackfillService
 
     datos = json.loads(settings.session_file.read_text(encoding="utf-8"))
     jid = datos.get("jid") or {}
     if not jid.get("user"):
         pytest.skip("la sesion guardada no tiene JID")
 
-    # Misma formula que BackfillService.session_fingerprint(), pero partiendo
-    # de los mismos campos que tendria el dispositivo ya cargado.
-    crudo = f"{jid['user']}:{jid.get('server')}:{datos.get('device_id', '')}"
-    como_el_backfill = hashlib.sha256(crudo.encode()).hexdigest()[:16]
+    # El dispositivo tal y como lo veria el backfill ya conectado.
+    dispositivo = types.SimpleNamespace(
+        jid=types.SimpleNamespace(
+            user=jid["user"], server=jid.get("server", "s.whatsapp.net")
+        ),
+        device_id=datos.get("device_id", ""),
+        registration_id=datos.get("registration_id", ""),
+    )
+    servicio = object.__new__(BackfillService)
+    servicio._client = types.SimpleNamespace(device=dispositivo)
 
-    assert session_fingerprint(settings) == como_el_backfill
+    assert session_fingerprint(settings) == servicio.session_fingerprint()
+
+
+def test_la_huella_distingue_identidades_con_la_misma_ranura(tmp_path):
+    """Dos vinculaciones pueden recibir el MISMO device_id.
+
+    El servidor reutiliza el numero de ranura: al desvincular todos los
+    dispositivos la numeracion vuelve atras. Sin el registration_id, esas dos
+    identidades compartirian huella y la segunda daria por confirmado el
+    historial inicial de la primera.
+    """
+    import json
+    import types
+
+    from app.core.identity import session_fingerprint
+
+    def huella_de(registration_id: int) -> str:
+        ruta = tmp_path / f"device-{registration_id}.json"
+        ruta.write_text(
+            json.dumps(
+                {
+                    "jid": {"user": "573000000", "server": "s.whatsapp.net"},
+                    "device_id": 5,  # LA MISMA ranura en las dos
+                    "registration_id": registration_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return session_fingerprint(types.SimpleNamespace(session_file=ruta))
+
+    assert huella_de(111) != huella_de(222)

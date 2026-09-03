@@ -2,15 +2,15 @@
 
 QUE CAMBIA
 ----------
-Hasta ahora ``main.py`` cableaba las piezas y el usuario tenia que acordarse
+Antes las piezas se cableaban a mano y el usuario tenia que acordarse
 de ejecutar ``inspect_db.py``, ``repair_db.py`` o ``probe_chat.py`` para que
 la copia estuviera al dia. Esas herramientas siguen existiendo para
-diagnostico (seccion 35), pero el mantenimiento normal ocurre aqui solo.
+diagnostico, pero el mantenimiento normal ocurre aqui solo.
 
-EL FLUJO (seccion 15)
+EL FLUJO
 ---------------------
     START
-      -> migraciones            (las verifica main.py antes de llegar aqui)
+      -> migraciones            (las verifica service.py antes de llegar aqui)
       -> salud de la base       health_check()
       -> mantenimiento seguro   MaintenanceService.run_all()
       -> cargar sesion / conectar
@@ -29,10 +29,10 @@ LO QUE NO HACE
 --------------
 NADA destructivo. No borra mensajes, ni multimedia, ni la sesion, ni
 ``raw_proto``. Todo lo que ejecuta automaticamente esta en la lista blanca de
-la seccion 16; ``repair_db.py`` sigue siendo la unica via para lo demas y
+``repair_db.py`` sigue siendo la unica via para lo demas y
 sigue exigiendo autorizacion explicita.
 
-LA GUI NO ESPERA (seccion 19)
+LA GUI NO ESPERA
 -----------------------------
 El visor se habilita en cuanto el servidor confirma la sesion. El historial y
 la multimedia siguen llegando por detras y la barra de estado lo cuenta. Nunca
@@ -82,7 +82,7 @@ class RuntimeStatus:
 
 @dataclass
 class HealthReport:
-    """Comprobacion LIGERA del arranque (seccion 36).
+    """Comprobacion LIGERA del arranque.
 
     Ligera de verdad: ni un ``COUNT(*)`` sobre ``messages``. Un escaneo
     profundo se pide a mano con ``inspect_db.py --deep``.
@@ -184,7 +184,7 @@ class Orchestrator:
         return report
 
     def run_maintenance(self) -> Any:
-        """Reconciliacion segura. NUNCA destructiva (seccion 16)."""
+        """Reconciliacion segura. NUNCA destructiva."""
         from app.services.maintenance_service import MaintenanceService
 
         if self.maintenance is None:
@@ -274,7 +274,7 @@ class Orchestrator:
             await self._reconciliar_tras_reconectar()
 
         # 5) Worker permanente de multimedia. Va por su cuenta: ni la GUI ni
-        #    el backfill esperan por el (seccion 14).
+        #    el backfill esperan por el.
         self._start_media_worker(pywhats_client)
 
         # 6) Backfill historico. Es el unico que depende del telefono.
@@ -398,6 +398,16 @@ class Orchestrator:
         # Lo que acaba de llegar cambia contadores, cursores y previas.
         self.run_maintenance()
         self._publish("history_ingested", "backfill completado")
+
+        # Y se deja el recuento medido en el log, para poder juzgar una prueba
+        # desde cero sin tener que consultar la base a mano.
+        from app.services.product_report import log_summary
+
+        informe = log_summary(self._database)
+        self._publish(
+            "history.backfill.completed",
+            informe.to_json() if informe is not None else {},
+        )
 
     def _start_maintenance_loop(self) -> None:
         intervalo = self._settings.maintenance_interval_seconds

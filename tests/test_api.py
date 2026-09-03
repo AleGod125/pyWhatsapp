@@ -97,7 +97,7 @@ def runtime(settings, database, session, tmp_path):
     """``AppRuntime`` real, con base del test y sesion en un temporal.
 
     Se usa el runtime de verdad, no un doble: asi las pruebas ejercitan el
-    mismo objeto que comparten ``main.py`` y ``service.py``. Pero la carpeta
+    mismo objeto que construye ``service.py``. Pero la carpeta
     de sesion se aisla: la aplicacion archiva ``device.json`` cuando el
     servidor rechaza un login, y una prueba no puede tocar la sesion viva.
     """
@@ -497,14 +497,20 @@ def _imports_de(ruta: Path) -> list[str]:
     return nombres
 
 
-def test_la_api_no_importa_tkinter():
-    """``app/api`` no puede depender de la ventana."""
-    for ruta in _modulos_de("app.api"):
-        for nombre in _imports_de(ruta):
-            assert nombre.split(".")[0] != "tkinter", f"{ruta.name} importa tkinter"
-            assert not nombre.startswith("app.gui"), (
-                f"{ruta.name} importa {nombre}: la API no depende de la ventana"
-            )
+def test_ningun_modulo_vuelve_a_importar_tkinter():
+    """El producto es la API. La ventana de escritorio se retiro entera.
+
+    Se mira el arbol y no el texto: los comentarios que explican esta regla
+    mencionan ``tkinter``, y buscarlo como cadena daria un falso positivo.
+    """
+    for paquete in ("app.api", "app.core", "app.services", "app.compat"):
+        for ruta in _modulos_de(paquete):
+            for nombre in _imports_de(ruta):
+                raiz = nombre.split(".")[0]
+                assert raiz != "tkinter", f"{ruta.name} importa tkinter"
+                assert not nombre.startswith("app.gui"), (
+                    f"{ruta.name} importa {nombre}, que ya no existe"
+                )
 
 
 def test_el_nucleo_tampoco_arrastra_tkinter():
@@ -526,29 +532,21 @@ def test_los_servicios_no_dependen_de_ninguna_interfaz():
             )
 
 
-def test_la_ventana_no_llama_a_flask():
-    """Tkinter habla con los servicios, no con la API."""
-    for ruta in _modulos_de("app.gui"):
-        for nombre in _imports_de(ruta):
-            assert nombre.split(".")[0] != "flask", f"{ruta.name} importa flask"
-            assert not nombre.startswith("app.api"), (
-                f"{ruta.name} importa {nombre}: la ventana no llama a la API"
-            )
 
 
 # ---------------------------------------------------------------------------
-# Cerrojo de sesion entre main.py y service.py
+# Cerrojo de sesion
 # ---------------------------------------------------------------------------
 
 
 def test_dos_procesos_no_pueden_abrir_la_misma_sesion(tmp_path):
     from app.core.lock import SessionLock, SessionLockedError
 
-    principal = SessionLock(tmp_path, owner="main.py").acquire()
+    principal = SessionLock(tmp_path, owner="otro service.py").acquire()
     try:
         with pytest.raises(SessionLockedError) as fallo:
             SessionLock(tmp_path, owner="service.py").acquire()
-        assert fallo.value.holder.owner == "main.py"
+        assert fallo.value.holder.owner == "otro service.py"
     finally:
         principal.release()
 
@@ -556,7 +554,7 @@ def test_dos_procesos_no_pueden_abrir_la_misma_sesion(tmp_path):
 def test_al_soltar_el_cerrojo_el_otro_proceso_entra(tmp_path):
     from app.core.lock import SessionLock
 
-    primero = SessionLock(tmp_path, owner="main.py").acquire()
+    primero = SessionLock(tmp_path, owner="otro service.py").acquire()
     primero.release()
     segundo = SessionLock(tmp_path, owner="service.py").acquire()
     assert segundo.held
@@ -589,7 +587,7 @@ def test_el_cerrojo_no_se_le_quita_a_otro_proceso(tmp_path):
 
     from app.core.lock import SessionLock
 
-    cerrojo = SessionLock(tmp_path, owner="main.py").acquire()
+    cerrojo = SessionLock(tmp_path, owner="otro service.py").acquire()
     # Alguien reescribe el archivo con OTRO pid.
     cerrojo.path.write_text(
         json.dumps({"pid": os.getpid() + 1, "owner": "otro", "acquired_at": "ahora"}),
@@ -623,38 +621,6 @@ def test_el_modo_solo_lectura_no_pide_el_cerrojo(settings, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_ambos_entrypoints_construyen_el_mismo_runtime():
-    """Ni main.py ni service.py cablean servicios por su cuenta.
-
-    ``service.py`` pasa por ``build_service_runtime``, que ademas de construir
-    el runtime deja la base lista. Es la MISMA fabrica que usan las pruebas de
-    integracion, y por dentro llama a ``build_runtime``: lo que importa aqui
-    es que ninguno de los dos monte el cableado a mano.
-    """
-    fabricas = {
-        "main.py": ("build_runtime(",),
-        "service.py": ("build_service_runtime(", "build_runtime("),
-    }
-    for archivo, aceptadas in fabricas.items():
-        fuente = Path(archivo).read_text(encoding="utf-8")
-        assert any(f in fuente for f in aceptadas), (
-            f"{archivo} debe construir el runtime con una fabrica compartida"
-        )
-        assert "AppRuntime(" not in fuente, (
-            f"{archivo} construye AppRuntime a mano en vez de usar la fabrica"
-        )
-
-    principal = Path("main.py").read_text(encoding="utf-8")
-    # El cableado de servicios se elimino de main.py: vive una sola vez.
-    for duplicado in (
-        "def wire_history_ingestion",
-        "def wire_backfill",
-        "def wire_live_messages",
-        "def wire_orchestrator",
-    ):
-        assert duplicado not in principal, (
-            f"{duplicado} volvio a main.py: ese cableado vive en AppRuntime"
-        )
 
 
 def test_service_usa_el_mismo_env_que_main():

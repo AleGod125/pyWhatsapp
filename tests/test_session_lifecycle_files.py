@@ -117,8 +117,6 @@ def test_si_el_store_queda_bloqueado_no_se_vincula(sesion_completa, monkeypatch)
     """
     import app.whatsapp_client as cliente_module
 
-    real = cliente_module.archive_session
-
     def archivar_solo_el_device(settings, reason):
         """Simula el bloqueo: se lleva el device.json y no el store."""
         destino = settings.diagnostics_dir / f"session-parcial-{reason}"

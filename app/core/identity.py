@@ -1,7 +1,7 @@
 """Identidad propia del dispositivo vinculado, y enmascarado de identificadores.
 
 Estas dos funciones vivian en ``inspect_db.py``, una herramienta de
-diagnostico, y sin embargo las usaban ``main.py`` y el orquestador. La
+diagnostico, y sin embargo las usaba el orquestador. La
 dependencia iba al reves de como debe ir: la aplicacion no puede necesitar un
 script de depuracion para arrancar. Ahora viven en el nucleo y las
 herramientas las importan de aqui.
@@ -84,9 +84,16 @@ def session_fingerprint(settings: Any) -> str | None:
     jid = datos.get("jid") or {}
     if not jid.get("user"):
         return None
+    # ``registration_id`` entra a proposito. ``device_id`` es un NUMERO DE
+    # RANURA que el servidor reutiliza: al desvincular todos los
+    # dispositivos la numeracion puede volver atras, y dos identidades
+    # distintas acabarian con la misma huella. Entonces se daria por
+    # confirmado el historial inicial de una sesion que ya no existe y la
+    # espera del bootstrap se saltaria sin que nada lo delatara. El
+    # registration_id se genera nuevo en cada vinculacion.
     crudo = (
         f"{jid['user']}:{jid.get('server', 's.whatsapp.net')}:"
-        f"{datos.get('device_id', '')}"
+        f"{datos.get('device_id', '')}:{datos.get('registration_id', '')}"
     )
     return hashlib.sha256(crudo.encode()).hexdigest()[:16]
 

@@ -95,7 +95,7 @@ class InitialHistoryGate:
     uso medido: en una sesion YA sincronizada el bootstrap no vuelve a
     llegar nunca, asi que la barrera agotaba sus 180 segundos en cada
     arranque y la aplicacion tardaba tres minutos en hacer nada util
-    (seccion 18). Con la marca persistida esa espera desaparece; solo se
+   . Con la marca persistida esa espera desaparece; solo se
     espera cuando de verdad hay algo que esperar.
     """
 

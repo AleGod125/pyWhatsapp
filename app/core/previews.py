@@ -7,7 +7,7 @@ que la aplicacion SI tiene: el tipo esta en la fila y el evento de sistema se
 puede leer del protobuf.
 
 Regla: si el clasificador conoce el tipo, la previa lo dice. ``[unknown]`` solo
-queda para lo que de verdad no se ha podido determinar (seccion 33).
+queda para lo que de verdad no se ha podido determinar.
 """
 
 from __future__ import annotations
@@ -76,11 +76,3 @@ def preview_for(
     return FALLBACK_PREVIEW
 
 
-def bubble_placeholder(message_type: str) -> str:
-    """Texto de la burbuja cuando el mensaje no tiene ni texto ni adjunto."""
-    etiqueta = TYPE_PREVIEWS.get(message_type)
-    if etiqueta is not None:
-        return etiqueta
-    if message_type == "unknown":
-        return "Mensaje no compatible con esta version"
-    return FALLBACK_PREVIEW

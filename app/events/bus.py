@@ -150,15 +150,7 @@ class EventBus:
             if suscriptor in self._subscribers:
                 self._subscribers.remove(suscriptor)
 
-    def latest(self, name: str) -> Any | None:
-        """Ultimo evento con ese nombre, o ``None`` si no ha habido ninguno."""
-        with self._lock:
-            return self._latest.get(name)
 
-    @property
-    def subscriber_count(self) -> int:
-        with self._lock:
-            return len(self._subscribers)
 
     def stream(
         self, *, timeout: float = 1.0, replay: bool = False

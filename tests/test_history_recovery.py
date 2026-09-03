@@ -26,8 +26,8 @@ import pytest
 from sqlalchemy import select
 
 from app.models import Chat, ChatHistoryState
-from app.services.history_recovery import HistoryRecoveryService
-from app.services.web_seed_provider import WebSeed
+from app.experimental.history_recovery import HistoryRecoveryService
+from app.experimental.web_seed_provider import WebSeed
 
 FANTASMA_A = "99955544433@lid"
 FANTASMA_B = "99966677788@lid"
@@ -168,7 +168,7 @@ def test_no_se_escriben_mensajes_ni_multimedia():
     from pathlib import Path
 
     arbol = ast.parse(
-        Path("app/services/history_recovery.py").read_text(encoding="utf-8")
+        Path("app/experimental/history_recovery.py").read_text(encoding="utf-8")
     )
     nombres = []
     for nodo in ast.walk(arbol):
@@ -263,7 +263,7 @@ def test_una_prueba_nunca_levanta_el_proceso_auxiliar(servicio, session, fantasm
 
 
 def test_el_progreso_trae_lo_que_el_frontend_necesita():
-    from app.services.history_recovery import ChatProgress, RecoveryJob
+    from app.experimental.history_recovery import ChatProgress, RecoveryJob
 
     trabajo = RecoveryJob(
         job_id="abc123",
@@ -288,7 +288,7 @@ def test_el_progreso_trae_lo_que_el_frontend_necesita():
 
 def test_el_qr_auxiliar_no_sale_en_el_json():
     """Un QR es una credencial de vinculacion: se sirve como imagen."""
-    from app.services.history_recovery import RecoveryJob
+    from app.experimental.history_recovery import RecoveryJob
 
     trabajo = RecoveryJob(job_id="abc", qr_required=True, qr_payload="2@SECRETO")
     cuerpo = trabajo.to_json()
@@ -299,7 +299,7 @@ def test_el_qr_auxiliar_no_sale_en_el_json():
 
 
 def test_los_estados_por_chat_estan_definidos():
-    from app.services.history_recovery import ESTADOS_CHAT
+    from app.experimental.history_recovery import ESTADOS_CHAT
 
     assert set(ESTADOS_CHAT) >= {
         "waiting_seed",

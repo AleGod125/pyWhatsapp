@@ -7,7 +7,7 @@ protocolo: claves de Noise, sesiones Signal, prekeys, contadores del ratchet.
 Dos procesos escribiendo ahi a la vez no producen "un conflicto"; producen una
 sesion corrupta que WhatsApp rechaza, y entonces hay que volver a vincular.
 
-Por eso ``py main.py`` y ``py service.py`` no pueden abrir la sesion a la vez.
+Por eso dos ``py service.py`` no pueden abrir la sesion a la vez.
 
 COMO SE HACE
 ------------
@@ -35,7 +35,7 @@ de ``session/``, y solo se borra ESE: nunca ``device.json`` ni la base Signal.
 LO QUE NO ES
 ------------
 No protege PostgreSQL. Dos procesos pueden LEER la base a la vez sin problema:
-es justo lo que hace ``main.py --viewer``. Lo que se serializa es la sesion de
+es justo lo que hace ``service.py --local``. Lo que se serializa es la sesion de
 WhatsApp.
 """
 
@@ -332,12 +332,10 @@ def explain(error: SessionLockedError) -> str:
             "corromperia el estado del protocolo y obligaria a volver a vincular",
             "el dispositivo.",
             "",
-            "Cierra el otro proceso y vuelve a intentarlo:",
-            "    py main.py       ventana Tkinter",
-            "    py service.py    API HTTP",
+            "Cierra el otro proceso y vuelve a intentarlo:  py service.py",
             "",
-            "Para ver la copia local sin tocar la sesion, y con el otro proceso",
-            "abierto, usa:  py main.py --viewer",
+            "Para leer la copia local sin tocar la sesion, y con el otro proceso",
+            "abierto, usa:  py service.py --local",
         )
     )
 

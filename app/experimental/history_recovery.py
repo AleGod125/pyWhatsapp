@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging_setup import get_logger
-from app.services.web_seed_provider import ETIQUETA, WebSeed, WebSeedProvider
+from app.experimental.web_seed_provider import ETIQUETA, WebSeed, WebSeedProvider
 
 log = get_logger("BACKFILL")
 
