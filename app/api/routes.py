@@ -861,6 +861,14 @@ EVENT_NAMES: dict[str, str] = {
     # pintando "Conectado" seria mentir.
     "reconnecting": "session.state",
     "reconnected": "session.state",
+    # Recuperacion de historiales pendientes. Se pasan tal cual: el nombre ya
+    # esta en el vocabulario del frontend.
+    "history.recovery.started": "history.recovery.started",
+    "history.recovery.progress": "history.recovery.progress",
+    "history.recovery.completed": "history.recovery.completed",
+    "history.seed.found": "history.seed.found",
+    "history.seed.not_found": "history.seed.not_found",
+    "history.backfill.started": "history.backfill.started",
     "session_valid": "session.state",
     "logged_out": "session.state",
     "disconnected": "session.state",

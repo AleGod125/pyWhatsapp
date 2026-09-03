@@ -159,31 +159,28 @@ def test_el_proveedor_no_escribe_mensajes_ni_multimedia():
 
 
 def test_el_componente_node_no_guarda_historial():
-    """Tampoco del lado Node: una clave y se apaga."""
+    """Tampoco del lado Node: una clave por chat y se apaga."""
     from pathlib import Path
 
     fuente = Path("web_bootstrap/seed.js").read_text(encoding="utf-8")
-    # Termina en cuanto encuentra la semilla.
-    assert "terminar(true)" in fuente
-    # Y no descarga contenido.
+    # Se apaga solo en cuanto no queda nada que buscar.
+    assert "pendientes.size === 0" in fuente
+    assert "terminar(" in fuente
+    # No descarga contenido.
     for prohibido in ("downloadMediaMessage", "downloadContentFromMessage"):
         assert prohibido not in fuente
+    # Y no manda nada: es un oyente.
+    assert "sendMessage" not in fuente
 
 
-def test_solo_toca_el_cursor_del_chat():
-    """El UNICO efecto sobre la base es dejar el ancla."""
-    import ast
+def test_el_auxiliar_no_marca_nada_como_leido():
+    """Se conecta a la cuenta real del usuario: no puede alterar sus chats."""
     from pathlib import Path
 
-    arbol = ast.parse(Path("app/services/web_seed_job.py").read_text(encoding="utf-8"))
-    tablas = [
-        n.id
-        for n in ast.walk(arbol)
-        if isinstance(n, ast.Name) and n.id in {"Message", "MediaFile", "ChatHistoryState"}
-    ]
-    assert "ChatHistoryState" in tablas
-    assert "Message" not in tablas
-    assert "MediaFile" not in tablas
+    fuente = Path("web_bootstrap/seed.js").read_text(encoding="utf-8")
+    assert "markOnlineOnConnect: false" in fuente
+    for prohibido in ("readMessages", "chatModify", "sendReceipt"):
+        assert prohibido not in fuente
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +253,27 @@ def test_el_componente_esta_instalado_de_verdad(settings):
 
 
 def test_un_fallo_del_auxiliar_no_lanza(proveedor):
-    """El servicio principal no puede caerse porque el auxiliar falle."""
-    assert proveedor.run({ISAAC}) is None
+    """El servicio principal no puede caerse porque el auxiliar falle.
+
+    Aqui falta ``seed.js`` a proposito (el proveedor apunta a un directorio
+    temporal), asi que esto ejerce la ruta de "no se pudo ni arrancar".
+    """
+    resultado = proveedor.run([{"chat_id": 1, "jids": [ISAAC]}])
+    assert resultado == {}
+
+
+def test_se_buscan_todos_los_chats_en_UNA_conexion(proveedor):
+    """Un proceso por chat serian treinta vinculaciones seguidas.
+
+    El historial llega junto de todas formas: se aprovecha esa unica entrega.
+    """
+    import inspect
+
+    firma = inspect.signature(WebSeedProvider.run)
+    assert "targets" in firma.parameters, "recibe la lista entera, no un chat"
+
+    fuente = inspect.getsource(WebSeedProvider.run)
+    assert "--targets" in fuente
 
 
 def test_el_proceso_se_cierra_siempre():

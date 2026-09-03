@@ -93,6 +93,9 @@ class RecoveryJob:
     no_seed: int = 0
     errors: int = 0
     qr_required: bool = False
+    # El payload del codigo auxiliar. NO sale en el JSON: un QR es una
+    # credencial de vinculacion y se sirve solo como imagen.
+    qr_payload: str | None = None
     current: ChatProgress | None = None
     chats: list[ChatProgress] = field(default_factory=list)
     error: str | None = None
@@ -241,6 +244,7 @@ class HistoryRecoveryService:
         def al_evento(estado: str, datos: dict[str, Any]) -> None:
             if estado == "qr_required":
                 trabajo.qr_required = True
+                trabajo.qr_payload = datos.get("qr")
                 trabajo.state = "qr_required"
                 self._emitir("history.recovery.progress", trabajo.to_json())
             elif estado == "failed":
