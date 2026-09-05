@@ -81,7 +81,7 @@ def _user(jid: str | None) -> str | None:
     return usuario or None
 
 
-def seed(settings: Any) -> bool:
+def seed(settings: Any, *, lid_hint: str | None = None) -> bool:
     """Escribe el par PN<->LID propio en el ``lid_map`` del Signal Store.
 
     Devuelve ``True`` si el mapa quedo con nuestro par. Nunca lanza: sin este
@@ -91,11 +91,30 @@ def seed(settings: Any) -> bool:
 
     Es idempotente: ``SqliteLidMap.set`` limpia cualquier par conflictivo
     antes de insertar, y aqui se comprueba primero si ya esta.
+
+    EL LID PUEDE NO ESTAR TODAVIA EN EL DISCO
+    -----------------------------------------
+    En una vinculacion nueva el LID no llega con el ``pair-success``: llega
+    DESPUES, en el ``<success>`` del servidor. Se midio en un pairing limpio::
+
+        15:45:17  post_connect -> "Sin identidad propia completa todavia"
+        15:45:18  activator: <success> ... lid=8653...@lid
+
+    Un segundo de diferencia, y en ese segundo la siembra ya habia fallado y
+    no habia nadie que la repitiera. Por eso se acepta ``lid_hint``: el
+    dispositivo VIVO conoce el LID en cuanto llega el ``<success>``, sin
+    depender de cuando se escriba ``device.json``.
+
+    El indicio solo se usa si el disco no lo tiene; nunca lo sobrescribe.
     """
     from app.core.identity import own_identity
 
     pn_jid, lid_jid = own_identity(settings)
     pn_user, lid_user = _user(pn_jid), _user(lid_jid)
+    if not lid_user and lid_hint:
+        lid_user = _user(lid_hint)
+        if lid_user:
+            log.debug("LID tomado del dispositivo vivo; el disco no lo tenia aun")
     if not pn_user or not lid_user:
         log.debug("Sin identidad propia completa todavia; no se siembra el lid_map")
         return False

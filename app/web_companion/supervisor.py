@@ -154,12 +154,35 @@ class WebCompanionSupervisor:
     def vivo(self) -> bool:
         return self._proceso is not None and self._proceso.poll() is None
 
+    @property
+    def sesion_guardada(self) -> bool:
+        """Si este dispositivo ya estuvo vinculado alguna vez.
+
+        Es la diferencia entre REANUDAR y PEDIR. Con sesion guardada, arrancar
+        el worker no ensena ningun codigo: se reconecta y sigue trabajando.
+        Sin ella, arrancar significa publicar un segundo codigo QR, y eso no
+        puede pasar sin que el usuario lo haya pedido.
+        """
+        raiz = getattr(self._settings, "session_dir", None)
+        if not raiz:
+            return False
+        try:
+            carpeta = Path(raiz) / "web_companion"
+            return carpeta.is_dir() and any(carpeta.iterdir())
+        except (OSError, TypeError, ValueError):
+            # Mirar el disco no puede tumbar un `snapshot()`: esta propiedad
+            # se consulta desde el estado que pinta el panel.
+            return False
+
     def snapshot(self) -> dict[str, Any]:
         with self._candado:
             datos = self._estado.to_json()
         datos["enabled"] = self.habilitado
         datos["running"] = self.vivo
         datos["process_running"] = self.vivo
+        # Lo que el panel necesita para decidir si ofrece "activar" o
+        # simplemente muestra que ya esta en marcha.
+        datos["linked"] = self.sesion_guardada
         return datos
 
     def qr_payload(self) -> tuple[str | None, int]:

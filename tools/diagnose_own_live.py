@@ -180,9 +180,161 @@ def main() -> int:
     print()
     print("  Los contadores de copias propias y de acuses salen en el registro")
     print("  del servicio, en las lineas [OWN_LIVE] y app.live.")
+
+    _direcciones_propias(settings)
+    _resumen_own_live(settings)
+
     print()
     print("Solo lectura: no se ha escrito ni una fila.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# La direccion criptografica: donde estaba el fallo
+# ---------------------------------------------------------------------------
+
+
+def _direcciones_propias(settings) -> None:
+    """Bajo que direccion vive la sesion con nuestro propio telefono.
+
+    AQUI ESTABA EL BUG, y por eso esto es lo primero que hay que mirar.
+
+    Un mensaje escrito desde el telefono llega dirigido a NUESTRO PROPIO LID.
+    La sesion con ese aparato existe, pero guardada bajo la otra direccion, la
+    del numero. Son dos identificadores del mismo telefono, y la busqueda va
+    por la direccion literal, asi que no la encuentra:
+
+        no session for peer <nuestro propio LID>
+
+    pywhats sabe resolverlo --migra la sesion del numero al LID-- pero para eso
+    necesita el par PN<->LID en el ``lid_map``, y ese par no llega solo: hay
+    que sembrarlo. Si la linea de abajo dice que NO esta, los mensajes propios
+    no se van a poder descifrar.
+    """
+    import sqlite3
+
+    from app.core.identity import own_identity
+
+    print()
+    print(LINEA)
+    print("LA DIRECCION CON LA QUE LLEGAN MIS COPIAS")
+    print(LINEA)
+
+    pn_jid, lid_jid = own_identity(settings)
+    pn = (pn_jid or "").split("@")[0].split(".")[0]
+    lid = (lid_jid or "").split("@")[0].split(".")[0]
+    if not pn or not lid:
+        print("  Todavia no hay identidad propia completa. Sin ella no se")
+        print("  puede sembrar el par, y las copias propias no se descifran.")
+        return
+
+    almacen = settings.signal_store_file
+    if not almacen.exists():
+        print("  No hay Signal Store: no hay vinculacion.")
+        return
+
+    try:
+        conexion = sqlite3.connect(f"file:{almacen.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"  No se pudo leer el Signal Store: {exc}")
+        return
+
+    try:
+        par = conexion.execute(
+            "SELECT pn_user FROM lid_map WHERE lid_user = ?", (lid,)
+        ).fetchone()
+        sesiones = [
+            sid for (sid,) in conexion.execute("SELECT session_id FROM sessions")
+        ]
+    except sqlite3.Error as exc:
+        print(f"  No se pudo leer el Signal Store: {exc}")
+        return
+    finally:
+        conexion.close()
+
+    resuelve = bool(par) and str(par[0]) == pn
+    por_pn = [s for s in sesiones if s.startswith(f"{pn}:")]
+    por_lid = [s for s in sesiones if s.startswith(f"{lid}:")]
+
+    print(f"  par PN<->LID propio sembrado   {'si' if resuelve else 'NO'}")
+    print(f"  sesion por numero (PN)         {len(por_pn)}")
+    print(f"  sesion por LID                 {len(por_lid)}")
+    print()
+    if resuelve:
+        print("  Bien. Cuando llegue una copia dirigida al LID, la sesion del")
+        print("  numero se migra sola y el mensaje se descifra.")
+    else:
+        print("  ESTO ES EL FALLO. Sin el par, una copia dirigida a tu propio")
+        print("  LID no encuentra sesion y muere con 'no session for peer'.")
+        print("  Se siembra al llegar el <success>; reinicia 'py service.py'.")
+
+
+# ---------------------------------------------------------------------------
+# El resumen que pide el plan
+# ---------------------------------------------------------------------------
+
+#: Lo que se busca en el registro. Cada patron contesta una casilla, y ninguno
+#: depende del texto del mensaje: el registro no lo lleva, a proposito.
+_HUELLAS = {
+    "no_session": "no session for peer",
+    "mac_fail": "mac check failed",
+    "pkmsg": "type=pkmsg",
+    "opk_desconocida": "unknown one-time pre-key id",
+}
+
+
+def _resumen_own_live(settings) -> None:
+    """El recuento de §79, contando SOLO nuestras propias copias.
+
+    Contar todos los fallos de descifrado mezcla los mensajes de otros con los
+    nuestros, y son problemas distintos: el de un tercero es su ratchet, el
+    nuestro es una direccion que no se encuentra. Se filtra por remitente.
+    """
+    import pathlib as _pathlib
+
+    from app.core.identity import own_identity
+
+    _pn, lid_jid = own_identity(settings)
+    lid = (lid_jid or "").split("@")[0].split(".")[0]
+
+    registro = _pathlib.Path(settings.diagnostics_dir) / "app.log"
+    print()
+    print(LINEA)
+    print("[OWN_LIVE] RESUMEN")
+    print(LINEA)
+    if not lid or not registro.exists():
+        print("  Sin registro o sin identidad todavia.")
+        return
+
+    conteo = dict.fromkeys(_HUELLAS, 0)
+    lineas = 0
+    with registro.open("r", encoding="utf-8", errors="replace") as fichero:
+        try:
+            fichero.seek(max(0, registro.stat().st_size - 4_000_000))
+            fichero.readline()
+        except OSError:
+            pass
+        for linea in fichero:
+            if lid not in linea or "decrypt failed" not in linea:
+                continue
+            lineas += 1
+            for clave, patron in _HUELLAS.items():
+                if patron in linea:
+                    conteo[clave] += 1
+
+    print(f"  fallos en copias PROPIAS       {lineas}")
+    for clave in ("no_session", "mac_fail", "opk_desconocida"):
+        print(f"    {clave:<28} {conteo[clave]}")
+    print()
+    print("  (ultimos 4 MB del registro, y solo lo dirigido a tu propio LID)")
+    print()
+    if conteo["no_session"]:
+        print("  'no_session' en copias propias apunta al par PN<->LID: mira")
+        print("  la seccion de arriba.")
+    if conteo["opk_desconocida"]:
+        print("  'opk_desconocida' es un pkmsg que reusa una clave de un solo")
+        print("  uso ya consumida. La compatibilidad de reutilizacion de")
+        print("  ratchet lo cubre cuando el establecimiento es el mismo.")
 
 
 if __name__ == "__main__":

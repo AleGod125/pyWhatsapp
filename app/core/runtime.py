@@ -619,15 +619,25 @@ class AppRuntime:
             # todavia dijera "sin vincular", esa consulta lo mandaria de
             # vuelta a la pantalla del codigo QR con la sesion ya conectada.
             self._persistir_vinculacion()
+            # AQUI, y no antes, es cuando existe el par PN<->LID completo.
+            #
+            # Habia una segunda rama ``elif nombre == "paired"`` mas abajo con
+            # esta llamada. Era CODIGO MUERTO: la cadena if/elif ya habia
+            # entrado por la primera rama ``paired``, asi que en una
+            # vinculacion nueva la siembra no corria nunca. Y aunque hubiera
+            # corrido, habria sido pronto: el ``pair-success`` no trae el LID,
+            # lo trae el ``<success>``. Se midio en el pairing limpio de las
+            # 15:45 -- la siembra fallo a las 15:45:17 y el LID llego a las
+            # 15:45:18. Un segundo, y nadie lo reintentaba.
+            #
+            # Sin esto, cada mensaje que el usuario escribe desde su telefono
+            # llega dirigido a nuestro propio LID, no encuentra sesion --que
+            # existe, pero guardada bajo el numero-- y muere con "no session
+            # for peer <nuestro propio LID>".
+            self._sembrar_lid_propio("<success>")
             self.state.set(AppState.CONNECTED, reason="<success> del servidor")
         elif nombre == "logged_out":
             self._sesion_rechazada(carga)
-        elif nombre == "paired":
-            # Vinculacion NUEVA. Hasta este instante no existian ni
-            # ``device.json`` ni el Signal Store, asi que la siembra del
-            # arranque no pudo hacer nada: se hace AHORA, que es cuando hay
-            # identidad y hay store.
-            self._sembrar_lid_propio("pairing nuevo")
         elif nombre == "transport_lost":
             # Se cayo la linea. Las peticiones de historial en vuelo esperan
             # algo imposible: se las despierta ya, conservando su cursor.
@@ -1470,7 +1480,7 @@ class AppRuntime:
         try:
             from app.compat import own_lid_map
 
-            if own_lid_map.seed(self.settings):
+            if own_lid_map.seed(self.settings, lid_hint=self._lid_del_dispositivo_vivo()):
                 log.info("Par PN<->LID propio registrado (%s)", motivo)
             else:
                 log.warning(
@@ -1481,6 +1491,17 @@ class AppRuntime:
                 )
         except Exception:  # noqa: BLE001 - sembrar no puede tumbar la sesion
             log.exception("Fallo registrando el par PN<->LID propio")
+
+    def _lid_del_dispositivo_vivo(self) -> str | None:
+        """El LID que ya conoce el cliente conectado, si lo conoce.
+
+        En una vinculacion nueva el LID llega en el ``<success>`` y el disco
+        va un paso por detras. Preguntarselo al dispositivo vivo evita que la
+        siembra dependa de cuando se escriba el archivo.
+        """
+        dispositivo = getattr(getattr(self, "client", None), "_client", None)
+        lid = getattr(getattr(dispositivo, "device", None), "lid", None)
+        return str(lid) if lid else None
 
     def _sembrar(self, chat_jids: Any) -> None:
         """Un mensaje nuevo puede desbloquear un chat sin ancla.

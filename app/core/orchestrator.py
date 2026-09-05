@@ -586,18 +586,34 @@ class Orchestrator:
                 "no hace falta el segundo dispositivo"
             )
         elif supervisor is not None and getattr(supervisor, "habilitado", False):
-            if not getattr(supervisor, "vivo", False):
+            # QUE HAYA CONVERSACIONES SIN ANCLA NO AUTORIZA A PEDIR UN CODIGO.
+            #
+            # Antes se arrancaba el worker en cuanto quedaba una sin ancla. Con
+            # sesion guardada eso solo reanuda, que esta bien; pero SIN ella
+            # publica un segundo codigo QR, y el usuario se encuentra un codigo
+            # que no ha pedido y que parece obligatorio. No lo es: es una
+            # mejora opcional.
+            #
+            # Asi que se separan los dos casos. Reanudar, si. Pedir, solo
+            # cuando el usuario lo active desde los ajustes.
+            if getattr(supervisor, "vivo", False):
+                pass
+            elif getattr(supervisor, "sesion_guardada", False):
                 try:
-                    # Si ya hay sesion guardada arranca sin pedir nada; si no,
-                    # publica su QR y el panel lo ofrece como mejora.
                     supervisor.start()
                     log.info(
-                        "%d conversacion(es) sin ancla: se ofrece la recuperacion "
-                        "avanzada (segundo dispositivo)",
+                        "%d conversacion(es) sin ancla: se reanuda la recuperacion "
+                        "avanzada ya vinculada",
                         sin_ancla,
                     )
                 except Exception:  # noqa: BLE001 - opcional, no puede tumbar nada
-                    log.exception("No se pudo arrancar el Web Companion")
+                    log.exception("No se pudo reanudar el Web Companion")
+            else:
+                log.info(
+                    "%d conversacion(es) sin ancla: la recuperacion avanzada "
+                    "esta disponible en los ajustes (no se pide ningun codigo)",
+                    sin_ancla,
+                )
 
         vigilante = getattr(runtime, "auto_recovery", None)
         if vigilante is not None:
