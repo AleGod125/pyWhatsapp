@@ -201,7 +201,14 @@ class WebCompanionSupervisor:
 
         Sin runtime cableado se permite, para no romper el uso directo del
         supervisor en pruebas y herramientas.
+
+        Durante la fase A del Plan J3.1 se bloquea aunque la principal esté
+        perfectamente lista: lo que se mide ahí es una principal SOLA, y un
+        segundo dispositivo vinculado a media medición la invalida (§11, §12).
         """
+        if getattr(self._settings, "plan_j31_primary_only", False):
+            return False
+
         runtime = getattr(self, "runtime", None)
         if runtime is None:
             return True
@@ -217,6 +224,14 @@ class WebCompanionSupervisor:
         if not self.habilitado:
             self._fijar(state="disabled")
             log.info("desactivado")
+            return False
+
+        # La puerta unica. `_reintentar` ya preguntaba, pero `start` se llama
+        # tambien desde la API y desde herramientas, y durante la fase A del
+        # Plan J3.1 no puede haber un worker vivo por ninguna de las tres.
+        if not self.permitido():
+            self._fijar(state="blocked_by_primary", error=None, pid=None)
+            log.info("no se arranca el segundo dispositivo: bloqueado")
             return False
 
         ok, motivo = self.comprobar_entorno()

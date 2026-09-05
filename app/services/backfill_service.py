@@ -1206,6 +1206,8 @@ class BackfillService:
         Lo unico que puede cambiar es la capacidad, y solo si llega una
         respuesta ON_DEMAND correlacionada de verdad. Un ACK no basta.
         """
+        if self._historia_congelada(chat_jid):
+            return {"error": "frozen", "reason": "PLAN_J31_FREEZE_HISTORY"}
         if self._busy or self._in_flight:
             return {"error": "busy", "in_flight": sorted(self._in_flight)}
 
@@ -1347,8 +1349,25 @@ class BackfillService:
         midieron dos peticiones en vuelo con 2 s de diferencia. El telefono
         atiende de una en una y dos respuestas cruzadas no se pueden atribuir.
         """
+        if self._historia_congelada(chat_jid):
+            return False
         async with self._lock_ondemand():
             return await self._request_once_locked(chat_id, chat_jid, cursor)
+
+    def _historia_congelada(self, chat_jid: str) -> bool:
+        """La excavacion esta parada a proposito para una medicion (§24).
+
+        No es un fallo ni un limite del servidor: es que mientras se mide que
+        trae el ARRANQUE, excavar mezclaria anclas de ON_DEMAND con las del
+        bootstrap y la cifra dejaria de significar lo que dice medir.
+        """
+        if not getattr(self._settings, "plan_j31_freeze_history", False):
+            return False
+        log.info(
+            "ON_DEMAND congelado por PLAN_J31_FREEZE_HISTORY; no se pide %s",
+            chat_jid,
+        )
+        return True
 
     async def _request_once_locked(
         self, chat_id: int, chat_jid: str, cursor: Any

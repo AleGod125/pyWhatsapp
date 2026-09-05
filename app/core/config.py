@@ -273,6 +273,22 @@ class Settings:
     # comprobar si getChats() y Store.Chat ya bastan.
     web_store_discovery_scroll: bool
 
+    # --- Plan J3.1: la prueba simetrica --------------------------------------
+    #
+    # Instrumentacion de UN experimento concreto, no funciones del producto.
+    # Las tres vienen apagadas y se encienden a mano para la prueba.
+    #
+    # ``plan_j31_enabled``        cronometra los dos lados y guarda las fotos.
+    # ``plan_j31_primary_only``   impide que el segundo dispositivo arranque,
+    #                             para poder medir una principal SOLA (§11).
+    # ``plan_j31_freeze_history`` corta ON_DEMAND mientras dura la ventana: si
+    #                             excavamos mientras medimos, las anclas que
+    #                             contamos ya no son las que trajo el arranque
+    #                             (§24).
+    plan_j31_enabled: bool
+    plan_j31_primary_only: bool
+    plan_j31_freeze_history: bool
+
     # --- Compatibilidades pywhats 0.2.0 ---
     compat_wa_version: bool
     wa_version_fetch_timeout: float
@@ -483,6 +499,9 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         web_companion_chrome=_str("WEB_COMPANION_CHROME", ""),
         web_store_load_earlier=_bool("WEB_STORE_LOAD_EARLIER", False),
         web_store_discovery_scroll=_bool("WEB_STORE_DISCOVERY_SCROLL", False),
+        plan_j31_enabled=_bool("PLAN_J31_ENABLED", False),
+        plan_j31_primary_only=_bool("PLAN_J31_PRIMARY_ONLY", False),
+        plan_j31_freeze_history=_bool("PLAN_J31_FREEZE_HISTORY", False),
         compat_wa_version=_bool("COMPAT_WA_VERSION", True),
         wa_version_fetch_timeout=_float("WA_VERSION_FETCH_TIMEOUT", 10.0, minimum=1.0),
         compat_windows_store=_bool("COMPAT_WINDOWS_STORE", True),

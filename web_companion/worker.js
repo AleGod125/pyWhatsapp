@@ -525,6 +525,23 @@ async function atender(comando) {
           estado.probeRunning = false;
         }
       }
+    case 'j31_store_snapshot':
+      // Plan J3.1. LEE el almacen, no le pide nada: ni fetchMessages ni
+      // loadEarlierMsgs. Es la unica forma de medir que trae el arranque del
+      // navegador por si solo, que es lo que nunca se habia medido aparte.
+      {
+        const problema = exigirListo();
+        if (problema) return problema;
+        const comenzo = Date.now();
+        try {
+          const foto = await store.instantaneaJ31(cliente.pupPage, {
+            topeMensajes: Number(comando.limit || 1),
+          });
+          return { event: 'j31_store_snapshot', elapsed_ms: Date.now() - comenzo, ...foto };
+        } catch (e) {
+          return { event: 'error', error: 'instantanea_fallo', detail: String(e?.message || e).slice(0, 200) };
+        }
+      }
     case 'probe_waiting_seeds':
       estado.probeRunning = true;
       try { return await sondearSemillas(comando); } finally { estado.probeRunning = false; }

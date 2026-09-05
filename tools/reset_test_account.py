@@ -119,8 +119,20 @@ def _rutas(settings) -> list[tuple[str, Path]]:
         ("Signal Store", Path(settings.signal_store_file)),
         ("prekeys de compatibilidad", sesion / "compat_prekey.db"),
         ("sesion del Web Companion", sesion / "web_companion"),
+        # El OTRO dispositivo vinculado experimental. Faltaba, y su ausencia
+        # se midio: `check_clean_state` daba la limpieza por incompleta porque
+        # esta carpeta sobrevivia. Una sesion vinculada superviviente es justo
+        # lo que invalida una prueba que dice partir de cero.
+        ("sesion del bootstrap web", sesion / "web_bootstrap"),
         ("blobs de historial archivados", Path("data/history")),
         ("cache local", Path("data/cache")),
+        # Los laterales de SQLite. Borrar el .db y dejar el -wal deja escritas
+        # sin volcar de la vinculacion anterior: SQLite las recupera al abrir
+        # un archivo nuevo con el mismo nombre.
+        ("diario del Signal Store", Path(str(settings.signal_store_file) + "-wal")),
+        ("indice del Signal Store", Path(str(settings.signal_store_file) + "-shm")),
+        ("diario de las prekeys", sesion / "compat_prekey.db-wal"),
+        ("indice de las prekeys", sesion / "compat_prekey.db-shm"),
     ]
 
 

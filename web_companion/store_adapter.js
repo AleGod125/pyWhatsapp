@@ -288,8 +288,95 @@ async function cargarAnteriores() {
   return { ok: false, motivo: 'read_only_loader_disabled' };
 }
 
+/**
+ * La foto del almacén tal y como está, para el Plan J3.1.
+ *
+ * QUÉ LA DISTINGUE DE `inventarioCompleto`
+ * ----------------------------------------
+ * Aquélla PIDE: llama a `fetchMessages`, que acaba en `loadEarlierMsgs`, y eso
+ * altera lo que se está midiendo. Ésta sólo LEE lo que el navegador ya tiene
+ * por su cuenta — que es exactamente la pregunta de la fase: qué trae el
+ * arranque del navegador, sin que nosotros le pidamos nada (§56, §57).
+ *
+ * Tampoco filtra por tipo de conversación: la clasificación la hace Python con
+ * la misma tabla que aplica a la sesión principal, porque si cada lado filtra
+ * con su criterio la resta vuelve a no significar nada.
+ *
+ * Una sola pasada por la página: el peldaño T+0 tiene que salir rápido, y
+ * treinta idas y vueltas a Chromium ya no serían el instante que se dice medir.
+ */
+async function instantaneaJ31(page, { topeMensajes = 1 } = {}) {
+  return page.evaluate((tope) => {
+    const attempt = (fn, fallback = null) => { try { return fn(); } catch { return fallback; } };
+    const req = (name) => typeof window.require === 'function' ? attempt(() => window.require(name)) : null;
+    const collections = window.Store || req('WAWebCollections') || {};
+    const chats = window.Store?.Chat || collections?.Chat;
+    if (typeof chats?.getModelsArray !== 'function') {
+      return { chats: [], store_msg_total: null, error: 'no_chat_collection' };
+    }
+
+    const nombreDe = (chat) => {
+      for (const valor of [chat?.name, chat?.formattedTitle, chat?.contact?.name,
+        chat?.contact?.pushname, chat?.groupMetadata?.subject]) {
+        if (typeof valor === 'string' && valor.trim()) return true;
+      }
+      return false;
+    };
+
+    const modelos = attempt(() => chats.getModelsArray(), []) || [];
+    const filas = [];
+    for (const chat of modelos) {
+      const id = chat?.id?._serialized || attempt(() => chat?.id?.toString?.(), '') || '';
+      if (!id) continue;
+      const mensajes = attempt(() => chat?.msgs?.getModelsArray?.(), null)
+        || (Array.isArray(chat?.msgs?.models) ? chat.msgs.models : []);
+
+      // El más reciente que ya está materializado. NO se carga nada para
+      // conseguirlo: si no hay, no hay, y eso es justo el dato.
+      let masNuevo = null;
+      for (const mensaje of mensajes.slice(-Math.max(1, tope))) {
+        const clave = mensaje?.id ?? null;
+        const wamid = (clave && typeof clave === 'object' && typeof clave.id === 'string')
+          ? clave.id : (typeof clave === 'string' ? clave : null);
+        if (!wamid) continue;
+        const t = Number(mensaje?.t ?? mensaje?.timestamp ?? 0) || null;
+        if (!masNuevo || (t || 0) >= (masNuevo.t || 0)) {
+          masNuevo = {
+            wa_msg_id: wamid,
+            t,
+            from_me: (clave && typeof clave === 'object' && typeof clave.fromMe === 'boolean')
+              ? clave.fromMe
+              : (typeof mensaje?.fromMe === 'boolean' ? mensaje.fromMe : null),
+          };
+        }
+      }
+
+      filas.push({
+        id,
+        is_group: id.endsWith('@g.us'),
+        // Los indicadores que Python no puede deducir del identificador. Van
+        // como `null` cuando el modelo no los expone: no se suponen.
+        archived: typeof chat?.archive === 'boolean' ? chat.archive : null,
+        is_business: typeof chat?.contact?.isBusiness === 'boolean' ? chat.contact.isBusiness : null,
+        is_community: typeof chat?.isParentGroup === 'boolean' ? chat.isParentGroup : null,
+        name: nombreDe(chat),
+        last_activity: Number(chat?.t || chat?.timestamp || chat?.lastMessage?.t || 0) || null,
+        msgs_in_memory: mensajes.length,
+        newest: masNuevo,
+      });
+    }
+
+    const msgs = window.Store?.Msg || collections?.Msg;
+    const total = typeof msgs?.getModelsArray === 'function'
+      ? (attempt(() => msgs.getModelsArray(), []) || []).length
+      : null;
+
+    return { chats: filas, store_msg_total: total, error: null };
+  }, topeMensajes);
+}
+
 module.exports = {
   CARGADORES_DE_MENSAJES: LOADERS, HISTORIAL: HISTORY, descubrir,
   esperarStore, chatsDelStore, mensajesEnMemoria, inspeccionarModelos,
-  cargarAnteriores,
+  cargarAnteriores, instantaneaJ31,
 };

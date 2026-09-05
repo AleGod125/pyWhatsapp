@@ -396,3 +396,57 @@ def refrescar_indice():
     if bus is not None:
         bus.publish("web_inventory_done", resultado)
     return jsonify(resultado)
+
+
+@web_companion.post("/web-companion/j31/snapshot")
+def instantanea_j31():
+    """Plan J3.1: la foto del almacen del navegador. LEE, no pide nada.
+
+    Es la ruta que permite medir al navegador con la MISMA vara que a la
+    sesion principal: mismas metricas, misma clasificacion de conversaciones,
+    mismo criterio de ancla valida.
+
+    A diferencia de `inventory/preview`, esta no llama a `fetchMessages` ni a
+    `loadEarlierMsgs`. Esa distincion es el centro de la fase: si le pedimos
+    cosas al navegador mientras medimos que trae por si solo, la cifra deja de
+    responder a la pregunta.
+
+    `mode` distingue las dos mediciones que no se pueden mezclar:
+    `native_store` es lo que tiene el navegador solo, y `after_probes` lo que
+    tiene despues de que nuestro sondeo le haya pedido.
+    """
+    import time as _time
+
+    bloqueo = _principal_lista()
+    if bloqueo is not None:
+        return bloqueo
+
+    supervisor = _supervisor()
+    if supervisor is None or not supervisor.habilitado:
+        return _error("WEB_COMPANION_DISABLED", "El Web Companion esta apagado.")
+    if not supervisor.vivo:
+        return _error(
+            "WEB_COMPANION_NOT_RUNNING",
+            "El Web Companion no esta en marcha.",
+            409,
+            state=supervisor.snapshot().get("state"),
+        )
+    if not supervisor.snapshot().get("store_ready"):
+        return _error(
+            "WEB_COMPANION_NOT_READY",
+            "El almacen del navegador todavia no esta listo.",
+        )
+
+    cuerpo = request.json if request.is_json else {}
+    modo = str(cuerpo.get("mode") or "native_store")
+    etiqueta = str(cuerpo.get("label") or "manual")
+    t0 = float(cuerpo.get("t0") or _time.time())
+
+    respuesta = supervisor.enviar({"cmd": "j31_store_snapshot"}, timeout=60.0)
+    if respuesta.get("error"):
+        return _error("J31_SNAPSHOT_FAILED", str(respuesta.get("error")))
+
+    from app.discovery.symmetric_snapshot import fotografiar_navegador
+
+    foto = fotografiar_navegador(respuesta, t0=t0, etiqueta=etiqueta, modo=modo)
+    return jsonify(foto.to_json())

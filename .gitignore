@@ -57,3 +57,8 @@ web_companion/node_modules/
 web_companion/session/
 session/web_bootstrap/
 session/backups/
+
+# Salida de la prueba simetrica del Plan J3.1. Va sanitizada --hashes, sin
+# texto ni identificadores-- pero es el resultado de UNA medicion en UNA
+# maquina, no codigo. El informe es lo que se guarda; esto es su materia prima.
+debug/

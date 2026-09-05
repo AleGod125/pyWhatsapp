@@ -57,6 +57,11 @@ TAGS = (
     # ve WhatsApp Web. Etiqueta propia porque es experimental y opcional, y
     # tiene que poder distinguirse de la sesion de verdad de un vistazo.
     "WEB",
+    # La prueba simetrica del Plan J3.1: los peldanos de la escalera y el
+    # congelado de metricas. Etiqueta propia porque es la traza de UN
+    # experimento con fecha, y mezclarla con [WEB] o [SYNC] haria imposible
+    # leer despues que se midio y cuando.
+    "J31",
 )
 
 #: Cuantos caracteres hexadecimales se dejan ver de un volcado.

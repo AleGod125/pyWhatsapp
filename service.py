@@ -326,6 +326,11 @@ def main(argv: list[str] | None = None) -> int:
         # Solo se informa. Arrancarlo aqui es lo que ponia el codigo QR del
         # segundo dispositivo delante del usuario sin sesion principal.
         _informar_del_web_companion(runtime)
+        # Plan J3.1: cronometra los dos lados desde el T0 de cada uno. Apagado
+        # salvo que PLAN_J31_ENABLED este puesto; sin la bandera no hace nada.
+        from app.experimental.j31_recorder import arrancar_si_procede
+
+        arrancar_si_procede(runtime)
     else:
         log.info("PostgreSQL listo (modo local)")
         log.info("Runtime WhatsApp deshabilitado: no se abrira la sesion")
