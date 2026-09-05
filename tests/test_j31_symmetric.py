@@ -245,7 +245,7 @@ def test_un_mensaje_sin_identificador_no_da_ancla():
 # ---------------------------------------------------------------------------
 
 
-def _foto(lado, *, chats, anclas, edad, especiales=0):
+def _foto(lado, *, chats, anclas, edad, especiales=0, etiqueta="t120"):
     filas = []
     for i in range(chats):
         filas.append(
@@ -272,7 +272,7 @@ def _foto(lado, *, chats, anclas, edad, especiales=0):
             )
         )
     return snap.Foto(
-        lado=lado, etiqueta="t120", t0_epoch=0.0, capturado_epoch=edad, filas=filas
+        lado=lado, etiqueta=etiqueta, t0_epoch=0.0, capturado_epoch=edad, filas=filas
     )
 
 
@@ -546,3 +546,87 @@ def test_el_registrador_no_hace_nada_sin_la_bandera():
         settings = _Ajustes()
 
     assert arrancar_si_procede(_Runtime()) is None
+
+
+def test_la_escalera_entera_saca_los_cuatro_peldanos(tmp_path):
+    """El camino que corre solo durante la prueba, de principio a fin.
+
+    Se le da un T0 en el pasado para que ningun peldano tenga que esperar: lo
+    que se comprueba es que salen los cuatro archivos, con la edad correcta
+    cada uno, y que al final queda el congelado.
+    """
+    import time
+
+    from app.experimental.j31_recorder import RegistradorJ31
+
+    registrador = RegistradorJ31(runtime=None, carpeta=tmp_path)
+    t0 = time.time() - 500  # todos los peldanos ya vencidos
+    vistas = []
+
+    def fotografo(t0_dado, etiqueta):
+        vistas.append(etiqueta)
+        return _foto(
+            "p", chats=10, anclas=4, edad=float(etiqueta[1:]), etiqueta=etiqueta
+        )
+
+    registrador._subir_escalera("primary", t0, fotografo)
+
+    assert vistas == ["t000", "t030", "t060", "t120"]
+    for etiqueta in vistas:
+        assert (tmp_path / f"primary_{etiqueta}.json").exists()
+    congelado = json.loads(
+        (tmp_path / "PRIMARY_BOOTSTRAP_FINAL.json").read_text(encoding="utf-8")
+    )
+    assert congelado["name"] == "PRIMARY_BOOTSTRAP_FINAL"
+    assert congelado["ladder"] == [0, 30, 60, 120]
+    assert congelado["final"]["label"] == "t120"
+    assert "no alargado" in congelado["extension_decision"]
+
+
+def test_la_escalera_se_alarga_a_t300_si_seguia_creciendo(tmp_path):
+    import time
+
+    from app.experimental.j31_recorder import RegistradorJ31
+
+    registrador = RegistradorJ31(runtime=None, carpeta=tmp_path)
+    t0 = time.time() - 500
+    tamanos = {"t000": 2, "t030": 5, "t060": 8, "t120": 12, "t300": 12}
+
+    def fotografo(t0_dado, etiqueta):
+        return _foto(
+            "p", chats=tamanos[etiqueta], anclas=1,
+            edad=float(etiqueta[1:]), etiqueta=etiqueta,
+        )
+
+    registrador._subir_escalera("primary", t0, fotografo)
+
+    assert (tmp_path / "primary_t300.json").exists()
+    congelado = json.loads(
+        (tmp_path / "PRIMARY_BOOTSTRAP_FINAL.json").read_text(encoding="utf-8")
+    )
+    assert congelado["ladder"] == [0, 30, 60, 120, 300]
+    assert congelado["final"]["label"] == "t300"
+    assert "alargado" in congelado["extension_decision"]
+
+
+def test_un_peldano_que_falla_no_tumba_la_escalera(tmp_path):
+    """Si una foto falla se pierde ESA, no la medicion entera."""
+    import time
+
+    from app.experimental.j31_recorder import RegistradorJ31
+
+    registrador = RegistradorJ31(runtime=None, carpeta=tmp_path)
+    t0 = time.time() - 500
+
+    def fotografo(t0_dado, etiqueta):
+        if etiqueta == "t030":
+            raise RuntimeError("el navegador no contesto")
+        return _foto(
+            "p", chats=10, anclas=4, edad=float(etiqueta[1:]), etiqueta=etiqueta
+        )
+
+    registrador._subir_escalera("primary", t0, fotografo)
+
+    assert not (tmp_path / "primary_t030.json").exists()
+    assert (tmp_path / "primary_t120.json").exists()
+    assert (tmp_path / "PRIMARY_BOOTSTRAP_FINAL.json").exists()
