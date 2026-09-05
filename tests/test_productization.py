@@ -397,17 +397,45 @@ def test_la_confirmacion_va_por_huella_de_sesion(session):
 # ---------------------------------------------------------------------------
 
 
-def test_el_mantenimiento_es_idempotente(database, settings):
+def test_el_mantenimiento_no_rehace_su_propio_trabajo(database, settings):
+    """La segunda pasada no vuelve a tocar lo que arreglo la primera.
+
+    Antes esto exigia ``changed == 0`` a secas, y eso solo es cierto sobre una
+    base quieta. Con ``service.py`` en marcha entran mensajes mientras corre el
+    test: la segunda pasada encuentra trabajo NUEVO -- legitimo, de un chat que
+    acaba de recibir su primer mensaje -- y el test fallaba culpando al
+    mantenimiento de algo que no habia hecho.
+
+    Lo que de verdad se quiere comprobar es que no se rehace: que ningun chat
+    aparece arreglado dos veces. Eso si vale con la base viva.
+    """
     from app.services.maintenance_service import MaintenanceService
 
     servicio = MaintenanceService(database, settings)
-    servicio.run_all()
+    primera = servicio.run_all()
     segunda = servicio.run_all()
 
+    assert primera.errors == []
     assert segunda.errors == []
-    assert segunda.changed == 0, (
-        f"la segunda pasada cambio cosas, no es idempotente: {segunda}"
+
+    repetidos = set(primera.seeds_recovered_chats) & set(segunda.seeds_recovered_chats)
+    assert not repetidos, (
+        f"la segunda pasada volvio a despertar los mismos chats: {len(repetidos)}"
     )
+
+    # Y lo que se recalcula sin depender de actividad externa tiene que estar
+    # ya estable: si esto cambia en la segunda pasada, el mantenimiento se
+    # esta contradiciendo a si mismo.
+    for campo in (
+        "cursors_updated",
+        "reclassified",
+        "aliases_linked",
+        "usernames_filled",
+        "cursor_incoherent_fixed",
+    ):
+        assert getattr(segunda, campo) == 0, (
+            f"'{campo}' sigue cambiando en la segunda pasada: {segunda}"
+        )
 
 
 def test_el_mantenimiento_no_es_destructivo():
@@ -658,3 +686,36 @@ def test_la_huella_distingue_identidades_con_la_misma_ranura(tmp_path):
         return session_fingerprint(types.SimpleNamespace(session_file=ruta))
 
     assert huella_de(111) != huella_de(222)
+
+
+def test_las_dos_definiciones_de_tener_ancla_son_la_misma(database, settings):
+    """El chat que oscilaba para siempre.
+
+    ``classify`` degradaba a 'waiting_seed' contando MENSAJES con
+    identificador real; ``seed_from_messages`` promovia a 'pending' mirando el
+    CURSOR canonico. Un chat con cursor guardado y sin mensajes cumplia las dos
+    condiciones a la vez, asi que cada pasada de mantenimiento lo bajaba y lo
+    subia. En la pantalla se veia como un chat que iba y venia entre "Esperando
+    referencia" y "Pendiente de recuperacion" sin que nadie tocara nada.
+    """
+    import inspect
+
+    from app.services.seed_recovery import SeedRecovery
+
+    fuente = inspect.getsource(SeedRecovery.classify)
+    assert "get_valid_history_cursor" in fuente, (
+        "classify tiene que usar la funcion canonica, no contar mensajes"
+    )
+
+
+def test_el_mantenimiento_no_deja_ningun_chat_oscilando(database, settings):
+    """Dos pasadas seguidas: ningun chat despertado dos veces."""
+    from app.services.maintenance_service import MaintenanceService
+
+    servicio = MaintenanceService(database, settings)
+    primera = servicio.run_all()
+    segunda = servicio.run_all()
+    tercera = servicio.run_all()
+
+    assert not (set(primera.seeds_recovered_chats) & set(segunda.seeds_recovered_chats))
+    assert not (set(segunda.seeds_recovered_chats) & set(tercera.seeds_recovered_chats))

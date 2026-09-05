@@ -125,5 +125,5 @@ def apply() -> bool:
     # ambos caminos quedan cubiertos.
     pywhats.store.save_device_store = _safe_save_device_store
 
-    log.info("Adaptacion de persistencia Windows aplicada")
+    log.debug("Adaptacion de persistencia Windows aplicada")
     return True

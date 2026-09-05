@@ -30,6 +30,9 @@ from typing import Any
 
 from flask import Blueprint, Response, current_app, jsonify, request, send_file
 
+from app.auth import ownership
+from app.storage.interface import StorageError
+from app.auth.web import requiere_drive, requiere_sesion, usuario_actual
 from app.api.serializers import (
     chat_to_json,
     iso,
@@ -137,28 +140,60 @@ def health():
 
 
 @api.get("/session")
+@requiere_sesion
 def session_state():
     """Estado de la sesion.
 
     NO se deduce de que exista ``device.json``: ese archivo puede estar y la
     sesion estar revocada. El estado real lo lleva la maquina de estados, que
     solo pasa a CONNECTED con el ``<success>`` del servidor.
+
+    Aqui NO se responde 409 cuando la vinculacion es de otro usuario: este
+    endpoint es justo lo que el frontend consulta para orientarse, y negarselo
+    lo dejaria sin saber que mostrar. Se dice la verdad en el cuerpo.
     """
-    return jsonify(state_to_json(runtime()))
+    rt = runtime()
+    cuerpo = state_to_json(rt)
+
+    cuentas = getattr(rt, "whatsapp_accounts", None)
+    yo = usuario_actual()
+    dueno = cuentas.dueno_actual() if cuentas is not None else None
+    de_otro = dueno is not None and yo is not None and dueno != yo.id
+
+    # No se dice de QUIEN es: ni nombre, ni telefono, ni nada suyo.
+    cuerpo["owned_by_another_user"] = de_otro
+    if de_otro:
+        # Para este usuario NO hay vinculacion, aunque el equipo tenga una.
+        cuerpo["linked"] = False
+        cuerpo["connected"] = False
+        cuerpo["pairing_required"] = True
+    return jsonify(cuerpo)
 
 
 @api.post("/session/pair")
+@requiere_drive
 def session_pair():
-    """Reintento manual de la vinculacion. NO hace falta en el camino normal.
+    """Inicia la vinculacion PARA el usuario que la pide.
 
-    El QR se genera solo cuando el backend arranca sin sesion valida. Este
-    endpoint existe para reintentar si algo fallo, no como paso obligatorio.
+    Es la UNICA via de generar un codigo QR. El arranque ya no vincula solo:
+    una vinculacion sin dueno acaba en manos del primero que pase, y el codigo
+    quedaba hecho antes de que existiera ningun usuario.
 
-    Es idempotente: si ya hay una vinculacion en marcha, lo dice y NO lanza
-    otra. Dos vinculaciones simultaneas abririan dos conexiones y produirian
-    dos QR, de los cuales solo uno serviria.
+    Exige ademas Google Drive, porque es donde va a guardarse la copia:
+    vincular WhatsApp sin sitio donde guardar solo aplaza el problema.
+
+    Es idempotente: si ya hay una vinculacion en marcha, devuelve ESA y no
+    lanza otra. Dos vinculaciones simultaneas abririan dos conexiones y
+    produirian dos QR, de los cuales solo uno serviria.
     """
+    choque = _conflicto_de_sesion()
+    if choque is not None:
+        return choque
+
     rt = runtime()
+    cuenta = _asegurar_cuenta_de_whatsapp(rt)
+    if cuenta is None:
+        return _error("la base de datos no esta disponible", 503)
     if not rt.info().whatsapp_enabled:
         return _error_code(
             "WHATSAPP_DISABLED",
@@ -200,13 +235,16 @@ def session_pair():
             202,
         )
 
-    # Sin QR vigente (caducado, o el flujo murio): se reinicia.
+    # Aqui empieza de verdad. Se fija el dueno ANTES de generar nada: un QR
+    # sin dueno es el fallo que este cambio arregla.
+    rt.iniciar_vinculacion(usuario_actual().id, cuenta.id)
+
     reiniciado = rt.pairing.renew()
     rt.pairing.start_watchdog()
     return (
         jsonify(
             {
-                "status": "pairing_restarted" if reiniciado else "pairing_in_progress",
+                "status": "pairing_restarted" if reiniciado else "pairing_started",
                 "restarted": bool(reiniciado),
                 "session": state_to_json(rt),
             }
@@ -216,6 +254,7 @@ def session_pair():
 
 
 @api.get("/session/qr")
+@requiere_sesion
 def session_qr():
     """Metadatos del QR vigente. NO devuelve el payload.
 
@@ -223,12 +262,21 @@ def session_qr():
     un dispositivo a la cuenta. Se sirve solo como imagen, no se guarda en
     disco y no se registra en los logs.
     """
+    choque = _conflicto_de_sesion()
+    if choque is not None:
+        return choque
+
     return jsonify(qr_to_json(runtime()))
 
 
 @api.get("/session/qr/image")
+@requiere_sesion
 def session_qr_image():
     """PNG del QR vigente. Nunca uno caducado."""
+    choque = _conflicto_de_sesion()
+    if choque is not None:
+        return choque
+
     import io
 
     from app.core.qr_render import render_qr
@@ -265,9 +313,103 @@ def session_qr_image():
 # ---------------------------------------------------------------------------
 # Chats y mensajes
 # ---------------------------------------------------------------------------
+#
+# Todo lo que recibe un id por la URL comprueba de quien es. Sin eso, cambiar
+# el numero en la barra de direcciones seria suficiente para leer la copia de
+# otra persona.
+#
+# Se responde 404, no 403: un 403 sobre un id ajeno confirma que ese id
+# existe, y iterando se averigua cuanto tiene guardado otro usuario.
+
+
+def _no_es_mio(sesion, comprobacion, elemento_id: int) -> bool:
+    return not comprobacion(sesion, elemento_id, usuario_actual().id)
+
+
+def _resolver_contenido(filas):
+    """El contenido de esos mensajes, desde el almacenamiento.
+
+    Sin almacenamiento configurado se cae a lo que haya en PostgreSQL: es lo
+    correcto mientras la copia no ha empezado a subirse, y se distingue en la
+    respuesta.
+    """
+    from app.storage.reader import MensajeResuelto, MessageReader
+
+    rt = runtime()
+    usuario = usuario_actual()
+    almacenamiento_activo = getattr(rt, "storage", None)
+
+    pendientes = [f for f in filas if f.storage_status == "ready" and f.segment_id]
+    if not pendientes or almacenamiento_activo is None:
+        return {
+            f.id: MensajeResuelto(id=f.id, text=f.text, fuente="local") for f in filas
+        }
+
+    lector = getattr(rt, "_message_reader", None)
+    if lector is None:
+        lector = MessageReader(rt.database, almacenamiento_activo)
+        rt._message_reader = lector
+
+    return lector.resolver(
+        filas,
+        user_id=usuario.id,
+        almacenamiento=rt.storage_para(usuario.id),
+    )
+
+
+def _asegurar_cuenta_de_whatsapp(rt):
+    """La cuenta de WhatsApp del usuario actual, creandola si no la tiene.
+
+    Una por usuario en esta fase. El identificador NUNCA llega del navegador:
+    sale de la cookie, porque si el cliente pudiera decir de quien es la
+    cuenta, cambiarlo bastaria para apoderarse de la de otro.
+    """
+    cuentas = getattr(rt, "whatsapp_accounts", None)
+    if cuentas is None:
+        return None
+    return cuentas.asegurar_cuenta(usuario_actual().id)
+
+
+def _conflicto_de_sesion():
+    """``None`` si el usuario puede usar la sesion de WhatsApp de este equipo.
+
+    En esta fase el runtime sostiene UNA vinculacion. Si es de otro usuario,
+    se responde con un conflicto generico en vez de dejarle ver una copia
+    ajena o de arrancarle la sesion al dueno.
+
+    Se comprueban DOS cosas: quien tiene la cuenta marcada como vinculada en
+    la base, y quien tiene el runtime de este proceso. La segunda cubre el
+    hueco entre pedir la vinculacion y completarla: durante ese rato la base
+    todavia no dice ``linked``, pero el QR ya existe y es de alguien.
+    """
+    from app.auth.whatsapp_accounts import ConflictoDeSesion
+
+    rt = runtime()
+    yo = usuario_actual()
+    if yo is None:
+        return None
+
+    if not rt.es_mia_la_sesion(yo.id):
+        return _error_code(
+            "ACCOUNT_RUNTIME_IN_USE",
+            "Este dispositivo tiene una vinculacion de WhatsApp en marcha de "
+            "otro usuario.",
+            409,
+        )
+
+    cuentas = getattr(rt, "whatsapp_accounts", None)
+    if cuentas is None:
+        return None
+    try:
+        cuentas.exigir_propiedad(yo.id)
+    except ConflictoDeSesion as choque:
+        # No se dice de QUIEN es: ni nombre, ni telefono, ni nada suyo.
+        return _error_code(choque.code, str(choque), 409)
+    return None
 
 
 @api.get("/chats")
+@requiere_drive
 def chats():
     """Sidebar. Ordenado por ``last_message_timestamp`` descendente."""
     sesion = _session()
@@ -276,18 +418,26 @@ def chats():
     try:
         busqueda = (request.args.get("search") or "").strip() or None
         limite = min(_entero("limit", 500) or 500, 1000)
-        resumenes = repo.list_chat_summaries(sesion, search=busqueda, limit=limite)
+        resumenes = repo.list_chat_summaries(
+            sesion,
+            search=busqueda,
+            limit=limite,
+            accounts=ownership.cuentas_de(sesion, usuario_actual().id),
+        )
     finally:
         sesion.close()
     return jsonify({"chats": [chat_to_json(c) for c in resumenes], "count": len(resumenes)})
 
 
 @api.get("/chats/<int:chat_id>")
+@requiere_drive
 def chat_detail(chat_id: int):
     sesion = _session()
     if sesion is None:
         return _error("la base de datos no esta disponible", 503)
     try:
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
         resumen = repo.chat_summary(sesion, chat_id)
         if resumen is None:
             return _error("chat no encontrado", 404)
@@ -312,6 +462,7 @@ def chat_detail(chat_id: int):
 
 
 @api.get("/chats/<int:chat_id>/messages")
+@requiere_drive
 def chat_messages(chat_id: int):
     """Ultimos N mensajes, los anteriores a un cursor, o los posteriores.
 
@@ -354,6 +505,8 @@ def chat_messages(chat_id: int):
     if sesion is None:
         return _error("la base de datos no esta disponible", 503)
     try:
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
         if repo.chat_summary(sesion, chat_id) is None:
             return _error("chat no encontrado", 404)
         if despues_ts is not None:
@@ -371,7 +524,27 @@ def chat_messages(chat_id: int):
     finally:
         sesion.close()
 
-    mensajes = [message_to_json(f, adjuntos.get(f.id)) for f in filas]
+    # El CONTENIDO se resuelve desde el almacenamiento. PostgreSQL ha dicho
+    # que mensajes son y en que orden; el texto vive en Drive.
+    try:
+        contenido = _resolver_contenido(filas)
+    except StorageError as exc:
+        # NO se devuelve una lista vacia: "no se pudo traer" y "no hay
+        # mensajes" son cosas muy distintas, y confundirlas hace que una copia
+        # parezca perdida cuando solo esta lejos.
+        return _error_code(exc.code, exc.message, 503)
+
+    mensajes = []
+    for f in filas:
+        cuerpo = message_to_json(f, adjuntos.get(f.id))
+        resuelto = contenido.get(f.id)
+        if resuelto is not None:
+            cuerpo["text"] = resuelto.text
+            # De donde salio. Sirve para saber si la copia ya esta a salvo, y
+            # es lo que hace comprobable que Drive es la fuente.
+            cuerpo["content_source"] = resuelto.fuente
+        mensajes.append(cuerpo)
+
     # El cursor para la siguiente pagina sale del mensaje mas antiguo de esta.
     siguiente = None
     if filas:
@@ -401,11 +574,42 @@ def chat_messages(chat_id: int):
             # ``False`` cuando la pagina vino vacia: no queda nada anterior
             # ALMACENADO. No dice nada sobre lo que WhatsApp pueda tener.
             "has_more": bool(filas) and len(filas) == limite,
+            # Mensajes de este chat todavia sin subir. Con la pagina vacia,
+            # distingue "no hay historial" de "todavia se esta guardando":
+            # decir lo primero cuando pasa lo segundo hace creer que se
+            # perdio la conversacion.
+            "storage_pending": _pendientes_de_subir(chat_id),
         }
     )
 
 
+def _pendientes_de_subir(chat_id: int) -> int:
+    """Cuantos mensajes de ese chat siguen solo en PostgreSQL."""
+    from sqlalchemy import func, select
+
+    from app.models import Message
+
+    sesion = _session()
+    if sesion is None:
+        return 0
+    try:
+        return int(
+            sesion.execute(
+                select(func.count())
+                .select_from(Message)
+                .where(
+                    Message.chat_id == chat_id,
+                    Message.storage_status != "ready",
+                )
+            ).scalar()
+            or 0
+        )
+    finally:
+        sesion.close()
+
+
 @api.post("/chats/<int:chat_id>/history/recheck")
+@requiere_drive
 def chat_history_recheck(chat_id: int):
     """Vuelve a mirar si un chat sin ancla ya puede excavarse.
 
@@ -425,7 +629,18 @@ def chat_history_recheck(chat_id: int):
 
     from app.services.history_recheck import HistoryRecheck
 
-    resultado = HistoryRecheck(rt.database, rt.settings).recheck(chat_id)
+    sesion = _session()
+    if sesion is None:
+        return _error("la base de datos no esta disponible", 503)
+    try:
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
+    finally:
+        sesion.close()
+
+    resultado = HistoryRecheck(
+        rt.database, rt.settings, rt.runtime_owner_account_id
+    ).recheck(chat_id)
     if resultado is None:
         return _error("chat no encontrado", 404)
 
@@ -458,6 +673,11 @@ def _media_row(media_id: int):
     if sesion is None:
         return None, None
     try:
+        # La propiedad se comprueba AQUI, que es por donde pasan las cuatro
+        # rutas de multimedia. Repartirla por cada una seria cuatro sitios
+        # donde olvidarla, y basta olvidarla en uno.
+        if not ownership.media_es_de(sesion, media_id, usuario_actual().id):
+            return None, None
         fila = sesion.execute(
             select(MediaFile).where(MediaFile.id == media_id)
         ).scalar_one_or_none()
@@ -475,6 +695,9 @@ def _media_row(media_id: int):
             "height": fila.height,
             "download_status": fila.download_status,
             "local_path": fila.local_path,
+            # Donde vive el original si la copia local ya se desalojo.
+            "drive_file_id": fila.drive_file_id,
+            "storage_status": fila.storage_status,
             "message_id": fila.message_id,
             "chat_id": fila.chat_id,
         }
@@ -492,6 +715,7 @@ class _MediaView:
 
 
 @api.get("/media/<int:media_id>")
+@requiere_drive
 def media_detail(media_id: int):
     datos, _ = _media_row(media_id)
     if datos is None:
@@ -500,6 +724,7 @@ def media_detail(media_id: int):
 
 
 @api.post("/media/<int:media_id>/retry")
+@requiere_drive
 def media_retry(media_id: int):
     """Reintenta la descarga de UN adjunto. Nada mas.
 
@@ -531,6 +756,12 @@ def media_retry(media_id: int):
         return _error("la base de datos no esta disponible", 503)
 
     try:
+        # La propiedad se comprueba ANTES que cualquier otra cosa. Si se
+        # mirara despues, un 409 sobre un adjunto ajeno ya confirmaria que
+        # existe: el orden de las comprobaciones tambien filtra.
+        if _no_es_mio(sesion, ownership.media_es_de, media_id):
+            return _error("adjunto no encontrado", 404)
+
         fila = sesion.execute(
             select(MediaFile).where(MediaFile.id == media_id)
         ).scalar_one_or_none()
@@ -622,6 +853,7 @@ def media_retry(media_id: int):
 
 
 @api.post("/messages/<int:message_id>/media/recover")
+@requiere_drive
 def message_media_recover(message_id: int):
     """Igual que el anterior, pero por mensaje: el frontend tiene el mensaje.
 
@@ -635,6 +867,8 @@ def message_media_recover(message_id: int):
     if sesion is None:
         return _error("la base de datos no esta disponible", 503)
     try:
+        if _no_es_mio(sesion, ownership.mensaje_es_de, message_id):
+            return _error("mensaje no encontrado", 404)
         media_id = sesion.execute(
             select(MediaFile.id).where(MediaFile.message_id == message_id)
         ).scalars().first()
@@ -667,6 +901,7 @@ def _archivo_local(datos: dict[str, Any]) -> Path | None:
 
 
 @api.get("/media/<int:media_id>/file")
+@requiere_drive
 def media_file(media_id: int):
     datos, _ = _media_row(media_id)
     if datos is None:
@@ -680,21 +915,105 @@ def media_file(media_id: int):
             status=datos["download_status"],
             media=media_to_json(_MediaView(datos)),
         )
+    # 1. La copia local, si sigue estando. Es lo mas rapido y no gasta cupo
+    #    de Google. Flask ya resuelve Range/206 sobre un archivo real.
     ruta = _archivo_local(datos)
-    if ruta is None:
-        return _error(
-            "el adjunto todavia no se ha descargado",
-            404,
-            status=datos["download_status"],
+    if ruta is not None:
+        return send_file(
+            ruta,
+            mimetype=datos.get("mime_type") or None,
+            download_name=datos.get("file_name") or ruta.name,
+            conditional=True,
         )
-    return send_file(
-        ruta,
-        mimetype=datos.get("mime_type") or None,
-        download_name=datos.get("file_name") or ruta.name,
+
+    # 2. Si no, desde Drive. Angular nunca se entera: sigue pidiendo la misma
+    #    URL y no ve identificadores de archivo ni enlaces de Google.
+    if datos.get("drive_file_id"):
+        return _servir_desde_drive(media_id, datos)
+
+    return _error(
+        "el adjunto todavia no se ha descargado",
+        404,
+        status=datos["download_status"],
     )
 
 
+def _servir_desde_drive(media_id: int, datos: dict):
+    """Entrega el adjunto leyendo de Drive, respetando ``Range``.
+
+    Un video no se descarga entero para entregar diez segundos: el rango se
+    traduce a los trozos cifrados que lo cubren y solo se piden esos.
+    """
+    from app.storage.interface import StorageAuthError, StorageError
+    from app.storage.media import MediaStorage
+
+    rt = runtime()
+    usuario = usuario_actual()
+    if getattr(rt, "storage", None) is None:
+        return _error("el almacenamiento no esta disponible", 503)
+
+    sesion = _session()
+    if sesion is None:
+        return _error("la base de datos no esta disponible", 503)
+    try:
+        from app.models import MediaFile
+
+        fila = sesion.get(MediaFile, media_id)
+        if fila is None:
+            return _error("adjunto no encontrado", 404)
+
+        total = fila.file_size or 0
+        inicio, fin = _rango_pedido(total)
+
+        try:
+            trozo = MediaStorage(rt.database, rt.settings, rt.storage).leer_rango(
+                fila,
+                inicio=inicio,
+                fin=fin,
+                almacenamiento=rt.storage_para(usuario.id),
+                user_id=usuario.id,
+            )
+        except StorageAuthError as exc:
+            return _error_code("DRIVE_NOT_AUTHORIZED", exc.message, 403)
+        except StorageError as exc:
+            return _error_code(exc.code, exc.message, 502)
+        except FileNotFoundError:
+            return _error("el adjunto ya no esta disponible", 404)
+    finally:
+        sesion.close()
+
+    parcial = request.headers.get("Range") is not None
+    respuesta = current_app.response_class(
+        trozo.datos,
+        status=206 if parcial else 200,
+        mimetype=datos.get("mime_type") or "application/octet-stream",
+    )
+    respuesta.headers["Accept-Ranges"] = "bytes"
+    respuesta.headers["Content-Length"] = str(len(trozo.datos))
+    if parcial:
+        respuesta.headers["Content-Range"] = trozo.content_range
+    # El contenido es privado: no puede quedarse en caches intermedias.
+    respuesta.headers["Cache-Control"] = "private, no-store"
+    return respuesta
+
+
+def _rango_pedido(total: int) -> tuple[int, int]:
+    """Lee la cabecera ``Range``. Sin ella, el archivo entero."""
+    crudo = request.headers.get("Range", "")
+    if not crudo.startswith("bytes="):
+        return 0, max(0, total - 1)
+    trozo = crudo[len("bytes=") :].split(",")[0].strip()
+    desde, _, hasta = trozo.partition("-")
+    try:
+        inicio = int(desde) if desde else 0
+        fin = int(hasta) if hasta else max(0, total - 1)
+    except ValueError:
+        return 0, max(0, total - 1)
+    return max(0, inicio), max(inicio, fin)
+
+
 @api.get("/media/<int:media_id>/thumbnail")
+@requiere_drive
 def media_thumbnail(media_id: int):
     """Miniatura cacheada. Se genera una vez y se reutiliza."""
     from app.services.thumbnails import ensure_thumbnail
@@ -726,6 +1045,7 @@ def media_thumbnail(media_id: int):
 
 
 @api.get("/sync/status")
+@requiere_drive
 def sync_status():
     """Progreso del trabajo de fondo Y del ciclo manual. Nunca bloquea."""
     rt = runtime()
@@ -799,6 +1119,7 @@ def sync_status():
 
 
 @api.post("/sync/run")
+@requiere_drive
 def sync_run():
     """Lanza un ciclo de sincronizacion manual.
 
@@ -841,6 +1162,279 @@ def sync_run():
     )
 
 
+@api.get("/onboarding/recovery")
+def onboarding_recovery():
+    """En que punto va la RECUPERACION del historial, para el usuario.
+
+    Deliberadamente separada de ``/onboarding/status``, que ya existe en
+    ``auth_routes`` y contesta otra pregunta: por donde va el usuario dentro
+    del alta (login, Google, vinculacion). Aquella decide a que pantalla ir;
+    esta cuenta que esta pasando una vez dentro.
+
+    Juntarlas obligaria a que cada pantalla filtrara la mitad que no le
+    importa, y una de las dos acabaria mandando sobre la otra.
+
+    Una sola llamada con todo lo que la pantalla necesita saber: si hace falta
+    escanear el codigo principal, si hace falta el segundo, si esta recuperando
+    o si ya termino. El frontend no tiene que juntar cuatro endpoints ni
+    deducir la fase de contadores sueltos.
+
+    Es estado de EJECUCION: describe un momento, no un dato que haya que
+    guardar. Por eso no hay tabla ni migracion.
+    """
+    from app.core.primary import (
+        RECONNECTING,
+        mensaje_para_el_usuario,
+        razon_no_lista,
+    )
+
+    rt = runtime()
+    # La conexion principal manda, y se pregunta ENTERA. Que el estado diga
+    # CONNECTED no basta: un emparejamiento a medias deja el objeto en pie sin
+    # identidad ni Signal, y con eso no se puede excavar nada. Se evalua aqui,
+    # antes que ninguna otra fase, porque si falta esto lo demas sobra.
+    motivo_principal = razon_no_lista(rt)
+    principal_listo = motivo_principal is None
+
+    supervisor = getattr(rt, "web_companion", None)
+    web = {
+        "enabled": bool(supervisor is not None and getattr(supervisor, "habilitado", False)),
+        "running": bool(supervisor is not None and getattr(supervisor, "vivo", False)),
+        "ready": False,
+        "qr_available": False,
+        "qr_generation": 0,
+        "state": "disabled",
+    }
+    if supervisor is not None and web["enabled"]:
+        instantanea = supervisor.snapshot()
+        web["ready"] = bool(instantanea.get("web_client_ready"))
+        web["qr_available"] = bool(instantanea.get("qr_available"))
+        web["qr_generation"] = int(instantanea.get("qr_generation") or 0)
+        web["state"] = str(instantanea.get("state") or "disabled")
+
+    vigilante = getattr(rt, "auto_recovery", None)
+    recuperacion = vigilante.estado.to_json() if vigilante is not None else {}
+
+    # Los recuentos que de verdad dicen si esto termino.
+    resumen = {}
+    if rt.database is not None:
+        from app.history.resumen import resumen_de_estado
+
+        try:
+            datos = resumen_de_estado(
+                rt.database, account_id=getattr(rt, "runtime_owner_account_id", None)
+            )
+            resumen = {
+                "chats_total": datos.chats_total,
+                "waiting_seed": datos.waiting_seed,
+                "pending": datos.pending,
+                "fetching": datos.fetching,
+                "timeout": datos.timeout,
+                "exhausted": datos.exhausted,
+            }
+        except Exception:  # noqa: BLE001 - un recuento no puede tumbar la ruta
+            resumen = {}
+
+    cola = getattr(rt, "seed_queue", None)
+    estado_cola = cola.estado() if cola is not None and hasattr(cola, "estado") else None
+
+    return jsonify(
+        {
+            "phase": _fase_de_onboarding(
+                principal_listo,
+                web,
+                recuperacion,
+                resumen,
+                estado_cola,
+                motivo_principal,
+            ),
+            "primary": {
+                "linked": principal_listo,
+                "reason": motivo_principal,
+                # Reconectando NO es "vuelve a vincular": las credenciales
+                # siguen valiendo y ensenar el codigo mandaria al usuario a
+                # rehacer algo que no esta roto.
+                "reconnecting": motivo_principal == RECONNECTING,
+                "message": mensaje_para_el_usuario(motivo_principal),
+            },
+            "web_companion": web,
+            "recovery": recuperacion,
+            "counts": resumen,
+            "queue": estado_cola,
+        }
+    )
+
+
+def _fase_de_onboarding(
+    principal_listo, web, recuperacion, resumen, cola, motivo_principal=None
+):
+    """La fase, en el orden en que el usuario la vive.
+
+    ``complete`` es exigente a proposito: mientras quede una conversacion
+    esperando ancla o un reintento por hacer, esto es ``partial``. Decir
+    "completo" con trabajo pendiente es la clase de mentira que hace dudar de
+    todo lo demas.
+    """
+    # Primero de todo, y sin excepciones. Si el usuario estaba en cualquier
+    # fase posterior y la conexion principal se cae, vuelve aqui: seguir
+    # ensenandole el segundo codigo seria mandarlo a escanear el que no toca.
+    if not principal_listo:
+        from app.core.primary import RECONNECTING
+
+        # Salvo un corte pasajero: ahi no hay nada que volver a vincular.
+        return "reconnecting" if motivo_principal == RECONNECTING else "pairing_primary"
+    if cola and cola.get("waiting_for_phone"):
+        return "waiting_for_phone"
+    if web.get("enabled"):
+        if web.get("qr_available"):
+            return "pairing_web"
+        if not web.get("ready"):
+            return "waiting_web"
+    if recuperacion.get("waiting_reason") == "INITIAL_SYNC_RUNNING":
+        return "initial_sync"
+    if cola and cola.get("pending"):
+        return "recovering_history"
+    if resumen:
+        pendientes = (
+            int(resumen.get("waiting_seed") or 0)
+            + int(resumen.get("pending") or 0)
+            + int(resumen.get("fetching") or 0)
+            + int(resumen.get("timeout") or 0)
+        )
+        return "complete" if pendientes == 0 else "partial"
+    return "recovering_history"
+
+
+@api.post("/sync/full-recovery")
+@requiere_drive
+def sync_full_recovery():
+    """Revisa TODOS los chats recuperables y vuelve a intentarlo.
+
+    Es el mismo ciclo, con una sola diferencia: adelanta una vez la espera de
+    reintento de los chats que la estaban cumpliendo, porque el usuario acaba
+    de pedir explicitamente que se intente ahora.
+
+    Lo que NO hace, y conviene decirlo porque la palabra "completo" invita a
+    pensarlo: no borra mensajes, ni anclas, ni multimedia, ni nada de Drive;
+    no vuelve a emparejar; no toca la sesion; y no reabre las conversaciones
+    que el telefono ya dio por terminadas -- para eso hace falta evidencia
+    nueva, no un boton.
+    """
+    from app.services.sync_job import SyncAlreadyRunningError, SyncUnavailableError
+
+    rt = runtime()
+    trabajo = getattr(rt, "sync_job", None)
+    if trabajo is None:
+        return _error_code(
+            "WHATSAPP_DISABLED",
+            "El backend esta en modo local y no puede sincronizar WhatsApp.",
+            409,
+        )
+
+    try:
+        job_id = trabajo.start(rt, profundo=True)
+    except SyncAlreadyRunningError as exc:
+        # No se lanza un segundo ciclo: se devuelve el que ya corre.
+        return _error_code(
+            "SYNC_ALREADY_RUNNING", str(exc), 409, sync=trabajo.snapshot()
+        )
+    except SyncUnavailableError as exc:
+        return _error_code(exc.code, str(exc), 409, session=state_to_json(rt))
+
+    return (
+        jsonify(
+            {"started": True, "job_id": job_id, "state": "running", "mode": "full"}
+        ),
+        202,
+    )
+
+
+@api.post("/chats/<int:chat_id>/history/retry")
+@requiere_drive
+def chat_history_retry(chat_id: int):
+    """Vuelve a pedirle a WhatsApp el historial de UN chat.
+
+    Es el boton "Volver a comprobar" de una conversacion que se quedo en
+    ``timeout``: el telefono no contesto y su espera de reintento aun no ha
+    vencido. Aqui se adelanta esa espera SOLO para este chat y se le pone en
+    la cola.
+
+    No es lo mismo que ``/history/recheck``, que mira lo que ya hay en casa
+    sin pedir nada. Este si pide, y por eso comprueba antes que la sesion este
+    conectada y que el chat tenga un ancla real: pedir sin ancla produce un
+    ACK y despues silencio.
+
+    Una peticion cada vez: entra por la misma cola y el mismo candado global
+    que todo lo demas.
+    """
+    from sqlalchemy import select, update
+
+    from app.history.cursor import get_valid_history_cursor
+    from app.models import Chat, ChatHistoryState
+
+    rt = runtime()
+    if rt.database is None:
+        return _error("la base de datos no esta disponible", 503)
+
+    sesion = _session()
+    if sesion is None:
+        return _error("la base de datos no esta disponible", 503)
+    try:
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
+    finally:
+        sesion.close()
+
+    cola = getattr(rt, "seed_queue", None)
+    backfill = getattr(rt, "backfill", None)
+    if cola is None or backfill is None or getattr(backfill, "_client", None) is None:
+        return _error_code(
+            "SESSION_NOT_CONNECTED",
+            "WhatsApp no esta conectado; no se puede pedir historial ahora.",
+            409,
+        )
+
+    with rt.database.transaction() as db:
+        jid = db.execute(select(Chat.jid).where(Chat.id == chat_id)).scalar_one_or_none()
+        if jid is None:
+            return _error("chat no encontrado", 404)
+        estado = db.execute(
+            select(ChatHistoryState).where(ChatHistoryState.chat_jid == jid)
+        ).scalar_one_or_none()
+        if estado is not None and estado.history_status == "exhausted":
+            return _error_code(
+                "CHAT_ALREADY_COMPLETE",
+                "WhatsApp ya entrego todo el historial disponible de este chat.",
+                409,
+            )
+        cursor = get_valid_history_cursor(db, chat_id=chat_id, chat_jid=jid)
+        if cursor is None:
+            return _error_code(
+                "NO_VALID_CURSOR",
+                (
+                    "Este chat todavia no tiene una referencia con la que pedir "
+                    "historial."
+                ),
+                409,
+            )
+        # Solo este chat. La espera de los demas se queda como estaba.
+        db.execute(
+            update(ChatHistoryState)
+            .where(ChatHistoryState.chat_jid == jid)
+            .values(next_retry_at=None)
+        )
+
+    encolados = cola.enqueue([jid])
+    return jsonify(
+        {
+            "queued": bool(encolados),
+            "chat_id": chat_id,
+            "already_queued": not encolados,
+            "queue": cola.estado() if hasattr(cola, "estado") else None,
+        }
+    )
+
+
 # Traduccion de los eventos internos al vocabulario del frontend. Los nombres
 # internos son del protocolo; los de fuera describen QUE ha cambiado.
 #
@@ -875,6 +1469,14 @@ EVENT_NAMES: dict[str, str] = {
     "history.seed.found": "history.seed.found",
     "history.seed.not_found": "history.seed.not_found",
     "history.backfill.started": "history.backfill.started",
+    # Referencias del Web Companion: aplicarlas es una accion explicita del
+    # usuario y el panel tiene que poder seguirla sin recargar.
+    "web_seed_apply_started": "history.web_seeds.started",
+    "web_seed_apply_complete": "history.web_seeds.completed",
+    # El telefono se durmio: la recuperacion se para sin perder nada, y eso
+    # hay que decirlo. No es un error del protocolo.
+    "history.waiting_for_phone": "history.waiting_for_phone",
+    "history.recovery_resumed": "history.recovery_resumed",
     "session_valid": "session.state",
     "logged_out": "session.state",
     "disconnected": "session.state",
@@ -882,6 +1484,19 @@ EVENT_NAMES: dict[str, str] = {
     "client_stopped": "session.state",
     "session_state_changed": "session.state",
     "history_ingested": "history.progress",
+    # Un chat cambio de estado (espera ancla -> pendiente -> excavando ->
+    # completo). Sin esto la pantalla ensenaba el estado del momento en que se
+    # cargo: un chat podia decir "Recuperando historial" con el trabajo ya
+    # terminado, o "Esperando referencia" con tres mil mensajes dentro.
+    "chat_history_status": "chat.status",
+    # El indice de WhatsApp Web termino: puede haber conversaciones nuevas.
+    "web_inventory_done": "chat.inventory",
+    # Y una por una, con su fila entera dentro. Es lo que permite que una
+    # conversacion recien descubierta aparezca sola, sin recargar: el aviso
+    # escueto obligaba a pedir la lista, y cincuenta conversaciones nuevas
+    # eran cincuenta peticiones.
+    "web_chat_created": "chat.created",
+    "web_chat_updated": "chat.updated",
     "waiting_initial_history": "history.progress",
     "initial_history_ready": "history.progress",
     "media_downloaded": "media.updated",
@@ -903,6 +1518,23 @@ _ESTADO_COMPLETO = {"session.state", "sync.status"}
 # tras una reconexion y saber que tiene que revalidar contra PostgreSQL, que
 # sigue siendo la fuente de verdad: el bus vive en memoria y no guarda nada.
 _sse_seq = itertools.count(1)
+
+
+#: Eventos que cuentan algo de la sesion de WhatsApp: quien la tiene, que le
+#: llega, como va su sincronizacion. Solo su dueno los recibe.
+EVENTOS_DE_SESION = (
+    "session.",
+    "sync.",
+    "message.",
+    "chat.",
+    "media.",
+    "history.",
+    "backfill.",
+)
+
+
+def _es_de_la_sesion(nombre: str) -> bool:
+    return nombre.startswith(EVENTOS_DE_SESION)
 
 
 def _sse(nombre: str, datos: Any) -> str:
@@ -946,6 +1578,7 @@ def eventos_para(evento: Any, rt: Any) -> list[tuple[str, Any]]:
 
 
 @api.get("/events/stream")
+@requiere_sesion
 def events_stream():
     """Server-Sent Events.
 
@@ -954,16 +1587,29 @@ def events_stream():
 
     El QR NUNCA viaja por aqui como payload: se avisa de que hay uno nuevo y
     el cliente lo pide como imagen.
+
+    FILTRADO POR DUENO
+    ------------------
+    El bus es unico para el proceso, asi que sin filtrar aqui un usuario
+    recibiria los avisos de la sesion de otro: cuando llega un mensaje, cuando
+    cambia su estado, cuando hay un QR nuevo. Eso ya es informacion sobre otra
+    persona aunque no lleve su contenido.
+
+    Quien no sea el dueno de la sesion activa recibe solo lo suyo: los eventos
+    de almacenamiento de su propia cuenta y los latidos.
     """
     rt = runtime()
+    yo = usuario_actual()
+    es_dueno = yo is not None and rt.es_mia_la_sesion(yo.id)
 
     def generar():
         # Estado completo de entrada: quien se conecta a mitad tiene que saber
         # donde esta, no esperar al siguiente cambio.
         yield _sse("session.state", state_to_json(rt))
-        yield _sse("sync.status", sync_to_json(rt))
-        if rt.pairing is not None and rt.pairing.available:
-            yield _sse("session.qr", qr_to_json(rt))
+        if es_dueno:
+            yield _sse("sync.status", sync_to_json(rt))
+            if rt.pairing is not None and rt.pairing.available:
+                yield _sse("session.qr", qr_to_json(rt))
 
         ultimo_latido = time.monotonic()
         for evento in rt.bus.stream(timeout=1.0):
@@ -986,6 +1632,11 @@ def events_stream():
                 continue
 
             for nombre, datos in eventos_para(evento, rt):
+                # Lo que cuenta algo de la sesion de WhatsApp solo va a su
+                # dueno. El bus es unico para el proceso: sin esto, un usuario
+                # sabria cuando le llega un mensaje a otro.
+                if not es_dueno and _es_de_la_sesion(nombre):
+                    continue
                 ultimo_latido = ahora
                 yield _sse(nombre, datos)
 
@@ -1092,6 +1743,7 @@ def _lanzar_recuperacion(chat_id: int | None):
 
 
 @api.post("/history/web-bootstrap/recover-pending")
+@requiere_drive
 def recover_pending():
     """Intenta recuperar TODAS las conversaciones que esperan referencia.
 
@@ -1107,6 +1759,7 @@ def recover_pending():
 
 
 @api.get("/history/web-bootstrap/recover-pending/status/<job_id>")
+@requiere_drive
 def recover_pending_status(job_id: str):
     """Progreso del intento. ``qr_required`` significa QR AUXILIAR."""
     apagado = _web_bootstrap_apagado()
@@ -1120,6 +1773,7 @@ def recover_pending_status(job_id: str):
 
 
 @api.post("/chats/<int:chat_id>/history/recover")
+@requiere_drive
 def chat_history_recover(chat_id: int):
     """Lo mismo, para una sola conversacion."""
     apagado = _web_bootstrap_apagado()
@@ -1157,6 +1811,7 @@ def chat_history_recover(chat_id: int):
 
 
 @api.get("/history/web-bootstrap/qr")
+@requiere_drive
 def web_bootstrap_qr():
     """PNG del QR AUXILIAR. NO es el de la sesion principal.
 
@@ -1192,6 +1847,7 @@ def web_bootstrap_qr():
 
 
 @api.get("/history/web-bootstrap/session")
+@requiere_drive
 def web_bootstrap_session():
     """Si la sesion auxiliar ya esta vinculada (para saber si hara falta QR)."""
     apagado = _web_bootstrap_apagado()
@@ -1210,6 +1866,7 @@ def web_bootstrap_session():
 
 
 @api.delete("/history/web-bootstrap/session")
+@requiere_drive
 def web_bootstrap_forget():
     """Elimina SOLO la sesion auxiliar.
 
@@ -1247,6 +1904,7 @@ def _recheck_pendientes():
 
 
 @api.post("/history/recheck-pending")
+@requiere_drive
 def history_recheck_pending():
     """Revisa TODOS los chats que esperan un ancla, sin salir de casa.
 
@@ -1279,6 +1937,7 @@ def history_recheck_pending():
 
 
 @api.get("/history/recheck-pending/status/<job_id>")
+@requiere_drive
 def history_recheck_pending_status(job_id: str):
     """Progreso de la revision, para quien no pueda usar SSE."""
     trabajo = _recheck_pendientes().get(job_id)

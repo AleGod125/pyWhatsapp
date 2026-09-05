@@ -39,6 +39,7 @@ procesarlo. Un fallo posterior en la normalizacion no puede costar historial.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import zlib
 from dataclasses import dataclass, field
@@ -92,6 +93,109 @@ class FullHistorySync:
 # Callback que recibe el contenido completo. Lo registra la aplicacion.
 _callback: Callable[[FullHistorySync], None] | None = None
 _blob_dir: Path | None = None
+
+# Lo que traia la NOTIFICACION que provoco este blob, para poder pegarselo.
+#
+# El aviso y el blob son dos cosas distintas: la notificacion llega por el
+# socket con los campos 8 y 12 (``originalMessageID`` y
+# ``peerDataRequestSessionID``), y el blob se descarga despues por HTTP. Sin
+# guardarlo aqui, el identificador de la peticion se pierde por el camino y la
+# unica correlacion posible vuelve a ser adivinar por JID de chat.
+#
+# Es un ContextVar y no una global porque cada notificacion se atiende en su
+# propia tarea: dos blobs simultaneos no pueden pisarse el identificador.
+_notificacion: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "history_sync_notification", default=None
+)
+
+_MARKER_SYNCER = "_whatsapp_backup_history_notif_patch"
+
+#: Nombres de ``HistorySyncNotification.SyncType``, por valor.
+_TIPOS_DE_AVISO = {
+    0: "INITIAL_BOOTSTRAP",
+    1: "INITIAL_STATUS_V3",
+    2: "FULL",
+    3: "RECENT",
+    4: "PUSH_NAME",
+    5: "NON_BLOCKING_DATA",
+    6: "ON_DEMAND",
+}
+
+
+def leer_notificacion(notif: Any) -> dict[str, Any]:
+    """Los campos utiles del aviso, incluidos los que pywhats no modela.
+
+    ``HistorySyncNotification`` de pywhats 0.2.0 llega hasta el campo 8. El 12
+    -- ``peerDataRequestSessionID`` -- sigue en el mensaje como campo
+    desconocido, asi que se reserializa y se reparsea con nuestro descriptor.
+
+    Nunca se devuelven ni la clave de medios ni la ruta: son credenciales de
+    descarga.
+    """
+    datos: dict[str, Any] = {
+        "sync_type": None,
+        "chunk_order": None,
+        "original_message_id": None,
+        "peer_session_id": None,
+        "file_length": None,
+    }
+    try:
+        valor = getattr(notif, "sync_type", None)
+        datos["sync_type"] = _TIPOS_DE_AVISO.get(int(valor), str(valor)) if valor is not None else None
+        datos["chunk_order"] = int(getattr(notif, "chunk_order", 0) or 0)
+        datos["file_length"] = int(getattr(notif, "file_length", 0) or 0)
+    except Exception:  # noqa: BLE001 - leer no puede cortar la descarga
+        pass
+
+    try:
+        from app.models.proto import OnDemandNotification
+
+        extra = OnDemandNotification()
+        extra.ParseFromString(notif.SerializeToString())
+        if extra.HasField("originalMessageID"):
+            datos["original_message_id"] = extra.originalMessageID
+        if extra.HasField("peerDataRequestSessionID"):
+            datos["peer_session_id"] = extra.peerDataRequestSessionID
+    except Exception:  # noqa: BLE001
+        log.debug("No se pudieron leer los campos 8/12 del aviso de History Sync")
+    return datos
+
+
+def apply_notification_probe() -> bool:
+    """Deja constancia de CADA aviso de History Sync, antes de descargarlo.
+
+    Sin esto, un aviso cuyo blob no se pueda descargar no deja ni una linea en
+    el log de la aplicacion: ``HistorySyncer.handle`` captura la excepcion y
+    vuelve. El sintoma es indistinguible de "el telefono no contesto", que es
+    justo la duda que hay que poder resolver.
+    """
+    import pywhats.history
+
+    syncer = pywhats.history.HistorySyncer
+    original = syncer.handle
+    if getattr(original, _MARKER_SYNCER, False):
+        return True
+
+    async def handle(self: Any, notif: Any) -> Any:
+        datos = leer_notificacion(notif)
+        _notificacion.set(datos)
+        sesion = datos.get("peer_session_id")
+        log.info(
+            "HISTORY_SYNC_NOTIFICATION type=%s chunk=%s bytes=%s session=%s",
+            datos.get("sync_type"),
+            datos.get("chunk_order"),
+            datos.get("file_length"),
+            (sesion[:8] + "...") if sesion else "ausente",
+        )
+        try:
+            return await original(self, notif)
+        finally:
+            _notificacion.set(None)
+
+    setattr(handle, _MARKER_SYNCER, True)
+    syncer.handle = handle  # type: ignore[method-assign]
+    log.debug("Sonda de avisos de History Sync aplicada")
+    return True
 
 
 def set_callback(callback: Callable[[FullHistorySync], None] | None) -> None:
@@ -170,12 +274,16 @@ def parse_full(raw: bytes) -> FullHistorySync:
         for conversation in proto.conversations
     ]
 
+    aviso = _notificacion.get() or {}
     return FullHistorySync(
         sync_type=sync_type,
         chunk_order=int(proto.chunk_order),
         progress=int(proto.progress),
         conversations=conversations,
         pushnames=[(p.id, p.pushname) for p in proto.pushnames],
+        # Vienen del AVISO, no del blob: el blob no los lleva.
+        original_message_id=aviso.get("original_message_id"),
+        peer_session_id=aviso.get("peer_session_id"),
     )
 
 
@@ -236,5 +344,9 @@ def apply() -> bool:
     setattr(parse_history_sync, _MARKER, True)
     pywhats.history.parse_history_sync = parse_history_sync
 
-    log.info("Adaptacion de History Sync (mensajes individuales) aplicada")
+    # La sonda va aparte porque cubre lo que este parche NO puede ver: un
+    # aviso cuyo blob no llegue a descargarse nunca pasa por aqui.
+    apply_notification_probe()
+
+    log.debug("Adaptacion de History Sync (mensajes individuales) aplicada")
     return True

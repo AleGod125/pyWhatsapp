@@ -29,6 +29,8 @@ import json
 import os
 from pathlib import Path
 
+import uuid
+
 import pytest
 
 import service
@@ -42,7 +44,7 @@ def cliente(settings, database, session, tmp_path):
 
     from app.api import create_app
     from app.core.runtime import AppRuntime
-    from tests.test_api import _DatabaseShim
+    from tests.conftest import _DatabaseShim
 
     aislado = dataclasses.replace(
         settings,
@@ -54,9 +56,19 @@ def cliente(settings, database, session, tmp_path):
 
     rt = AppRuntime(aislado, owner="pytest", configure_logging=False)
     rt.database = _DatabaseShim(database, session)
+    rt._montar_cuentas()
     aplicacion = create_app(rt)
     aplicacion.config.update(TESTING=True)
-    return aplicacion.test_client()
+    cli = aplicacion.test_client()
+
+    # ``/session`` exige sesion iniciada desde que hay cuentas: sin cookie
+    # esto mediria un 401 en vez de quien controla el cerrojo.
+    inicio = rt.auth.register(
+        email=f"singleton-{uuid.uuid4().hex[:8]}@example.com",
+        password="una contrasena larga",
+    )
+    cli.set_cookie(aislado.session_cookie_name, inicio.token)
+    return cli
 
 
 @pytest.fixture

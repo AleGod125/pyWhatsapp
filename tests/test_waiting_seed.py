@@ -262,17 +262,10 @@ def test_la_revision_de_un_chat_inexistente_devuelve_nada(session, settings):
 # ---------------------------------------------------------------------------
 
 
-def test_un_chat_atascado_en_fetching_vuelve_a_pending(session, chat_dormido, settings):
-    """Se midio con "Tia Diana": el proceso murio entre pedir y responder.
-
-    ``fetching`` lo marca el backfill justo antes de pedir. Si el proceso cae
-    ahi, el chat se queda en ese estado para siempre Y ademas se vuelve
-    inalcanzable: la cola de semillas salta los que ya se estan excavando.
-    """
+def _atascar_en_fetching(session):
     from sqlalchemy import update
 
     from app.models import ChatHistoryState
-    from app.services.maintenance_service import MaintenanceService, ReconcileReport
 
     session.execute(
         update(ChatHistoryState)
@@ -280,6 +273,25 @@ def test_un_chat_atascado_en_fetching_vuelve_a_pending(session, chat_dormido, se
         .values(history_status="fetching")
     )
     session.flush()
+
+
+def test_un_fetching_atascado_CON_ancla_vuelve_a_pending(
+    session, chat_dormido, settings
+):
+    """Se midio con "Tia Diana": el proceso murio entre pedir y responder.
+
+    ``fetching`` lo marca el backfill justo antes de pedir. Si el proceso cae
+    ahi, el chat se queda en ese estado para siempre Y ademas se vuelve
+    inalcanzable: la cola de semillas salta los que ya se estan excavando.
+
+    Con ancla vuelve a ``pending``, que es lo que era antes de pedir. Y el
+    ancla NO se toca.
+    """
+    from app.services.maintenance_service import MaintenanceService, ReconcileReport
+
+    _mensaje_live(session, VIEJO, entrante(texto="hola"), "3A1F8BDD4678EB6DE395")
+    session.flush()
+    _atascar_en_fetching(session)
 
     informe = MaintenanceService(
         _DatabaseDeSesion(session), settings
@@ -289,6 +301,33 @@ def test_un_chat_atascado_en_fetching_vuelve_a_pending(session, chat_dormido, se
     assert _estado(session, VIEJO) == "pending", (
         "vuelve a lo que era antes de pedir; NO se marca agotado ni completo"
     )
+
+    from app.history.cursor import get_valid_history_cursor
+
+    cursor = get_valid_history_cursor(session, chat_jid=VIEJO)
+    assert cursor is not None and cursor.wa_msg_id == "3A1F8BDD4678EB6DE395", (
+        "rescatar un fetching no puede costarle el ancla al chat"
+    )
+
+
+def test_un_fetching_atascado_SIN_ancla_vuelve_a_waiting_seed(
+    session, chat_dormido, settings
+):
+    """Sin ancla, ``pending`` seria mentira.
+
+    Un chat en ``pending`` entra en la cola y se le intenta pedir historial.
+    Si no tiene con que anclar, ese intento no puede hacerse: lo que le pasa
+    es que espera una semilla, y eso es lo que tiene que decir.
+    """
+    from app.services.maintenance_service import MaintenanceService, ReconcileReport
+
+    _atascar_en_fetching(session)
+
+    MaintenanceService(_DatabaseDeSesion(session), settings).reconcile_stuck_fetching(
+        ReconcileReport()
+    )
+
+    assert _estado(session, VIEJO) == "waiting_seed"
 
 
 def test_rescatar_un_fetching_no_lo_declara_completo(session, chat_dormido, settings):

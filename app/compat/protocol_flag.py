@@ -83,5 +83,5 @@ def apply() -> bool:
     setattr(_extract_text, _MARKER, True)
     receiver_module._extract_text = _extract_text
 
-    log.info("Deteccion de mensajes de protocolo en vivo aplicada")
+    log.debug("Deteccion de mensajes de protocolo en vivo aplicada")
     return True

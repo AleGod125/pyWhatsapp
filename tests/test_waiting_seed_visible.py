@@ -104,20 +104,22 @@ def test_no_desaparece_del_listado_por_tener_cero_mensajes(session, chat_fantasm
 
 
 def test_el_resumen_cuenta_los_que_esperan_semilla(session, settings, chat_fantasma):
-    from app.services.sync_job import SyncJob
+    from app.history.resumen import resumen_de_estado
     from tests.test_backfill_accounting import _DatabaseFalsa
 
-    conteo = SyncJob(settings, _DatabaseFalsa(session))._contar_resultado()
+    conteo = resumen_de_estado(_DatabaseFalsa(session)).to_json()
 
     assert conteo["waiting_seed"] >= 1
-    assert set(conteo) == {"synced", "waiting_seed", "timeouts", "errors", "pending"}
+    # La MISMA foto para todas las fases: si cada una contara lo suyo,
+    # volveria el "0 espera(n)" con 26 esperando.
+    assert {"waiting_seed", "with_cursor", "pending", "timeout", "exhausted"} <= set(conteo)
 
 
 def test_esperar_semilla_no_cuenta_como_sincronizado(session, settings, chat_fantasma):
-    from app.services.sync_job import SyncJob
+    from app.history.resumen import resumen_de_estado
     from tests.test_backfill_accounting import _DatabaseFalsa
 
-    antes = SyncJob(settings, _DatabaseFalsa(session))._contar_resultado()
+    antes = resumen_de_estado(_DatabaseFalsa(session)).to_json()
 
     # El mismo chat, ahora agotado de verdad.
     session.execute(
@@ -126,9 +128,9 @@ def test_esperar_semilla_no_cuenta_como_sincronizado(session, settings, chat_fan
         .values(history_status="exhausted")
     )
     session.flush()
-    despues = SyncJob(settings, _DatabaseFalsa(session))._contar_resultado()
+    despues = resumen_de_estado(_DatabaseFalsa(session)).to_json()
 
-    assert despues["synced"] == antes["synced"] + 1
+    assert despues["exhausted"] == antes["exhausted"] + 1
     assert despues["waiting_seed"] == antes["waiting_seed"] - 1
 
 
@@ -154,8 +156,8 @@ def test_el_recuento_sale_de_la_base_no_de_lo_que_creyo_el_backfill():
     """Un chat puede cambiar de estado por otra via (una semilla en vivo)."""
     import inspect
 
-    from app.services.sync_job import SyncJob
+    from app.history.resumen import resumen_de_estado
 
-    fuente = inspect.getsource(SyncJob._contar_resultado)
+    fuente = inspect.getsource(resumen_de_estado)
     assert "ChatHistoryState" in fuente
     assert "history_status" in fuente

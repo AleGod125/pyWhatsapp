@@ -49,7 +49,7 @@ from typing import Any, Iterable
 from sqlalchemy import func, select, update
 
 from app.core.logging_setup import get_logger
-from app.models import ChatHistoryState, Message
+from app.models import ChatHistoryState, HistorySeed, Message
 
 log = get_logger("BACKFILL")
 
@@ -122,7 +122,28 @@ class SeedRecovery:
             ).all()
 
             informe.revisados = len(filas)
-            esperando = [jid for jid, anclas_validas in filas if anclas_validas == 0]
+            # QUIEN decide si hay ancla es ``get_valid_history_cursor``, la
+            # misma funcion que usa el motor para pedir y que usa
+            # ``seed_from_messages`` para despertar.
+            #
+            # Antes aqui se contaban mensajes con identificador real, y eso
+            # produjo un chat que oscilaba para siempre: esta funcion lo
+            # degradaba a 'waiting_seed' porque no tenia mensajes, y dos lineas
+            # despues ``seed_from_messages`` lo promovia a 'pending' porque SI
+            # tenia cursor guardado. Cada pasada de mantenimiento, en los dos
+            # sentidos. En la pantalla se veia como un chat que iba y venia
+            # entre "Esperando referencia" y "Pendiente de recuperacion" sin
+            # que nadie tocara nada.
+            #
+            # Dos definiciones de "tener ancla" no pueden convivir. Se queda la
+            # canonica.
+            from app.history.cursor import get_valid_history_cursor
+
+            esperando = [
+                jid
+                for jid, _ in filas
+                if get_valid_history_cursor(session, chat_jid=jid) is None
+            ]
             if esperando:
                 session.execute(
                     update(ChatHistoryState)
@@ -151,7 +172,7 @@ class SeedRecovery:
         if not deseados:
             return informe
 
-        from app.services import repository as repo
+        from app.history.cursor import get_valid_history_cursor, persist_cursor
 
         with self._database.transaction() as session:
             dormidos = session.execute(
@@ -163,19 +184,23 @@ class SeedRecovery:
             informe.revisados = len(dormidos)
 
             for chat_jid in dormidos:
-                cursor = repo.get_oldest_valid_history_cursor(session, chat_jid)
+                cursor = get_valid_history_cursor(session, chat_jid=chat_jid)
                 if cursor is None:
                     # Llego un mensaje, pero sin ID real de WhatsApp no sirve
                     # de ancla. Se queda esperando: es la verdad.
                     continue
+                # Primero el cursor, despues el estado: si el proceso muere
+                # entre las dos cosas, el chat sigue esperando pero ya con su
+                # ancla guardada.
+                persist_cursor(session, chat_jid, cursor)
                 session.execute(
                     update(ChatHistoryState)
                     .where(ChatHistoryState.chat_jid == chat_jid)
                     .values(
                         history_status="pending",
-                        oldest_message_id=cursor.message_id,
-                        oldest_message_timestamp=cursor.timestamp,
                         consecutive_no_progress=0,
+                        attempt_count=0,
+                        next_retry_at=None,
                     )
                 )
                 informe.sembrados += 1

@@ -70,6 +70,7 @@ class ReconcileReport:
     seeds_recovered: int = 0
     # Chats que se quedaron a medio excavar porque el proceso murio.
     stuck_fetching_reset: int = 0
+    cursor_incoherent_fixed: int = 0
     seeds_recovered_chats: list[str] = field(default_factory=list)
     duration_ms: int = 0
     errors: list[str] = field(default_factory=list)
@@ -88,6 +89,8 @@ class ReconcileReport:
             + self.usernames_filled
             + self.previews_updated
             + self.seeds_waiting
+            + self.stuck_fetching_reset
+            + self.cursor_incoherent_fixed
         )
 
     def __str__(self) -> str:
@@ -146,6 +149,8 @@ class MaintenanceService:
             # Antes de clasificar: un chat atascado en "fetching" no puede
             # quedarse ahi, porque ademas lo hace inalcanzable para la cola.
             ("stuck_fetching", self.reconcile_stuck_fetching),
+            # Y despues: un estado que promete un ancla tiene que tenerla.
+            ("cursor_coherence", self.reconcile_cursor_coherence),
             ("seed_states", self.reconcile_seed_states),
             ("identity_aliases", self.reconcile_identity_aliases),
             ("sidebar_previews", self.reconcile_sidebar_previews),
@@ -527,6 +532,7 @@ class MaintenanceService:
         marca como agotado ni como completo: no se sabe si el telefono habria
         respondido.
         """
+        from app.history.cursor import get_valid_history_cursor
         from app.models import ChatHistoryState
 
         with self._database.transaction() as session:
@@ -537,15 +543,90 @@ class MaintenanceService:
             ).scalars().all()
             if not atascados:
                 return report
-            session.execute(
-                update(ChatHistoryState)
-                .where(ChatHistoryState.chat_jid.in_(atascados))
-                .values(history_status="pending", last_error=None)
-            )
+            # A 'pending' solo los que CONSERVAN un ancla. Uno sin ella no
+            # esta pendiente de nada: esta esperando una semilla, y decir
+            # 'pending' lo pondria en la cola para pedir sin con que.
+            con_ancla, sin_ancla = [], []
+            for chat_jid in atascados:
+                destino = (
+                    con_ancla
+                    if get_valid_history_cursor(session, chat_jid=chat_jid)
+                    else sin_ancla
+                )
+                destino.append(chat_jid)
+            if con_ancla:
+                session.execute(
+                    update(ChatHistoryState)
+                    .where(ChatHistoryState.chat_jid.in_(con_ancla))
+                    .values(history_status="pending", last_error=None)
+                )
+            if sin_ancla:
+                session.execute(
+                    update(ChatHistoryState)
+                    .where(ChatHistoryState.chat_jid.in_(sin_ancla))
+                    .values(history_status="waiting_seed", last_error=None)
+                )
         report.stuck_fetching_reset += len(atascados)
         log.info(
-            "%d chat(s) atascados en 'fetching' vuelven a 'pending'", len(atascados)
+            "%d chat(s) atascados en 'fetching' reconciliados: %d a 'pending' "
+            "(conservan su ancla), %d a 'waiting_seed'",
+            len(atascados),
+            len(con_ancla),
+            len(sin_ancla),
         )
+        return report
+
+    # -- 3a ter. Coherencia entre estado y ancla -----------------------------
+
+    def reconcile_cursor_coherence(self, report: ReconcileReport) -> ReconcileReport:
+        """Un estado que promete un ancla tiene que tenerla de verdad.
+
+        La maquina de estados solo significa algo si se cumple::
+
+            waiting_seed  ->  no hay ancla
+            pending       ->  hay ancla
+            fetching      ->  hay ancla y una peticion en vuelo
+            timeout       ->  hay ancla y el ultimo intento vencio
+            exhausted     ->  el telefono dijo que no queda mas
+
+        Un 'pending' sin ancla se encola, se le intenta pedir y se descubre
+        alli que no hay con que. Un 'timeout' sin ancla es peor: dice que se
+        pidio algo que no se pudo pedir. Se corrigen aqui, al arrancar, que es
+        cuando importa que lo persistido sea coherente.
+
+        NO se toca ningun cursor y no se borra nada: solo cambia la etiqueta
+        de los que mienten.
+        """
+        from app.history.cursor import get_valid_history_cursor
+        from app.models import ChatHistoryState
+
+        with self._database.transaction() as session:
+            candidatos = session.execute(
+                select(ChatHistoryState.chat_jid).where(
+                    ChatHistoryState.history_status.in_(("pending", "timeout"))
+                )
+            ).scalars().all()
+            sin_ancla = [
+                jid
+                for jid in candidatos
+                if get_valid_history_cursor(session, chat_jid=jid) is None
+            ]
+            if sin_ancla:
+                session.execute(
+                    update(ChatHistoryState)
+                    .where(ChatHistoryState.chat_jid.in_(sin_ancla))
+                    .values(
+                        history_status="waiting_seed",
+                        last_error="sin ancla real; vuelve a esperar una semilla",
+                    )
+                )
+        report.cursor_incoherent_fixed += len(sin_ancla)
+        if sin_ancla:
+            log.info(
+                "%d chat(s) prometian un ancla que no existe; vuelven a "
+                "'waiting_seed'",
+                len(sin_ancla),
+            )
         return report
 
     # -- 3b. Estados honestos de los chats sin ancla -------------------------

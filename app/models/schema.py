@@ -24,6 +24,8 @@ Decisiones de diseno relevantes:
 
 from __future__ import annotations
 
+import uuid
+
 from datetime import datetime
 
 from sqlalchemy import (
@@ -42,6 +44,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ---------------------------------------------------------------------------
@@ -172,6 +175,17 @@ class Chat(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     jid: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
 
+    # De QUIEN es este chat. La propiedad se resuelve siguiendo una sola
+    # cadena (chat -> whatsapp_account -> user) en vez de repetir ``user_id``
+    # en cada tabla, que es donde acaban apareciendo filas con dueno
+    # equivocado. Nulo solo mientras quedan datos de antes de multiusuario.
+    whatsapp_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
     name: Mapped[str | None] = mapped_column(Text, nullable=True)
     chat_type: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
 
@@ -251,6 +265,30 @@ class Message(Base):
     # volver a pedirlo al servidor.
     raw_proto: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    # --- Donde vive el contenido -------------------------------------------
+    #
+    # ``text`` se conserva como PREVIA para el sidebar y la busqueda basica.
+    # El texto completo, el ``raw_proto`` y el resto del mensaje viven en el
+    # segmento: es lo que impide que PostgreSQL crezca hasta ser el problema
+    # que este disenio evita.
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("message_segments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Linea dentro del segmento. Sin esto habria que recorrer el archivo
+    # entero para encontrar un mensaje.
+    segment_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: local | pending | uploading | ready | failed
+    storage_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="local"
+    )
+    #: ``text`` esta recortado y el completo esta en el segmento.
+    text_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -318,6 +356,16 @@ class ChatHistoryState(Base):
     oldest_message_timestamp: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     newest_message_timestamp: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
+    # La peticion ON_DEMAND lleva ``oldestMsgFromMe``. Se guarda con el
+    # cursor: recalcularlo consultando el mensaje justo antes de pedir fallaba
+    # en silencio si ese mensaje ya no estaba, y salia un False por defecto.
+    oldest_from_me: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_text("false")
+    )
+    # De donde salio el cursor activo: ``message``, ``seed`` o ``state``.
+    # Solo diagnostico; no cambia lo que se envia.
+    cursor_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     requests_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -342,6 +390,23 @@ class ChatHistoryState(Base):
     )
     last_seed_attempt_result: Mapped[str | None] = mapped_column(
         String(32), nullable=True
+    )
+
+    # -- Reintentos de la peticion de historial ------------------------------
+    #
+    # Un timeout NO invalida el cursor: el ancla sigue siendo real, lo que
+    # fallo es que el telefono no contesto. Lo que cambia es cuando se puede
+    # volver a probar. Sin esta espera, un chat en 'timeout' se reintentaba en
+    # la pasada siguiente, y la siguiente, consumiendo la unica ranura de
+    # peticiones sin que nada hubiera cambiado.
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sa_text("0")
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     updated_at: Mapped[datetime] = mapped_column(
@@ -452,6 +517,30 @@ class MediaFile(Base):
 
     # Ruta relativa a MEDIA_DIR, para que mover la carpeta no rompa la DB.
     local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- Drive --------------------------------------------------------------
+    drive_file_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    #: SHA-256 del archivo TAL Y COMO ESTA EN DISCO, en hexadecimal.
+    #:
+    #: No se reutiliza ``file_sha256``: esa lleva los bytes crudos que manda
+    #: WhatsApp y sirve para comprobar la descarga. Esta comprueba la subida.
+    #: Son dos verificaciones distintas y meterlas en la misma columna haria
+    #: que una pisara a la otra.
+    plaintext_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: local | pending | uploading | ready | failed
+    storage_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="local"
+    )
+    #: Bytes que ocupa YA cifrado en Drive. Para comprobar la subida.
+    stored_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    uploaded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Ultimo uso de la copia local. Es lo que ordena el desalojo LRU: la
+    #: copia local es CACHE, no el original.
+    last_accessed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     download_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     download_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

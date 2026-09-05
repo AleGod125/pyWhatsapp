@@ -44,6 +44,19 @@ def iso(timestamp: int | None) -> str | None:
     )
 
 
+def iso_datetime(valor: Any) -> str | None:
+    """``datetime`` -> ISO-8601 con zona. ``None`` si no hay valor.
+
+    Distinta de :func:`iso`, que recibe un epoch. Las columnas de reintento
+    son ``TIMESTAMPTZ``, no numeros.
+    """
+    if valor is None:
+        return None
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone().isoformat()
+
+
 def chat_to_json(summary: Any) -> dict[str, Any]:
     """Fila del sidebar."""
     from app.models import COMPLETE_STATUSES, SEEDLESS_STATUSES
@@ -353,4 +366,8 @@ def historia_to_json(fila: Any, total: int) -> dict[str, Any]:
         "newest_message_at": iso(fila[3]),
         "message_count": total,
         "last_error": fila[5],
+        # Un timeout NO pierde el ancla: el chat se reintenta cuando toque.
+        # Sin esto el panel solo podia decir "fallo", que no es lo que pasa.
+        "attempts": fila[6] if len(fila) > 6 else 0,
+        "retry_at": iso_datetime(fila[7]) if len(fila) > 7 else None,
     }

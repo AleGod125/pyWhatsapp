@@ -32,7 +32,6 @@ TAGS = (
     "SYNC",
     "BACKFILL",
     "MEDIA",
-    "GUI",
     "API",
     "SSE",
     "COMPAT",
@@ -40,7 +39,41 @@ TAGS = (
     # multimedia o de excavacion no se confunda con uno de recepcion: cuando
     # todo se mezclaba bajo [APP] costaba ver donde moria un mensaje.
     "LIVE",
+    # Cuentas, sesiones web y OAuth. Separada de [API] a proposito: los
+    # intentos de acceso y los cambios de credencial son lo primero que se
+    # mira cuando algo huele raro, y no pueden quedar sepultados entre
+    # peticiones normales.
+    "AUTH",
+    # Google Drive.
+    "DRIVE",
+    # Busqueda de anclas de historial. Etiqueta propia porque es lo que se
+    # mira para saber si una conversacion sin historial puede recuperarlo.
+    "PLAN_E",
+    # Segmentos, cola de subidas y cache local. Separada de [DRIVE] porque
+    # una cosa es el pipeline y otra el proveedor: si manana el destino no es
+    # Drive, [STORAGE] sigue significando lo mismo.
+    "STORAGE",
+    # Web Companion: el dispositivo vinculado aparte que sirve para medir que
+    # ve WhatsApp Web. Etiqueta propia porque es experimental y opcional, y
+    # tiene que poder distinguirse de la sesion de verdad de un vistazo.
+    "WEB",
 )
+
+#: Cuantos caracteres hexadecimales se dejan ver de un volcado.
+#:
+#: Seis bytes bastan para leer el numero de campo y la longitud del primer
+#: elemento del protobuf, que es para lo que sirve ese log. No bastan para
+#: llevarse el contenido.
+HEX_VISIBLE = 12
+
+
+def _recortar_hex(coincidencia: "re.Match[str]") -> str:
+    """Deja la cabecera del volcado y tapa el resto."""
+    etiqueta, crudo = coincidencia.group(1), coincidencia.group(2)
+    if len(crudo) <= HEX_VISIBLE:
+        return f"{etiqueta}{crudo}"
+    return f"{etiqueta}{crudo[:HEX_VISIBLE]}...[{len(crudo) // 2} bytes redactados]"
+
 
 # Patrones redactados si se cuelan en un mensaje ya formateado.
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -53,6 +86,32 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
             re.IGNORECASE,
         ),
         r"\1=***",
+    ),
+    # Volcados hexadecimales del cuerpo YA DESCIFRADO de un mensaje.
+    #
+    # pywhats registra en INFO ``receiver: empty text id=... len=... hex=...``
+    # cuando su ``_extract_text`` no reconoce la variante. Esa cadena es el
+    # protobuf entero en claro: lleva el texto del mensaje, las URL de
+    # multimedia y el resto de la metadata. Se midieron 220 apariciones en un
+    # solo archivo de log, todas en INFO.
+    #
+    # Se recorta en vez de borrarse: la cabecera dice QUE campo llego, que es
+    # para lo que existe ese aviso, y el contenido se queda fuera.
+    (re.compile(r"\b(hex=)([0-9a-fA-F]{16,})"), _recortar_hex),
+    # URL de descarga de multimedia: llevan la ruta directa del adjunto.
+    (re.compile(r"https?://[^\s]*whatsapp\.(?:net|com)/[^\s]*"), "https://***"),
+    # Un JID completo es un numero de telefono, o el identificador con el que
+    # WhatsApp senala a una persona. pywhats los escribe enteros en INFO
+    # (``sender: preparing message id=... to=573001112233@s.whatsapp.net``, los
+    # acuses de recibo, los avisos de descifrado). Se dejan los primeros
+    # digitos, que bastan para seguir una conversacion en el log, y se tapa el
+    # resto.
+    (
+        re.compile(
+            r"(?<![0-9])([0-9]{6})[0-9]{2,}"
+            r"(?=(?::[0-9]+)?@(?:s\.whatsapp\.net|lid|c\.us|g\.us))"
+        ),
+        r"\1***",
     ),
 )
 
@@ -187,3 +246,91 @@ def get_logger(tag: str) -> logging.Logger:
     if normalized not in TAGS:
         raise ValueError(f"etiqueta de log desconocida: {tag!r}. Conocidas: {TAGS}")
     return logging.getLogger(f"app.{normalized.lower()}")
+
+
+# ---------------------------------------------------------------------------
+# Ruido de terceros
+# ---------------------------------------------------------------------------
+
+
+class _SoloPeticionesInteresantes(logging.Filter):
+    """Deja pasar los fallos HTTP y calla el resto.
+
+    Werkzeug escribe una linea por peticion. Con el panel abierto eso son
+    decenas por minuto —multimedia, estado, SSE— y entierran lo unico que hay
+    que ver: la conexion, la sincronizacion y los errores.
+
+    Los 4xx y 5xx SI pasan: un fallo silencioso es peor que ruido.
+    """
+
+    #: Codigos que no dicen nada cuando todo va bien.
+    NORMALES = (" 200 ", " 204 ", " 206 ", " 301 ", " 302 ", " 304 ")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        mensaje = record.getMessage()
+        if any(codigo in mensaje for codigo in self.NORMALES):
+            return False
+        return True
+
+
+def silenciar_ruido_http(activo: bool = True) -> None:
+    """Quita del INFO las peticiones HTTP correctas.
+
+    Con ``HTTP_ACCESS_LOG=true`` se vuelven a ver todas: sirve para
+    diagnosticar el frontend, y entonces el ruido es justo lo que se busca.
+    """
+    registro = logging.getLogger("werkzeug")
+    for filtro in list(registro.filters):
+        if isinstance(filtro, _SoloPeticionesInteresantes):
+            registro.removeFilter(filtro)
+    if activo:
+        registro.addFilter(_SoloPeticionesInteresantes())
+
+
+class RateLimitedLogger:
+    """Agrupa avisos repetidos en vez de escribir cien iguales.
+
+    Cien fallos identicos de Signal no son cien problemas: son uno que ocurre
+    cien veces. Escribirlos todos entierra los demas y no anade informacion.
+
+    El PRIMERO se ve siempre —hay que saber que pasa— y despues se cuenta y se
+    resume cada tanto. Avisos DISTINTOS nunca se agrupan entre si.
+    """
+
+    def __init__(self, logger: logging.Logger, ventana: float = 60.0) -> None:
+        self._log = logger
+        self._ventana = ventana
+        self._contador: dict[str, int] = {}
+        self._ultimo: dict[str, float] = {}
+
+    def warning(self, clave: str, mensaje: str, *args: object) -> None:
+        import time
+
+        ahora = time.monotonic()
+        visto = self._ultimo.get(clave)
+
+        if visto is None:
+            self._ultimo[clave] = ahora
+            self._contador[clave] = 0
+            self._log.warning(mensaje, *args)
+            return
+
+        self._contador[clave] = self._contador.get(clave, 0) + 1
+        if ahora - visto >= self._ventana:
+            repetidos = self._contador[clave]
+            self._ultimo[clave] = ahora
+            self._contador[clave] = 0
+            if repetidos:
+                self._log.warning(
+                    "%s (y %d mas en los ultimos %.0f s)",
+                    mensaje % args if args else mensaje,
+                    repetidos,
+                    self._ventana,
+                )
+
+    def flush(self) -> None:
+        """Publica lo acumulado. Para el cierre o un resumen a peticion."""
+        for clave, repetidos in list(self._contador.items()):
+            if repetidos:
+                self._log.warning("%s: %d repeticiones", clave, repetidos)
+            self._contador[clave] = 0

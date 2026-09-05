@@ -103,41 +103,29 @@ def log_summary(database: Any) -> ProductReport | None:
         log.debug("No se pudo reunir el resumen de producto", exc_info=True)
         return None
 
-    log.info("%s RESULTADO FINAL", ETIQUETA)
-    log.info("%s   chats_total=%d", ETIQUETA, informe.chats_total)
-    log.info("%s   messages_total=%d", ETIQUETA, informe.messages_total)
+    # Cuatro lineas, no doce. El detalle por estado sigue estando, en DEBUG.
     log.info(
-        "%s   media_total=%d (descargados=%d)",
+        "%s chats=%d mensajes=%d multimedia=%d (descargados=%d)",
         ETIQUETA,
+        informe.chats_total,
+        informe.messages_total,
         informe.media_total,
         informe.media_downloaded,
     )
     log.info(
-        "%s   exhausted=%d waiting_seed=%d timeout=%d errors=%d",
+        "%s waiting_seed=%d exhausted=%d timeout=%d errores=%d",
         ETIQUETA,
-        informe.exhausted,
         informe.waiting_seed,
+        informe.exhausted,
         informe.timeout,
         informe.errors,
     )
-    otros = {
-        k: v
-        for k, v in informe.por_estado.items()
-        if k not in {"exhausted", "waiting_seed", "timeout", "error"}
-    }
-    if otros:
-        log.info("%s   otros estados: %s", ETIQUETA, otros)
+    log.debug("%s por estado: %s", ETIQUETA, informe.por_estado)
     if informe.waiting_seed:
         log.info(
-            "%s   %d conversacion(es) siguen esperando una referencia de "
-            "WhatsApp. No estan vacias, y despiertan solas si llega un mensaje "
-            "real.",
+            "%s %d conversacion(es) esperan una referencia de WhatsApp. NO "
+            "estan vacias: despiertan solas si llega un mensaje real.",
             ETIQUETA,
             informe.waiting_seed,
         )
-    log.info(
-        "%s Esto es la copia local de todo el historial y contenido "
-        "recuperable que WhatsApp ha proporcionado al companion device.",
-        ETIQUETA,
-    )
     return informe

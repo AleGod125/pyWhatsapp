@@ -53,12 +53,23 @@ def apply_all(settings) -> list[str]:  # type: ignore[no-untyped-def]
             applied.append("own_lid_map")
 
     # Observacion del camino real del receptor cuando llega un mensaje
-    # NUESTRO. No cambia nada: solo dice por que encuentra (o no) la sesion.
+    # NUESTRO. No cambia nada: solo dice por que encuentra (o no) la sesion,
+    # y de cual de mis dispositivos venia.
     if settings.compat_own_lid_map:
         from app.compat import lid_diagnostics
 
         if lid_diagnostics.apply(settings):
             applied.append("lid_diagnostics")
+
+        # Y una foto del almacen: un dispositivo propio con sesion por numero
+        # Y por LID es el mismo aparato con dos ratchets, que es la
+        # explicacion medible de que alguna copia del telefono no cuadre.
+        from app.core.own_device import avisar_de_sesiones_duplicadas
+
+        try:
+            avisar_de_sesiones_duplicadas(settings)
+        except Exception:  # noqa: BLE001 - mirar no puede impedir el arranque
+            log.debug("No se pudo auditar las sesiones propias")
 
     # Busca anclas en las mutaciones de app-state. APAGADA por defecto: se
     # midio contra la cuenta real y no aparecio ni una clave de mensaje

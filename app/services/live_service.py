@@ -116,10 +116,15 @@ class LiveMessageService:
         *,
         own_jid: str | None = None,
         own_lid: str | None = None,
+        whatsapp_account_id: Any = None,
     ) -> None:
         self._database = database
         self._own_jid = own_jid
         self._own_lid = own_lid
+        # De quien son los chats que se creen aqui. Se fija cuando el runtime
+        # sabe quien es el dueno; hasta entonces los chats nuevos quedarian
+        # sin el, que es lo que dejaba el panel vacio.
+        self.whatsapp_account_id = whatsapp_account_id
         self.stats = LiveStats()
 
     def _own_ids(self) -> frozenset[str]:
@@ -240,6 +245,7 @@ class LiveMessageService:
                     message_type, text, raw_proto=raw_proto, metadata=propio_metadata
                 ),
                 last_message_timestamp=int(message.timestamp),
+                whatsapp_account_id=self.whatsapp_account_id,
             )
 
             inserted = repo.bulk_upsert_messages(

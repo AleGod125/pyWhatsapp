@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-backup-web-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mide que conversaciones ve WhatsApp Web y si tienen una referencia real. NO extrae historial.",
+  "type": "commonjs",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "1.34.7"
+  }
+}

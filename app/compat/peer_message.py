@@ -40,6 +40,13 @@ log = get_logger("COMPAT")
 
 _MARKER = "_whatsapp_backup_peer_patch"
 _FLAG = "_whatsapp_backup_peer_mode"
+#: Atributo donde queda el ``enc.type`` de la ultima stanza peer emitida.
+LAST_ENC_TYPE = "_whatsapp_backup_peer_last_enc_type"
+
+
+def ultimo_enc_type(sender: Any) -> str | None:
+    """El ``enc.type`` de la ultima peticion peer, o ``None`` si no hubo."""
+    return getattr(sender, LAST_ENC_TYPE, None)
 
 
 @contextlib.contextmanager
@@ -59,6 +66,20 @@ def peer_mode(sender: Any) -> Iterator[None]:
 
 class PeerShapeError(RuntimeError):
     """La stanza peer no tiene la forma que el telefono espera."""
+
+
+def _device_identity(node: Any) -> Any | None:
+    """El ``<device-identity>`` que pywhats ya adjunto, si esta.
+
+    Es la ADVSignedDeviceIdentity de ESTE companion: la firma con la que el
+    telefono comprueba que la clave de identidad que viaja en un ``pkmsg`` es
+    de verdad suya. Aqui no se construye ni se firma nada; solo se conserva el
+    nodo que ``Sender._build_message_node`` ya habia puesto.
+    """
+    for child in node.content or []:
+        if getattr(child, "tag", None) == "device-identity":
+            return child
+    return None
 
 
 def _collect_encs(node: Any) -> list[Any]:
@@ -86,7 +107,7 @@ def _collect_encs(node: Any) -> list[Any]:
 def apply() -> bool:
     """Envuelve el Sender para producir el wire shape de una peer. Idempotente.
 
-    Son TRES ajustes, y los tres hacen falta:
+    Son CUATRO ajustes, y los cuatro hacen falta:
 
     1. ``category="peer"`` + ``type="text"`` en la stanza.
     2. Un solo destinatario. ``Sender._target_devices`` (sender.py:725) hace::
@@ -103,6 +124,10 @@ def apply() -> bool:
        como se renderiza un mensaje de chat enviado desde otro dispositivo.
        Una Peer Data Operation no es un mensaje de chat: whatsmeow envia el
        ``Message`` desnudo, y envuelto el telefono no reconoce la operacion.
+    4. ``<device-identity>`` cuando el ``<enc>`` es un ``pkmsg``. Es la firma
+       que permite al telefono validar una sesion Signal NUEVA. Ver el
+       comentario largo mas abajo: quitarlo siempre es lo que convirtio
+       ON_DEMAND en un timeout el dia que la sesion con el telefono se perdio.
     """
     from pywhats.messaging.sender import Sender
 
@@ -157,20 +182,63 @@ def apply() -> bool:
             )
 
         enc = encs[0]
-        log.info(
-            "Peer shape=bare enc_count=1 enc_type=%s category=peer type=text",
-            enc.attrs.get("type"),
-        )
+        enc_type = enc.attrs.get("type")
+        # Se deja anotado en el Sender para que quien emite la peticion pueda
+        # registrarlo sin volver a inspeccionar la stanza. `pkmsg` significa
+        # sesion NUEVA con el telefono, y eso cambia el diagnostico de un
+        # timeout por completo.
+        setattr(self, LAST_ENC_TYPE, enc_type)
 
-        # Estructura peer: el <enc> cuelga DIRECTAMENTE de <message>. Sin
-        # <participants> (no hay fanout: la peticion es para un solo
-        # dispositivo) y sin <device-identity>.
-        node.content = [enc]
-        log.debug("Stanza peer reestructurada: <message category=peer><enc/></message>")
+        # Estructura peer: el <enc> cuelga DIRECTAMENTE de <message>, sin
+        # <participants>, porque no hay fanout: la peticion es para un solo
+        # dispositivo.
+        #
+        # <device-identity> SOLO cuando el enc es un pkmsg, y ahi es
+        # OBLIGATORIO. Un pkmsg abre una sesion Signal nueva y lleva dentro
+        # nuestra clave de identidad; el telefono no puede aceptarla sin la
+        # ADVSignedDeviceIdentity que demuestra que este companion es suyo.
+        # Un `msg` viaja sobre una sesion ya establecida y no la necesita.
+        #
+        # ESTO SE MIDIO. Con `msg` salieron 73 peticiones y todas
+        # respondieron; en cuanto la sesion con el telefono se perdio y las
+        # peticiones empezaron a salir como `pkmsg`, el servidor las siguio
+        # confirmando con ACK y el telefono dejo de contestar. La unica
+        # diferencia estructural entre unas y otras era este nodo, que se
+        # estaba quitando siempre.
+        contenido = [enc]
+        if enc_type == "pkmsg":
+            identidad = _device_identity(node)
+            if identidad is not None:
+                contenido.append(identidad)
+                log.info(
+                    "Peer shape=bare enc_count=1 enc_type=pkmsg category=peer "
+                    "type=text device_identity=si (sesion NUEVA con el telefono)"
+                )
+            else:
+                # No se degrada en silencio: sin la firma, el telefono no
+                # puede validar la sesion nueva y la peticion se pierde sin
+                # dejar rastro salvo el timeout.
+                log.warning(
+                    "Peer pkmsg SIN device-identity: pywhats no adjunto la "
+                    "ADVSignedDeviceIdentity. El telefono no podra validar la "
+                    "sesion nueva y lo mas probable es que no conteste."
+                )
+        else:
+            log.info(
+                "Peer shape=bare enc_count=1 enc_type=%s category=peer type=text "
+                "device_identity=no (sesion ya establecida)",
+                enc_type,
+            )
+
+        node.content = contenido
+        log.debug(
+            "Stanza peer reestructurada: <message category=peer><enc/>%s</message>",
+            "<device-identity/>" if len(contenido) > 1 else "",
+        )
         return node
 
     setattr(_build_message_node, _MARKER, True)
     Sender._build_message_node = _build_message_node  # type: ignore[method-assign]
 
-    log.info("Adaptacion de mensajes peer (category=peer) aplicada")
+    log.debug("Adaptacion de mensajes peer (category=peer) aplicada")
     return True

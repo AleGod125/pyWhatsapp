@@ -18,6 +18,8 @@ import ast
 import re
 from pathlib import Path
 
+import uuid
+
 import pytest
 
 pytest.importorskip("flask")
@@ -34,97 +36,16 @@ TOTAL = 250
 # ---------------------------------------------------------------------------
 
 
-class _SessionShim:
-    """Sesion del test que la API no puede cerrar."""
-
-    def __init__(self, session) -> None:
-        self._session = session
-
-    def __getattr__(self, nombre):
-        return getattr(self._session, nombre)
-
-    def close(self) -> None:
-        return None
 
 
-class _DatabaseShim:
-    """Base de datos que devuelve SIEMPRE la sesion del test.
-
-    La API abre una sesion por peticion y la cierra al terminar. La del test
-    vive dentro de una transaccion que se revierte al final, asi que si la
-    cerrara se perderia lo que la prueba acaba de escribir. Este envoltorio
-    conserva el contrato y neutraliza el cierre.
-    """
-
-    def __init__(self, real, session) -> None:
-        self._real = real
-        self._session = session
-
-    def session(self):
-        return _SessionShim(self._session)
-
-    def health(self):
-        return self._real.health()
-
-    def applied_migration(self):
-        return self._real.applied_migration()
-
-    def transaction(self):
-        """Tambien sobre la sesion del test, NO sobre la base real.
-
-        Delegar esto en ``self._real`` fue un error con consecuencias: los
-        servicios que escriben dentro de ``transaction()`` (mantenimiento,
-        recuperacion de semillas) hacian COMMIT contra la base de produccion
-        del usuario. Se detecto porque una pasada de la suite reclasifico 32
-        chats reales. Ahora todo queda dentro de la transaccion que se
-        revierte.
-        """
-        from contextlib import contextmanager
-
-        @contextmanager
-        def scope():
-            yield self._session
-            self._session.flush()
-
-        return scope()
-
-    def dispose(self) -> None:
-        return None
 
 
-@pytest.fixture
-def runtime(settings, database, session, tmp_path):
-    """``AppRuntime`` real, con base del test y sesion en un temporal.
-
-    Se usa el runtime de verdad, no un doble: asi las pruebas ejercitan el
-    mismo objeto que construye ``service.py``. Pero la carpeta
-    de sesion se aisla: la aplicacion archiva ``device.json`` cuando el
-    servidor rechaza un login, y una prueba no puede tocar la sesion viva.
-    """
-    import dataclasses
-
-    from app.core.runtime import AppRuntime
-
-    aislado = dataclasses.replace(
-        settings,
-        session_dir=tmp_path / "session",
-        diagnostics_dir=tmp_path / "diagnostics",
-    )
-    (tmp_path / "session").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "diagnostics").mkdir(parents=True, exist_ok=True)
-
-    rt = AppRuntime(aislado, owner="pytest", configure_logging=False)
-    rt.database = _DatabaseShim(database, session)
-    return rt
 
 
-@pytest.fixture
-def cliente(runtime):
-    from app.api import create_app
 
-    aplicacion = create_app(runtime)
-    aplicacion.config.update(TESTING=True)
-    return aplicacion.test_client()
+
+
+
 
 
 @pytest.fixture

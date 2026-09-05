@@ -22,7 +22,7 @@ pytest.importorskip("flask")
 
 from app.services import repository as repo  # noqa: E402
 from app.services.repository import IncomingMessage  # noqa: E402
-from tests.test_api import _DatabaseShim  # noqa: E402
+from tests.conftest import _DatabaseShim  # noqa: E402
 
 CHAT_JID = "34600444555@s.whatsapp.net"
 
@@ -56,13 +56,6 @@ def runtime(settings, database, session, tmp_path):
     return rt
 
 
-@pytest.fixture
-def cliente(runtime):
-    from app.api import create_app
-
-    aplicacion = create_app(runtime)
-    aplicacion.config.update(TESTING=True)
-    return aplicacion.test_client()
 
 
 # ---------------------------------------------------------------------------
@@ -428,11 +421,32 @@ def test_nunca_se_usa_un_cursor_sintetico():
     from app.services import seed_recovery
 
     fuente = inspect.getsource(seed_recovery)
-    assert "get_oldest_valid_history_cursor" in fuente, (
-        "el ancla se toma del repositorio, que ya rechaza los ids fabricados"
+    assert "get_valid_history_cursor" in fuente, (
+        "el ancla se toma de la funcion central, que rechaza los ids fabricados"
     )
     for prohibido in ('oldestMsgID=""', "synthetic-", "opaque-"):
         assert prohibido not in fuente
+
+
+def test_la_funcion_central_rechaza_los_ids_fabricados():
+    """Y no de palabra: se comprueba llamandola.
+
+    Una prueba que solo mirase el codigo fuente pasaria aunque el filtro
+    estuviera puesto y no se aplicara.
+    """
+    from app.history.cursor import CursorInfo, _del_estado
+
+    class _Estado:
+        oldest_message_timestamp = 1_760_000_000
+        oldest_from_me = False
+
+        def __init__(self, wamid):
+            self.oldest_message_id = wamid
+
+    assert _del_estado(_Estado("3A1F8BDD4678EB6DE395")) is not None
+    for fabricado in ("opaque-1", "synthetic-9", "local-x", "", None):
+        assert _del_estado(_Estado(fabricado)) is None
+    assert isinstance(_del_estado(_Estado("3A1F8BDD4678EB6DE395")), CursorInfo)
 
 
 def test_las_metricas_separan_completo_de_sin_semilla(session, cliente):

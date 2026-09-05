@@ -122,6 +122,45 @@ def _arrancar_whatsapp_en_segundo_plano(runtime: Any) -> threading.Thread:
     return hilo
 
 
+def _informar_del_web_companion(runtime: Any) -> None:
+    """Dice si el segundo dispositivo esta disponible. NO lo arranca.
+
+    AQUI ESTABA EL FALLO
+    --------------------
+    Esto levantaba el worker en un hilo nada mas arrancar, sin mirar la sesion.
+    Se midio: ``service.py`` arranco con ``STARTING -> NO_SESSION``, sin
+    ``device.json``, sin identidad y sin Signal, y aun asi salio
+    ``[WEB] worker iniciado`` y ``[WEB] QR requerido``. El usuario acabo
+    escaneando el codigo del segundo dispositivo cuando el que hacia falta era
+    el principal.
+
+    Y no podia ser de otra manera: al arrancar, la conexion principal NUNCA
+    esta lista todavia -- se abre despues y en otro hilo. Asi que este sitio no
+    es el que tiene que decidirlo.
+
+    Ahora lo arranca el orquestador cuando la sesion principal esta lista de
+    verdad y solo si quedan conversaciones sin ancla. La sesion principal
+    manda; el segundo dispositivo espera.
+    """
+    companion = getattr(runtime, "web_companion", None)
+    if companion is None:
+        return
+    registro = get_logger("WEB")
+    if not companion.habilitado:
+        registro.info("disabled")
+        return
+
+    disponible, motivo = companion.comprobar_entorno()
+    if not disponible:
+        registro.warning("no disponible: %s", motivo)
+        return
+
+    registro.info(
+        "disponible; se arrancara cuando la conexion principal este lista y "
+        "queden conversaciones sin referencia"
+    )
+
+
 # Codigos de salida, para poder ramificar desde un script sin leer el texto.
 SALIDA_OK = 0
 SALIDA_YA_HAY_SERVICIO = 5
@@ -237,6 +276,16 @@ def main(argv: list[str] | None = None) -> int:
         get_logger("DB").error("%s", exc)
         return 3
 
+    from app.core.logging_setup import silenciar_ruido_http
+
+    silenciar_ruido_http(not getattr(settings, "http_access_log", False))
+    if getattr(settings, "protocol_debug", False):
+        import logging
+
+        for etiqueta in ("SIGNAL", "BACKFILL", "COMPAT", "PLAN_E"):
+            logging.getLogger(etiqueta).setLevel(logging.DEBUG)
+        log.info("Detalle de protocolo ACTIVO (PROTOCOL_DEBUG=true)")
+
     if not _verificar_migraciones(runtime):
         runtime.stop()
         return 3
@@ -274,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.local:
         _arrancar_whatsapp_en_segundo_plano(runtime)
+        # Solo se informa. Arrancarlo aqui es lo que ponia el codigo QR del
+        # segundo dispositivo delante del usuario sin sesion principal.
+        _informar_del_web_companion(runtime)
     else:
         log.info("PostgreSQL listo (modo local)")
         log.info("Runtime WhatsApp deshabilitado: no se abrira la sesion")
@@ -315,7 +367,14 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError:  # pragma: no cover - hilo secundario
                 pass
 
+    # Se dicen las DOS: donde escucha el proceso y por donde entra el
+    # navegador. No son la misma, y usar 127.0.0.1 desde el navegador rompe
+    # la sesion: para el, "localhost" y "127.0.0.1" son sitios distintos y
+    # una cookie puesta en uno no viaja en las peticiones del otro.
     log.info("API escuchando en http://%s:%d/api/v1", host, port)
+    publica = getattr(settings, "api_public_url", "").rstrip("/")
+    if publica:
+        log.info("Desde el navegador, usa: %s/api/v1", publica)
     log.info("CORS permitido para %s", settings.frontend_origin)
     try:
         # threaded=True es necesario: el SSE mantiene una conexion abierta por

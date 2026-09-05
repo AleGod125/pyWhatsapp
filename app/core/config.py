@@ -217,6 +217,35 @@ class Settings:
     # respeta esta espera; el boton manual no la respeta nunca. 0 la desactiva.
     auto_recheck_cooldown_seconds: float
 
+    # --- Cuentas y autenticacion ---
+    session_cookie_name: str
+    session_lifetime_days: int
+    cookie_secure: bool
+    cookie_samesite: str
+    app_encryption_key: str | None
+    frontend_url: str
+    api_public_url: str
+
+    # --- Detalle de los registros ---
+    http_access_log: bool
+    protocol_debug: bool
+
+    # --- Almacenamiento del contenido (Google Drive) ---
+    drive_storage_enabled: bool
+    drive_message_segment_max_messages: int
+    drive_message_segment_max_bytes: int
+    drive_segment_max_age_seconds: float
+    local_media_cache_max_gb: float
+    local_media_cache_ttl_hours: int
+    max_pending_storage_bytes: int
+    storage_encryption_enabled: bool
+    storage_kek: str | None
+
+    # --- Google OAuth ---
+    google_client_id: str | None
+    google_client_secret: str | None
+    google_redirect_uri: str
+
     # --- Recuperacion auxiliar (Web Bootstrap / Baileys) ---
     #
     # Vincula un SEGUNDO dispositivo a la cuenta del usuario, con su propio QR.
@@ -224,6 +253,25 @@ class Settings:
     # asi que viene apagada. Sigue en el codigo y se reactiva con
     # ``WEB_BOOTSTRAP_ENABLED=true`` cuando haya algo que ganar con ella.
     web_bootstrap_enabled: bool
+
+    # --- Web Companion (whatsapp-web.js) -------------------------------------
+    #
+    # Otro dispositivo vinculado MAS, con su propio QR y su propia sesion, que
+    # sirve para MEDIR: de las conversaciones que esperan una referencia,
+    # ¿cuantas ve WhatsApp Web y de cuantas puede dar un mensaje real?
+    #
+    # En esta fase solo mide. No anota anclas, no cambia estados y no pide
+    # historial. Apagado por defecto: el producto funciona entero sin el.
+    web_companion_enabled: bool
+    # Ruta a Chrome/Chromium. Vacio deja que puppeteer use el suyo.
+    web_companion_chrome: str
+    # Nivel 2: pedirle al Store que cargue mensajes anteriores de un chat.
+    # Solo se usa cuando lo ya cargado no basta.
+    web_store_load_earlier: bool
+    # Forzar la carga diferida del panel lateral desplazandolo. El proyecto
+    # anterior hacia 80 desplazamientos por defecto; aqui va apagado hasta
+    # comprobar si getChats() y Store.Chat ya bastan.
+    web_store_discovery_scroll: bool
 
     # --- Compatibilidades pywhats 0.2.0 ---
     compat_wa_version: bool
@@ -379,10 +427,62 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         allow_remote_api=_bool("ALLOW_REMOTE_API", False),
         api_port=_int("API_PORT", 5000, minimum=1),
         frontend_origin=_str("FRONTEND_ORIGIN", "http://localhost:4200"),
+        session_cookie_name=_str("SESSION_COOKIE_NAME", "whatsapp_backup_session"),
+        session_lifetime_days=_int("SESSION_LIFETIME_DAYS", 30, minimum=1),
+        # En localhost no hay HTTPS, y una cookie Secure no llegaria nunca:
+        # el login parecería fallar sin ningun error visible. En produccion
+        # tiene que ser true.
+        cookie_secure=_bool("COOKIE_SECURE", False),
+        cookie_samesite=_str("COOKIE_SAMESITE", "Lax"),
+        app_encryption_key=os.environ.get("APP_ENCRYPTION_KEY") or None,
+        frontend_url=_str("FRONTEND_URL", "http://localhost:4200"),
+        # Por donde entra el NAVEGADOR, no donde escucha el proceso. Tiene que
+        # ser "localhost" y no "127.0.0.1": para el navegador son sitios
+        # distintos, y una cookie SameSite=Lax puesta en uno no viaja en las
+        # peticiones que hace el otro.
+        api_public_url=_str("API_PUBLIC_URL", "http://localhost:5000"),
+        # Las peticiones HTTP correctas no se registran: con el panel abierto
+        # son decenas por minuto y entierran lo que hay que ver.
+        http_access_log=_bool("HTTP_ACCESS_LOG", False),
+        # Detalle de protocolo (cursores, ACKs, formas de peticion). Apagado
+        # por defecto; no se ha borrado nada, solo baja de nivel.
+        protocol_debug=_bool("PROTOCOL_DEBUG", False),
+        drive_storage_enabled=_bool("DRIVE_STORAGE_ENABLED", True),
+        drive_message_segment_max_messages=_int(
+            "DRIVE_MESSAGE_SEGMENT_MAX_MESSAGES", 1000, minimum=1
+        ),
+        drive_message_segment_max_bytes=_int(
+            "DRIVE_MESSAGE_SEGMENT_MAX_BYTES", 5_242_880, minimum=1024
+        ),
+        drive_segment_max_age_seconds=_float(
+            "DRIVE_SEGMENT_MAX_AGE_SECONDS", 60.0, minimum=1.0
+        ),
+        local_media_cache_max_gb=_float("LOCAL_MEDIA_CACHE_MAX_GB", 5.0, minimum=0.0),
+        local_media_cache_ttl_hours=_int(
+            "LOCAL_MEDIA_CACHE_TTL_HOURS", 24, minimum=1
+        ),
+        max_pending_storage_bytes=_int(
+            "MAX_PENDING_STORAGE_BYTES", 10_737_418_240, minimum=0
+        ),
+        storage_encryption_enabled=_bool("STORAGE_ENCRYPTION_ENABLED", True),
+        # Separada de APP_ENCRYPTION_KEY a proposito: una protege los secretos
+        # del servidor y la otra el contenido de los usuarios. Si falta, se
+        # deriva de la primera con HKDF y una etiqueta distinta.
+        storage_kek=os.environ.get("STORAGE_KEK") or None,
+        google_client_id=os.environ.get("GOOGLE_CLIENT_ID") or None,
+        google_client_secret=os.environ.get("GOOGLE_CLIENT_SECRET") or None,
+        google_redirect_uri=_str(
+            "GOOGLE_REDIRECT_URI",
+            "http://127.0.0.1:5000/api/v1/auth/google/callback",
+        ),
         auto_recheck_cooldown_seconds=_float(
             "AUTO_RECHECK_COOLDOWN_SECONDS", 300.0, minimum=0.0
         ),
         web_bootstrap_enabled=_bool("WEB_BOOTSTRAP_ENABLED", False),
+        web_companion_enabled=_bool("WEB_COMPANION_ENABLED", False),
+        web_companion_chrome=_str("WEB_COMPANION_CHROME", ""),
+        web_store_load_earlier=_bool("WEB_STORE_LOAD_EARLIER", False),
+        web_store_discovery_scroll=_bool("WEB_STORE_DISCOVERY_SCROLL", False),
         compat_wa_version=_bool("COMPAT_WA_VERSION", True),
         wa_version_fetch_timeout=_float("WA_VERSION_FETCH_TIMEOUT", 10.0, minimum=1.0),
         compat_windows_store=_bool("COMPAT_WINDOWS_STORE", True),

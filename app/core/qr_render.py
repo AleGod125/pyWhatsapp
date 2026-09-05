@@ -85,8 +85,9 @@ def render_qr(payload: str, *, max_pixels: int | None = None) -> Image.Image:
     if not payload:
         raise ValueError("el payload del QR esta vacio")
 
-    log.info("Payload recibido")
-    log.info("Longitud payload=%d", len(payload))
+    # A DEBUG: el QR rota cada pocos segundos y esto eran dos lineas por
+    # rotacion. El payload NUNCA se registra; solo su longitud.
+    log.debug("Payload recibido, longitud=%d", len(payload))
 
     # ERROR_CORRECT_L es lo que usa WhatsApp Web: mas correccion significaria
     # mas modulos para el mismo dato y un QR mas denso, mas dificil de leer.
@@ -116,8 +117,9 @@ def render_qr(payload: str, *, max_pixels: int | None = None) -> Image.Image:
             (image.width * factor, image.height * factor), resample=Image.Resampling.NEAREST
         )
 
-    log.info("Imagen generada=%dx%d", image.width, image.height)
-    log.info("Border modules=%d", BORDER_MODULES)
+    log.debug(
+        "Imagen generada=%dx%d border=%d", image.width, image.height, BORDER_MODULES
+    )
     log.debug(
         "Modulos=%d box_size=%d version=%s", qr.modules_count, qr.box_size, qr.version
     )

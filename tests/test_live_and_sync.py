@@ -21,7 +21,7 @@ pytest.importorskip("flask")
 
 from app.services import repository as repo  # noqa: E402
 from app.services.repository import IncomingMessage  # noqa: E402
-from tests.test_api import _DatabaseShim  # noqa: E402
+from tests.conftest import _DatabaseShim  # noqa: E402
 
 CHAT_JID = "34600333222@s.whatsapp.net"
 
@@ -56,13 +56,6 @@ def runtime(settings, database, session, tmp_path):
     return rt
 
 
-@pytest.fixture
-def cliente(runtime):
-    from app.api import create_app
-
-    aplicacion = create_app(runtime)
-    aplicacion.config.update(TESTING=True)
-    return aplicacion.test_client()
 
 
 @pytest.fixture
@@ -847,3 +840,129 @@ def test_el_vigilante_pide_qr_cuando_no_hay_ninguno():
         gestor.stop()
 
     assert intentos, "sin QR y sin vinculo, el vigilante tiene que pedir uno"
+
+
+# ---------------------------------------------------------------------------
+# EL HISTORIAL QUE ENTRA, SIN F5
+# ---------------------------------------------------------------------------
+#
+# Una excavación produce un aviso por cada bloque de cincuenta mensajes. Antes
+# ese aviso decía sólo en qué conversaciones había entrado algo, así que la
+# pantalla tenía que pedir la lista entera para enterarse del contador nuevo:
+# recuperar tres mil mensajes eran sesenta peticiones contra el mismo endpoint.
+#
+# Ahora la fila va dentro del aviso cuando son pocas conversaciones, y la
+# pantalla actualiza en el sitio.
+
+
+class _EventoFalso:
+    def __init__(self, nombre, payload):
+        self.name = nombre
+        self.payload = payload
+        self.extra = {}
+
+
+def test_el_historial_que_entra_dice_en_que_chats_y_como_quedaron(
+    session, chat_vacio, runtime
+):
+    from app.api.live_events import translate
+
+    _guardar(session, chat_vacio, "HIST0001", "del historial")
+    salida = dict(
+        translate(
+            _EventoFalso(
+                "history_ingested",
+                {
+                    "summary": "1 mensaje",
+                    "chat_jids": [CHAT_JID],
+                    "messages": 1,
+                    "sync_type": "ON_DEMAND",
+                },
+            ),
+            runtime,
+        )
+    )
+
+    datos = salida["history.progress"]
+    assert datos["chat_jids"] == [CHAT_JID]
+    assert datos["messages"] == 1
+    # Y la fila entera, para poder actualizar sin pedir la lista.
+    assert len(datos["chats"]) == 1
+    fila = datos["chats"][0]
+    assert fila["jid"] == CHAT_JID
+    assert fila["message_count"] >= 1
+
+
+def test_con_demasiadas_conversaciones_no_se_mandan_todas_las_filas(runtime):
+    """Un ``INITIAL_BOOTSTRAP`` toca decenas: el aviso no puede pesar tanto."""
+    from app.api.live_events import TOPE_DE_FILAS, translate
+
+    muchos = [f"5730000{i:04d}@s.whatsapp.net" for i in range(TOPE_DE_FILAS + 5)]
+    salida = dict(
+        translate(
+            _EventoFalso("history_ingested", {"chat_jids": muchos, "messages": 900}),
+            runtime,
+        )
+    )
+
+    datos = salida["history.progress"]
+    assert "chats" not in datos, "con tantas, la pantalla se refresca una vez"
+    assert len(datos["chat_jids"]) == len(muchos)
+
+
+def test_un_aviso_antiguo_de_texto_suelto_no_rompe_nada(runtime):
+    """Compatibilidad: antes viajaba una cadena."""
+    from app.api.live_events import translate
+
+    salida = dict(
+        translate(_EventoFalso("history_ingested", "backfill completado"), runtime)
+    )
+
+    assert salida["history.progress"]["summary"] == "backfill completado"
+
+
+def test_un_adjunto_descargado_NO_es_un_cambio_de_la_lista(session, chat_vacio, runtime):
+    """`media.updated` no puede provocar una recarga de conversaciones.
+
+    Se descargan cientos de adjuntos seguidos; refrescar la lista por cada uno
+    dejaría el sidebar parpadeando sin que nada haya cambiado en él.
+    """
+    from app.api.live_events import translate
+
+    salida = dict(
+        translate(
+            _EventoFalso("media_ready", {"media_id": 1, "chat_id": chat_vacio}), runtime
+        )
+    )
+
+    assert set(salida) == {"media.updated"}
+
+
+def test_los_nombres_nuevos_estan_en_el_mapa_de_eventos():
+    """Sin esto el aviso se publica y nunca sale por el stream."""
+    from app.api.routes import EVENT_NAMES
+
+    assert EVENT_NAMES["web_chat_created"] == "chat.created"
+    assert EVENT_NAMES["web_chat_updated"] == "chat.updated"
+    assert EVENT_NAMES["web_inventory_done"] == "chat.inventory"
+
+
+def test_un_cambio_de_estado_lleva_el_identificador_del_chat(session, chat_vacio):
+    """El JID basta para buscar, pero la pantalla indexa por id.
+
+    Y una conversación que llegó por LID puede estar en la lista con el JID
+    del teléfono: comparar cadenas fallaría justo en ese caso.
+    """
+    from app.history.seed_collector import RecentSeedCollector
+
+    recolector = RecentSeedCollector(_DatabaseShim(None, session))
+    publicados = []
+    recolector.publish = lambda nombre, carga=None, **k: publicados.append((nombre, carga))
+
+    recolector._avisar_estado(CHAT_JID, "pending")
+
+    assert publicados[0][0] == "chat_history_status"
+    carga = publicados[0][1]
+    assert carga["chat_jid"] == CHAT_JID
+    assert carga["chat_id"] == chat_vacio
+    assert carga["history_status"] == "pending"

@@ -181,11 +181,15 @@ def verify(store: Path, pn_user: str, lid_user: str) -> bool:
         conexion.close()
 
     resuelve = bool(fila) and str(fila[0]) == pn_user
-    log.info(
-        "[COMPAT] identidad propia lista pn=%s lid=%s", bool(pn_user), bool(lid_user)
+    # Detalle de la comprobacion: a DEBUG. Lo que importa en INFO es si el
+    # mapa resuelve o no, y eso se dice abajo en una sola linea.
+    log.debug(
+        "identidad propia lista pn=%s lid=%s store_fp=%s resuelve=%s",
+        bool(pn_user),
+        bool(lid_user),
+        store_fingerprint(store),
+        resuelve,
     )
-    log.info("[COMPAT] own_lid_map store_fp=%s", store_fingerprint(store))
-    log.info("[COMPAT] el LID propio resuelve a su PN=%s", resuelve)
 
     if not resuelve:
         log.error(
@@ -196,10 +200,8 @@ def verify(store: Path, pn_user: str, lid_user: str) -> bool:
         return False
 
     log.info(
-        "Par PN<->LID propio registrado (%s***<->%s***): los mensajes que "
-        "envies desde el telefono ya podran descifrarse",
-        pn_user[:6],
-        lid_user[:6],
+        "Par PN<->LID propio registrado: los mensajes que envies desde el "
+        "telefono ya podran descifrarse"
     )
     return True
 

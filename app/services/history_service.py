@@ -14,6 +14,8 @@ Orden de las operaciones, que importa por las claves ajenas:
 
 from __future__ import annotations
 
+from typing import Any
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -59,11 +61,15 @@ def ingest_history_sync(
     *,
     own_jid: str | None = None,
     signal_db: "Path | None" = None,
+    whatsapp_account_id: "Any" = None,
 ) -> IngestResult:
     """Persiste un blob de History Sync completo.
 
     :param own_jid: JID propio, para rellenar el emisor de los mensajes con
         ``fromMe``. Si no se conoce se deja a NULL en vez de inventarlo.
+    :param whatsapp_account_id: de quien son estos chats. Sin el quedan sin
+        dueno y el filtro de propiedad los excluye: existen en la base y no
+        los ve nadie.
     """
     result = IngestResult()
 
@@ -78,6 +84,7 @@ def ingest_history_sync(
             name=conversation.name,
             chat_type=classify_chat(conversation.jid),
             last_message_timestamp=conversation.last_message_timestamp,
+            whatsapp_account_id=whatsapp_account_id,
         )
         result.conversations += 1
 
@@ -97,6 +104,7 @@ def ingest_history_sync(
                     session,
                     jid=message.chat_jid,
                     chat_type=classify_chat(message.chat_jid),
+                    whatsapp_account_id=whatsapp_account_id,
                 )
             # Clasificacion central: lo interno se procesa pero no se guarda
             # como mensaje de conversacion.

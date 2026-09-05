@@ -140,6 +140,10 @@ class Orchestrator:
         self.media: Any = None
         self.backfill: Any = None
         self.gate: Any = None
+        # Solo para el resumen del arranque. Lo cablea el runtime.
+        self.seed_collector: Any = None
+        # Devuelve la linea de resumen del receptor. Lo cablea el runtime.
+        self._live_summary: Any = None
 
         self._tasks: list[asyncio.Task[Any]] = []
         self._stopping = False
@@ -213,6 +217,28 @@ class Orchestrator:
 
     # -- Fase asincrona: despues de conectar ---------------------------------
 
+    #: Cuanto se espera, tras recuperar una sesion guardada, antes de probar
+    #: ON_DEMAND.
+    #:
+    #: POR QUE HACE FALTA
+    #: ------------------
+    #: Una vinculacion NUEVA espera el ``INITIAL_BOOTSTRAP``, y esa espera —de
+    #: segundos a minutos— hace de asentamiento sin que nadie la pensara. Una
+    #: sesion RECUPERADA no espera nada: ``_await_history`` vuelve en el acto
+    #: porque el bootstrap ya se confirmo en su dia. Medido en la sesion real:
+    #: ``<success>`` a las 00:32:38.443 y la peticion de prueba a las
+    #: 00:32:40.489. Dos segundos.
+    #:
+    #: En esos dos segundos el servidor todavia estaba mandando
+    #: ``ib: dirty type=account_sync`` y acababa de terminar el vaciado de lo
+    #: pendiente. Pedir historial ahi es pedirlo a una sesion que aun se esta
+    #: colocando.
+    #:
+    #: No es un `sleep` a ciegas: primero se espera a las señales que SI
+    #: existen —identidad, Signal, cuenta, app-state, vaciado— y esto es solo
+    #: el margen que queda despues.
+    GRACIA_TRAS_RECUPERAR_SESION = 20.0
+
     async def post_connect(self, pywhats_client: Any) -> None:
         """Secuencia completa tras el ``<success>`` del servidor.
 
@@ -220,6 +246,9 @@ class Orchestrator:
         socket estuvo muerto no llego ni un evento, asi que lo que ocurriera
         en ese rato no se puede dar por recibido. Al volver se reconcilia.
         """
+        # Desde aqui se cuenta el asentamiento. Es el momento del
+        # ``<success>``, no el del arranque del proceso.
+        self._conectado_en = time.monotonic()
         self.status.connection = "Conectado"
         self.status.connected = True
         self._emit_status()
@@ -263,6 +292,11 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - un resumen no puede cortar nada
             log.debug("No se pudo resumir la busqueda de anclas en app-state")
 
+        # 4 quater) Una linea con la situacion del historial. Es lo primero
+        #           que se mira al arrancar, y antes habia que deducirlo de
+        #           lineas sueltas repartidas por toda la consola.
+        self._resumen_de_anclas()
+
         # 4 bis) Reconciliacion LIGERA si esto es una reconexion.
         #
         # Los mensajes que llegaron con el socket muerto no produjeron ningun
@@ -278,7 +312,16 @@ class Orchestrator:
         self._start_media_worker(pywhats_client)
 
         # 6) Backfill historico. Es el unico que depende del telefono.
+        await self._esperar_a_que_asiente()
         await self._run_backfill(pywhats_client)
+
+        # 6 bis) La segunda vinculacion y la recuperacion automatica.
+        #
+        # Van DESPUES del backfill a proposito: el motor de siempre ya trabajo
+        # con lo que habia, y lo que quede esperando ancla es justo lo que la
+        # via Web puede resolver. Arrancarlo antes solo pondria a Chromium a
+        # competir por el mismo telefono.
+        self._arrancar_recuperacion_automatica()
 
         # 7) Mantenimiento periodico mientras la aplicacion siga abierta.
         self._start_maintenance_loop()
@@ -289,6 +332,40 @@ class Orchestrator:
         publicar_estado = getattr(self, "_set_sync_state", None)
         if publicar_estado is not None:
             publicar_estado("WATCHING")
+
+    def _resumen_de_anclas(self) -> None:
+        """``waiting=27 exhausted=10 timeout=2 pending=1``, y ya esta.
+
+        Nunca lanza: un resumen no puede cortar el arranque.
+        """
+        colector = getattr(self, "seed_collector", None)
+        if colector is None:
+            return
+        try:
+            datos = colector.resumen()
+        except Exception:  # noqa: BLE001 - observar no puede tumbar nada
+            log.debug("No se pudo resumir el estado de las anclas")
+            return
+        get_logger("PLAN_E").info(
+            "waiting=%d exhausted=%d timeout=%d pending=%d anclas=%d "
+            "conversaciones_con_ancla=%d",
+            datos.get("waiting_seed", 0),
+            datos.get("exhausted", 0),
+            datos.get("timeout", 0),
+            datos.get("pending", 0),
+            datos.get("seeds_total", 0),
+            datos.get("chats_with_seed", 0),
+        )
+
+    def _resumen_live(self) -> None:
+        """``[LIVE] recibidos=20 propios=8 ...``. Nunca lanza."""
+        resumen = getattr(self, "_live_summary", None)
+        if resumen is None:
+            return
+        try:
+            get_logger("LIVE").info("%s", resumen())
+        except Exception:  # noqa: BLE001 - un resumen no puede cortar el ciclo
+            log.debug("No se pudo resumir la recepcion en vivo")
 
     async def _reconciliar_tras_reconectar(self) -> None:
         """Recupera lo que entro mientras no habia socket. Solo lo reciente.
@@ -369,6 +446,44 @@ class Orchestrator:
             name="media-worker",
         )
 
+    async def _esperar_a_que_asiente(self) -> None:
+        """El margen que le falta a una sesion recuperada. Solo a esa.
+
+        QUE SIGNIFICA "ASENTADA"
+        ------------------------
+        Cuando se llega aqui ya se cumplio todo lo que se puede comprobar:
+
+        * ``<success>`` del servidor y estado CONECTADO;
+        * identidad propia leida del dispositivo VIVO;
+        * Signal Store en su sitio y cuenta reconciliada;
+        * el historial inicial resuelto —esperado o ya confirmado—;
+        * app-state sincronizado (se espera de verdad: ``_sync_contacts``
+          hace ``await`` de cada coleccion);
+        * la reconciliacion de lo que entro con el socket muerto.
+
+        Lo unico que NO se puede comprobar con una señal es lo que hace el
+        telefono por su cuenta al reaparecer un companion. Para eso, y solo
+        para eso, queda este margen.
+
+        A una vinculacion NUEVA no se le aplica: ya espero su bootstrap.
+        """
+        if self.gate is not None and getattr(self.gate, "bootstrap_seen", False):
+            return
+
+        desde = getattr(self, "_conectado_en", None)
+        if desde is None:
+            return
+        restante = self.GRACIA_TRAS_RECUPERAR_SESION - (time.monotonic() - desde)
+        if restante <= 0:
+            return
+
+        log.info(
+            "[CAPABILITY] sesion recuperada; se deja asentar %.0fs antes de "
+            "probar ON_DEMAND",
+            restante,
+        )
+        await asyncio.sleep(restante)
+
     async def _run_backfill(self, pywhats_client: Any) -> None:
         if self.backfill is None:
             return
@@ -380,6 +495,17 @@ class Orchestrator:
                 ok = True
             else:
                 ok = await self.backfill.run_canary(pywhats_client)
+                if not ok and self.backfill.last_canary_reason == "sin_candidato":
+                    # El canary es un DIAGNOSTICO, no un permiso. Si no llego
+                    # a elegir objetivo no ha probado nada, y tratarlo como
+                    # "ON_DEMAND no funciona" dejaba sin excavar a chats que
+                    # si tenian ancla. Lo unico que bloquea la excavacion es
+                    # una prueba que se hizo y no obtuvo respuesta.
+                    log.info(
+                        "El canary no encontro objetivo, asi que no probo nada. "
+                        "Se continua con la excavacion normal."
+                    )
+                    ok = True
             if ok and self._settings.backfill_all_after_canary:
                 await self.backfill.run(pywhats_client)
         except asyncio.CancelledError:
@@ -409,6 +535,95 @@ class Orchestrator:
             informe.to_json() if informe is not None else {},
         )
 
+    def _arrancar_recuperacion_automatica(self) -> None:
+        """Levanta el companion de recuperacion y el vigilante que lo usa.
+
+        Antes esto eran dos botones que el usuario tenia que conocer: uno para
+        arrancar el Web Companion y otro para aplicar lo que encontrara. El
+        motor no cambia -- se llama a las mismas piezas -- pero ya no hace
+        falta saber que existen.
+
+        Nada de esto es imprescindible: si el companion esta apagado, o falla,
+        la aplicacion sigue funcionando con lo que WhatsApp entregue por la
+        via normal.
+        """
+        runtime = getattr(self, "_runtime", None)
+        if runtime is None:
+            return
+
+        # El segundo dispositivo es un FALLBACK, no un requisito. Solo se
+        # arranca si despues de todo lo que trajo la sesion principal quedan
+        # conversaciones sin ancla.
+        #
+        # Se midio por que hace falta: el INITIAL_BOOTSTRAP de esta cuenta
+        # trajo 41 conversaciones y 107 mensajes, y esos 107 estaban
+        # concentrados en 8 conversaciones. Las otras 33 llegaron como fichas
+        # VACIAS -- sin nombre, sin marca de tiempo, sin nada. No es que no
+        # supieramos extraerlas: WhatsApp no manda nada de ellas.
+        #
+        # Pero si la sesion principal bastara, pedir un segundo codigo seria
+        # molestar por costumbre.
+        # La conexion principal manda. Aunque esto corre dentro de
+        # post_connect, entre el <success> y este punto la sesion pudo caerse:
+        # un 515 mal resuelto, una reconexion que no cuaja, un emparejamiento
+        # que no llego a completarse. Arrancar el segundo dispositivo ahi deja
+        # al usuario escaneando el codigo equivocado.
+        from app.core.primary import primary_ready, razon_no_lista
+
+        if not primary_ready(runtime):
+            log.info(
+                "No se arranca el segundo dispositivo: la conexion principal "
+                "no esta lista (%s)",
+                razon_no_lista(runtime),
+            )
+            return
+
+        sin_ancla = self._cuantas_esperan_ancla()
+        supervisor = getattr(runtime, "web_companion", None)
+        if sin_ancla == 0:
+            log.info(
+                "Todas las conversaciones tienen ancla con la sesion principal: "
+                "no hace falta el segundo dispositivo"
+            )
+        elif supervisor is not None and getattr(supervisor, "habilitado", False):
+            if not getattr(supervisor, "vivo", False):
+                try:
+                    # Si ya hay sesion guardada arranca sin pedir nada; si no,
+                    # publica su QR y el panel lo ofrece como mejora.
+                    supervisor.start()
+                    log.info(
+                        "%d conversacion(es) sin ancla: se ofrece la recuperacion "
+                        "avanzada (segundo dispositivo)",
+                        sin_ancla,
+                    )
+                except Exception:  # noqa: BLE001 - opcional, no puede tumbar nada
+                    log.exception("No se pudo arrancar el Web Companion")
+
+        vigilante = getattr(runtime, "auto_recovery", None)
+        if vigilante is not None:
+            vigilante.start(getattr(runtime.client, "_loop", None))
+
+    def _cuantas_esperan_ancla(self) -> int:
+        """Conversaciones sin una referencia con la que pedir historial."""
+        from sqlalchemy import func, select
+
+        from app.models import SEEDLESS_STATUSES, ChatHistoryState
+
+        try:
+            with self._database.transaction() as sesion:
+                return int(
+                    sesion.execute(
+                        select(func.count())
+                        .select_from(ChatHistoryState)
+                        .where(ChatHistoryState.history_status.in_(SEEDLESS_STATUSES))
+                    ).scalar()
+                    or 0
+                )
+        except Exception:  # noqa: BLE001 - no poder contarlas no bloquea nada
+            # Sin poder mirarlo se ofrece igual: es mejor ofrecer de mas que
+            # dejar conversaciones sin recuperar en silencio.
+            return 1
+
     def _start_maintenance_loop(self) -> None:
         intervalo = self._settings.maintenance_interval_seconds
         if intervalo <= 0:
@@ -421,6 +636,9 @@ class Orchestrator:
                     informe = self.run_maintenance()
                     if informe.changed:
                         self._publish("maintenance_done", str(informe))
+                    # Una linea con lo que ha pasado por el receptor desde el
+                    # arranque. Sustituye a una linea por mensaje.
+                    self._resumen_live()
             except asyncio.CancelledError:
                 raise
 

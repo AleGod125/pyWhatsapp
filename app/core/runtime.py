@@ -42,7 +42,8 @@ from app.core.config import Settings, load_settings
 from app.core.database import Database
 from app.core.identity import own_identity, own_jid, session_fingerprint
 from app.core.lock import SessionLock, SessionLockedError
-from app.core.logging_setup import get_logger, setup_logging
+from app.core.logging_setup import RateLimitedLogger, get_logger, setup_logging
+from app.core.retry_tracker import RetryTracker
 from app.core.pairing import PairingManager
 from app.core.session_state import AppState, NEEDS_PAIRING, SessionState
 from app.events import EventBus
@@ -89,10 +90,36 @@ class AppRuntime:
         self.backfill: Any = None
         self.gate: Any = None
         self.sync_job: Any = None
+        # Cuentas y Google. Se construyen cuando hay base de datos: sin ella
+        # no hay donde guardar sesiones ni credenciales.
+        self.auth: Any = None
+        self.google: Any = None
+        # Quien es el dueno de la vinculacion de WhatsApp de este equipo.
+        self.whatsapp_accounts: Any = None
+        # Almacenamiento del contenido pesado (segmentos y multimedia).
+        self.storage: Any = None
+        self.storage_worker: Any = None
+        self._live_service: Any = None
+        #: Recoge anclas de historial de todas las fuentes.
+        self.seed_collector: Any = None
+
+        # DE QUIEN es la sesion de WhatsApp que sostiene este proceso.
+        #
+        # En esta fase el runtime sostiene UNA. Sin dueno explicito, el
+        # segundo usuario que entrara veria los chats del primero: la sesion
+        # en disco no sabe de quien es.
+        self.runtime_owner_user_id: Any = None
+        self.runtime_owner_account_id: Any = None
         # Vigila la aparicion de la PRIMERA ancla de un chat que no la tenia.
         self.seed_recovery: Any = None
         # Y excava el chat que acaba de despertar, solo a el.
         self.seed_queue: Any = None
+        # Vigila las condiciones y dispara sondeo, aplicacion y encolado de la
+        # via Web cuando se dan. Se construye al conectar, cuando ya hay un
+        # bucle donde vigilar; aqui solo se declara para que exista siempre --
+        # `_wire_workers` lo consulta, y un runtime sin sesion tambien pasa por
+        # ahi.
+        self.auto_recovery: Any = None
         # Ciclo de vida del QR. Se crea siempre, aunque la instancia arranque
         # en modo solo lectura: asi ``/session/qr`` responde "no disponible"
         # en vez de reventar.
@@ -163,6 +190,14 @@ class AppRuntime:
         # Acotado: un fallo antiguo no interesa y retenerlos todos seria una
         # fuga de memoria en una sesion larga.
         self._decrypt_pendientes: dict[str, str] = {}
+        # El recorrido completo de cada mensaje que no cuadro:
+        # original_failed -> retry_sent -> retry_received -> retry_success.
+        # Sin esto, "8 fallos" no distingue entre ocho mensajes que acabaron
+        # entrando y ocho que faltan.
+        self.retry_tracker = RetryTracker()
+        # Los avisos de Signal se agrupan por motivo. El primero se ve
+        # siempre; los repetidos se cuentan y se resumen por ventana.
+        self._avisos_signal = RateLimitedLogger(log, ventana=60.0)
         # Estado del ciclo de sincronizacion. WATCHING = conectado y a la
         # espera de cambios; es el estado NORMAL, no el final de nada.
         self.sync_state = "IDLE"
@@ -184,6 +219,79 @@ class AppRuntime:
     @property
     def fingerprint(self) -> str | None:
         return session_fingerprint(self.settings)
+
+    def storage_para(self, user_id: Any) -> Any:
+        """El almacenamiento de UN usuario, con SUS credenciales.
+
+        Se construye por peticion: no existe un cliente global capaz de
+        escribir en el Drive de cualquiera.
+        """
+        from app.storage.drive.client import DriveClient
+        from app.storage.drive.service import DriveBackupStorage
+        from app.storage.interface import StorageAuthError
+
+        if self.google is None:
+            raise StorageAuthError("Google no esta configurado.")
+        token = self.google.access_token(user_id)
+        if not token:
+            raise StorageAuthError(
+                "Google Drive necesita reconectarse: el acceso ya no es valido."
+            )
+        return DriveBackupStorage(
+            user_id=user_id, client=DriveClient(token), database=self.database
+        )
+
+    # -- Vinculacion con dueno ----------------------------------------------
+
+    def es_mia_la_sesion(self, user_id: Any) -> bool:
+        """Si ese usuario puede ver y usar la sesion de este proceso.
+
+        Sin dueno todavia, cualquiera autenticado puede reclamarla. Con dueno,
+        solo el.
+        """
+        if self.runtime_owner_user_id is None:
+            return True
+        return self.runtime_owner_user_id == user_id
+
+    def iniciar_vinculacion(self, user_id: Any, account_id: Any) -> None:
+        """Arranca el pairing PARA ese usuario. Unica via de generar un QR.
+
+        Antes de llamar aqui, quien lo haga tiene que haber comprobado que el
+        usuario esta autenticado y tiene Drive. Este metodo no valida
+        credenciales: fija la propiedad y arranca.
+        """
+        self.runtime_owner_user_id = user_id
+        self.runtime_owner_account_id = account_id
+        self._propagar_dueno()
+        self.arrancar_almacenamiento()
+
+        if self.state.state is AppState.CONNECTED:
+            return
+        self.state.set(AppState.PAIRING, reason="vinculacion solicitada")
+        self.pairing.start_watchdog()
+        # El cliente se arranca una sola vez. La marca real es su hilo: pedir
+        # la vinculacion dos veces (recargar la pagina) no puede reventar.
+        if self.client is not None and getattr(self.client, "_thread", None) is None:
+            self.client.start()
+        log.info("Vinculacion iniciada a peticion de un usuario autenticado")
+
+    def arrancar_almacenamiento(self) -> None:
+        """Pone en marcha el trabajador de subidas. Idempotente."""
+        if self.storage is None or self.storage_worker is not None:
+            return
+        if not self.storage.habilitado:
+            return
+        from app.storage.worker import DriveStorageWorker
+
+        self.storage_worker = DriveStorageWorker(
+            database=self.database,
+            settings=self.settings,
+            storage_service=self.storage,
+            google_service=self.google,
+            publish=self.bus.publish if getattr(self, "bus", None) else None,
+            runtime=self,
+        )
+        self.storage_worker.start()
 
     @property
     def rechazos_seguidos(self) -> int:
@@ -221,8 +329,46 @@ class AppRuntime:
             # sesion un instante despues. Quien sabe en que modo esta es
             # ``start()``, y lo dice el.
             log.info("PostgreSQL listo")
+        self._montar_cuentas()
         self._started = True
         return self
+
+    def _montar_cuentas(self) -> None:
+        """Cuentas y Google. Van con la base, no con la sesion de WhatsApp.
+
+        Tambien en ``--local``: poder entrar y ver la copia no depende de que
+        el companion este conectado.
+        """
+        if self.database is None or self.auth is not None:
+            return
+        from app.auth.google_service import GoogleService
+        from app.auth.service import AuthService
+
+        from app.auth.whatsapp_accounts import WhatsAppAccountService
+
+        self.auth = AuthService(self.database, self.settings)
+        self.google = GoogleService(self.database, self.settings)
+        self.whatsapp_accounts = WhatsAppAccountService(self.database, self.settings)
+
+        from app.storage.service import StorageService
+
+        self.storage = StorageService(self.database, self.settings)
+
+        from app.history.seed_collector import RecentSeedCollector
+
+        # Observa anclas; NO pide historial. Eso lo sigue haciendo el motor de
+        # siempre, al que solo se le entrega trabajo.
+        self.seed_collector = RecentSeedCollector(self.database)
+
+        from app.web_companion import WebCompanionSupervisor
+
+        # Dispositivo vinculado APARTE, con su propia sesion, solo para medir.
+        # Se construye siempre —asi el panel puede preguntar y recibir
+        # "disabled"— pero no arranca nada hasta que se le diga.
+        self.web_companion = WebCompanionSupervisor(self.settings)
+        # Para que pueda preguntar si la conexion principal esta lista antes
+        # de arrancarse solo. La sesion principal manda.
+        self.web_companion.runtime = self
 
     def start(self, *, connect: bool = True) -> "AppRuntime":
         """Arranque completo: base, compatibilidades, sesion y trabajos.
@@ -260,15 +406,149 @@ class AppRuntime:
 
         if connect:
             self._marcar_estado_inicial()
-            # AUTO-PAIRING: si hace falta vincular, se dice ya, sin esperar a
-            # que nadie pulse nada. El QR llegara por el canal normal y el
-            # vigilante se encargara de renovarlo.
-            if self.needs_pairing():
-                log.info("Se requiere vinculacion: iniciando automaticamente")
-                self.state.set(AppState.PAIRING, reason="vinculacion automatica")
-                self.pairing.start_watchdog()
-            self.client.start()
+
+            if self.session_exists:
+                # Hay una vinculacion guardada: se retoma. El dueno se
+                # recupera de la base, no se inventa.
+                self._recuperar_dueno()
+                self.client.start()
+            else:
+                # SIN sesion NO se vincula solo.
+                #
+                # Antes se generaba un QR nada mas arrancar. En multiusuario
+                # eso crea una vinculacion sin dueno: el primero que pase por
+                # delante del navegador —o el segundo usuario que entre— se
+                # queda con la cuenta de WhatsApp de otro. Y el QR ya estaba
+                # hecho antes de que existiera ningun usuario.
+                #
+                # Ahora se espera a que alguien AUTENTICADO lo pida para SU
+                # cuenta. Que el servicio arranque asi no es un error: es el
+                # estado normal de una instalacion nueva.
+                log.info(
+                    "Sin vinculacion guardada. Esperando a que un usuario "
+                    "autenticado la solicite; no se genera ningun codigo QR."
+                )
         return self
+
+    def _observar_ancla(self, mensaje: Any, fuente: str) -> None:
+        """Le pasa el mensaje al colector de anclas. Nunca lanza.
+
+        Buscar una referencia de historial no puede impedir que un mensaje se
+        guarde: el mensaje es el producto, el ancla es una mejora.
+        """
+        colector = getattr(self, "seed_collector", None)
+        if colector is None or not colector.listo:
+            return
+        try:
+            from app.history.seed_collector import desde_mensaje_vivo
+
+            candidato = desde_mensaje_vivo(mensaje, source=fuente)
+            if candidato is not None:
+                colector.observe(candidato)
+        except Exception:  # noqa: BLE001
+            log.debug("No se pudo observar el mensaje como ancla")
+
+    def _propagar_dueno(self) -> None:
+        """Lleva la cuenta a las piezas que ya estaban construidas.
+
+        El servicio de mensajes en vivo puede existir antes de que se sepa
+        quien es el dueno —el pairing llega despues—, y sin esto los chats que
+        creara quedarian sin cuenta.
+        """
+        vivo = getattr(self, "_live_service", None)
+        if vivo is not None:
+            vivo.whatsapp_account_id = self.runtime_owner_account_id
+
+        colector = getattr(self, "seed_collector", None)
+        if colector is not None:
+            colector.user_id = self.runtime_owner_user_id
+            colector.account_id = self.runtime_owner_account_id
+            colector._seed_queue = self.seed_queue
+
+    def _persistir_vinculacion(self) -> None:
+        """Deja constancia de que ESTE usuario ya tiene WhatsApp vinculado.
+
+        Es el puente que faltaba: el runtime llegaba a CONNECTED, el historial
+        entraba y la base seguia diciendo ``never_linked``, asi que el
+        onboarding respondia "toca vincular" con la sesion ya funcionando.
+
+        Idempotente: CONNECTED llega tambien en cada reconexion. ``linked_at``
+        se conserva —es cuando se vinculo, no cuando se reconecto— y solo se
+        refresca ``last_connected_at``.
+        """
+        cuentas = getattr(self, "whatsapp_accounts", None)
+        if cuentas is None:
+            return
+
+        dueno = self.runtime_owner_user_id
+        if dueno is None:
+            # Sesion en disco sin dueno registrado. NO se adjudica a nadie:
+            # entregarle a un usuario la vinculacion de otro es exactamente lo
+            # que el modelo de propiedad evita. Se dice y se deja como esta.
+            log.warning(
+                "Sesion conectada sin dueno registrado. NO se asigna a ningun "
+                "usuario; hara falta vincularla desde una cuenta."
+            )
+            return
+
+        pn, lid = self._identificadores_propios()
+        try:
+            cuentas.marcar_vinculada(dueno, pn=pn, lid=lid)
+        except Exception:  # noqa: BLE001 - no poder anotarlo no tira la sesion
+            log.exception("No se pudo anotar la vinculacion en la base")
+            return
+        log.info("[AUTH] Cuenta de WhatsApp marcada como vinculada")
+
+    def _marcar_desconectada(self) -> None:
+        """El socket cayo. NO es una desvinculacion."""
+        cuentas = getattr(self, "whatsapp_accounts", None)
+        if cuentas is None or self.runtime_owner_user_id is None:
+            return
+        try:
+            cuentas.marcar_estado(self.runtime_owner_user_id, "disconnected")
+        except Exception:  # noqa: BLE001
+            log.debug("No se pudo anotar la desconexion")
+
+    def _identificadores_propios(self) -> tuple[str | None, str | None]:
+        """PN y LID del dispositivo, si ya se conocen.
+
+        Pueden no estar todavia, y no se espera a ellos: la vinculacion
+        depende de que el companion este conectado, no de que estos dos
+        identificadores esten resueltos.
+        """
+        try:
+            from app.core.identity import own_identity
+
+            return own_identity(self.settings)
+        except Exception:  # noqa: BLE001
+            return None, None
+
+    def _recuperar_dueno(self) -> None:
+        """Quien era el dueno de la sesion que hay en disco.
+
+        Se lee de la base. Si no consta, la sesion se deja parada en vez de
+        adjudicarsela a alguien: entregarle a un usuario la vinculacion de
+        otro es exactamente lo que este cambio evita.
+        """
+        if self.whatsapp_accounts is None:
+            return
+        try:
+            dueno = self.whatsapp_accounts.dueno_de_la_sesion_en_disco()
+        except Exception:  # noqa: BLE001 - no poder leerlo no tumba el arranque
+            log.debug("No se pudo leer el dueno de la sesion")
+            return
+        if dueno is None:
+            log.warning(
+                "Hay una sesion en disco sin dueno registrado. No se asigna a "
+                "nadie: tendra que vincularse de nuevo desde una cuenta."
+            )
+            return
+        self.runtime_owner_user_id = dueno
+        cuenta = self.whatsapp_accounts.cuenta_de(dueno)
+        if cuenta is not None:
+            self.runtime_owner_account_id = cuenta.id
+        self._propagar_dueno()
+        self.arrancar_almacenamiento()
 
     def _marcar_estado_inicial(self) -> None:
         if self.session_exists:
@@ -332,6 +612,13 @@ class AppRuntime:
         elif nombre == "session_valid":
             self._reiniciar_freno()
             self.pairing.note_linked()
+            # Se PERSISTE antes de anunciar el estado.
+            #
+            # El orden importa: ``state.set`` publica el evento, el frontend
+            # lo recibe y consulta el onboarding al instante. Si la base
+            # todavia dijera "sin vincular", esa consulta lo mandaria de
+            # vuelta a la pantalla del codigo QR con la sesion ya conectada.
+            self._persistir_vinculacion()
             self.state.set(AppState.CONNECTED, reason="<success> del servidor")
         elif nombre == "logged_out":
             self._sesion_rechazada(carga)
@@ -362,6 +649,7 @@ class AppRuntime:
             )
             self.set_sync_state("RECONNECTING")
         elif nombre == "reconnected":
+            self._persistir_vinculacion()
             self.state.set(AppState.CONNECTED, reason="reconectado")
             self.set_sync_state("WATCHING")
         elif nombre == "disconnected":
@@ -369,6 +657,11 @@ class AppRuntime:
             # vuelve a procesar todo. Se distingue de SESSION_INVALID, que si
             # es terminal.
             if self.state.state is AppState.CONNECTED:
+                # Se anota que el socket cayo, pero la cuenta SIGUE vinculada:
+                # "vinculado" es una propiedad de la cuenta, no del socket. Si
+                # cada corte de red desvinculara, el usuario acabaria en la
+                # pantalla del codigo QR cada vez que se va el wifi.
+                self._marcar_desconectada()
                 self.state.set(AppState.DISCONNECTED, reason="conexion perdida")
         elif nombre == "decrypt_error":
             # Se CUENTAN, no se tocan. "mac check failed", "no sender-key" y
@@ -376,12 +669,9 @@ class AppRuntime:
             # y del reintento por receipt que ya existe; mezclarlos con el
             # pipeline de mensajes solo enturbiaria ambos. Aqui solo se deja
             # constancia para poder medirlos.
+            # Un solo aviso, agrupado, dentro de _anotar_fallo_descifrado.
+            # Antes se escribian dos lineas por cada fallo.
             self._anotar_fallo_descifrado(carga, event)
-            log.warning(
-                "Mensaje no descifrado (%d en esta sesion); el reintento por "
-                "receipt sigue su curso",
-                self.decrypt_errors,
-            )
         elif nombre in ("client_error", "client_stopped"):
             self._fin_del_cliente(carga)
 
@@ -738,6 +1028,16 @@ class AppRuntime:
 
         propio = self.own_jid
 
+        # -- Seguimiento de los acuses de reintento --
+        # Solo observa la salida del acuse para anotar 'retry_sent'. Sin esto,
+        # un fallo de descifrado no se puede distinguir de un mensaje perdido.
+        try:
+            from app.compat import retry_observer
+
+            retry_observer.apply(self.retry_tracker)
+        except Exception:  # noqa: BLE001 - observar no puede impedir el arranque
+            log.debug("No se pudo seguir los acuses de reintento")
+
         # -- History Sync: persistir cada blob en cuanto llega --
         self._wire_history_ingestion(propio)
 
@@ -749,16 +1049,34 @@ class AppRuntime:
         # para uno mismo, que SI va al chat personal) de un mensaje
         # saliente dirigido a otra persona.
         vivo = LiveMessageService(
-            self.database, own_jid=propio, own_lid=own_identity(self.settings)[1]
+            self.database,
+            own_jid=propio,
+            own_lid=own_identity(self.settings)[1],
+            whatsapp_account_id=self.runtime_owner_account_id,
         )
+        # Puede que el dueno todavia no se conozca al construirlo (el pairing
+        # llega despues). Se guarda para actualizarlo cuando se sepa.
+        self._live_service = vivo
 
         def recibir(mensaje: Any) -> Any:
             self.bump("receiver_messages_seen")
             self.bump("live_handle_called")
             identificador = getattr(mensaje, "id", None)
-            log.info("[LIVE] ingress id=%s", identificador)
-            # Si este mensaje habia fallado antes, el reintento lo salvo.
-            self._marcar_recuperado(identificador)
+            # DEBUG: una linea por mensaje llena la consola en cuanto hay
+            # trafico. El resumen periodico va en INFO.
+            log.debug("[LIVE] ingress id=%s", identificador)
+            # Si este mensaje habia fallado antes, el reintento lo salvo. Se
+            # distingue a proposito: un mensaje recuperado por reenvio es
+            # justo el que puede ser la PRIMERA ancla de su conversacion, y
+            # saber por donde entro es lo que permite comprobarlo despues.
+            recuperado = self._marcar_recuperado(identificador)
+
+            # Todo mensaje descifrado y AUTENTICADO pasa por el colector de
+            # anclas: es lo que permite que una conversacion sin historial
+            # despierte sola, sin que nadie pulse nada. Uno que no supero su
+            # verificacion no llega hasta aqui, y por eso no es fuente de
+            # nada.
+            self._observar_ancla(mensaje, "retry_resend" if recuperado else "live")
 
             resultado = vivo.handle(mensaje)
             if resultado is None:
@@ -810,6 +1128,10 @@ class AppRuntime:
 
         # -- Backfill historico --
         self.backfill = BackfillService(self.settings, self.database)
+        # Que la pantalla se entere de los cambios de estado sin recargar.
+        self.backfill.publish = self.bus.publish
+        if self.seed_collector is not None:
+            self.seed_collector.publish = self.bus.publish
         pn, lid = own_identity(self.settings)
         self.backfill.set_own_identity(pn, lid)
         log.info("Identidad propia: pn=%s lid=%s", bool(pn), bool(lid))
@@ -833,6 +1155,17 @@ class AppRuntime:
                 self.backfill,
                 lambda: getattr(cliente, "_loop", None),
             )
+            # Para poder avisar de que la recuperacion se paro o continuo. El
+            # panel no puede adivinar que el telefono se durmio.
+            self.seed_queue.publish = self.bus.publish
+
+        if self.auto_recovery is None:
+            from app.services.auto_recovery import AutoRecovery
+
+            # Vigila las condiciones y dispara sondeo, aplicacion y encolado
+            # cuando se dan. No es un camino nuevo: llama a las mismas piezas
+            # que los botones.
+            self.auto_recovery = AutoRecovery(self)
 
         if self.sync_job is None:
             from app.services.sync_job import SyncJob
@@ -847,6 +1180,13 @@ class AppRuntime:
         )
         self.orchestrator.backfill = self.backfill
         self.orchestrator.gate = self.gate
+        # El orquestador necesita llegar al runtime para arrancar el segundo
+        # dispositivo y el vigilante de recuperacion.
+        self.orchestrator._runtime = self
+        # Para la linea de resumen del arranque: waiting/exhausted/
+        # timeout/pending en una sola linea, leida de la base.
+        self.orchestrator.seed_collector = self.seed_collector
+        self.orchestrator._live_summary = self.resumen_live
         # El orquestador avisa del estado del ciclo sin conocer al runtime.
         self.orchestrator._set_sync_state = self.set_sync_state
         # Los chats que la reconciliacion despierte se excavan enseguida, no
@@ -878,10 +1218,37 @@ class AppRuntime:
                 self.gate.note_history_sync(full.sync_type)
             if self.backfill is not None:
                 self.backfill.notify_history(full)
+
+            # Durante una prueba de diagnostico los blobs ON_DEMAND se
+            # observan y no se guardan: la prueba tiene que poder repetirse
+            # sin cambiar la base. El blob ya quedo archivado en
+            # ``data/history/``, asi que no se pierde nada y se puede ingerir
+            # despues con 'py scripts/ingest_blobs.py'.
+            #
+            # Solo los ON_DEMAND: un INITIAL_BOOTSTRAP que llegue a la vez se
+            # guarda como siempre.
+            if (
+                self.backfill is not None
+                and getattr(self.backfill, "diagnostico_sin_persistir", False)
+                and getattr(full, "sync_type", None) == "ON_DEMAND"
+            ):
+                sync_log.info(
+                    "[ON_DEMAND_TEST] blob observado y NO persistido "
+                    "(conversaciones=%d mensajes=%d, archivado=%s)",
+                    len(getattr(full, "conversations", ()) or ()),
+                    full.message_count,
+                    full.blob_path.name if full.blob_path else "no",
+                )
+                return
+
             try:
                 with database.transaction() as session:
                     resultado = ingest_history_sync(
-                        session, full, own_jid=own_jid_value, signal_db=signal_db
+                        session,
+                        full,
+                        own_jid=own_jid_value,
+                        signal_db=signal_db,
+                        whatsapp_account_id=self.runtime_owner_account_id,
                     )
             except Exception as exc:  # noqa: BLE001 - el blob ya esta en disco
                 sync_log.exception("Fallo al persistir el History Sync: %s", exc)
@@ -903,6 +1270,11 @@ class AppRuntime:
                             len(getattr(c, "messages", ()) or ())
                             for c in getattr(full, "conversations", ())
                         ),
+                        # Y los identificadores del bloque. Un mensaje que ya
+                        # estaba no suma a `messages_inserted`, asi que sin
+                        # esto no habria forma de saber que el bloque ya
+                        # alcanzo lo que se tenia.
+                        _wamids_del_blob(full),
                     )
                 except Exception:  # noqa: BLE001 - contabilizar no puede cortar
                     sync_log.debug("No se pudo anotar el conteo del blob")
@@ -910,8 +1282,20 @@ class AppRuntime:
             # Un History Sync puede traer el PRIMER mensaje de un chat que
             # estaba sin ancla. Ese mensaje la crea, y el chat pasa a poder
             # excavarse sin esperar a ningun reinicio.
-            self._sembrar([c.jid for c in getattr(full, "conversations", [])])
-            self.bus.publish("history_ingested", str(resultado))
+            afectados = [c.jid for c in getattr(full, "conversations", [])]
+            self._sembrar(afectados)
+            # Antes esto viajaba como una cadena suelta y la pantalla no podia
+            # hacer nada con ella: sabia que "algo" habia entrado, pero no
+            # donde. Un chat abierto se quedaba vacio hasta recargar.
+            self.bus.publish(
+                "history_ingested",
+                {
+                    "summary": str(resultado),
+                    "chat_jids": afectados,
+                    "messages": int(getattr(resultado, "messages_inserted", 0) or 0),
+                    "sync_type": getattr(full, "sync_type", None),
+                },
+            )
 
         history_compat.set_callback(ingest)
 
@@ -930,6 +1314,10 @@ class AppRuntime:
         """
         self.decrypt_errors += 1
         self.bump("receiver_decrypt_errors")
+        # Y aparte si era MIA: es la pregunta del usuario, y mezclarla con el
+        # trafico general la deja sin respuesta.
+        if self._origen_del_fallo(event) != "peer":
+            self.bump("own_decrypt_failed")
 
         extras = getattr(event, "extra", {}) or {}
         argumentos = extras.get("args") or []
@@ -942,6 +1330,7 @@ class AppRuntime:
         elif "no session" in bajo:
             self.bump("no_session")
 
+        intentos = 1
         if wamid:
             clave = str(wamid)
             if clave not in self._decrypt_pendientes:
@@ -949,21 +1338,96 @@ class AppRuntime:
             self._decrypt_pendientes[clave] = motivo[:120]
             if len(self._decrypt_pendientes) > self.MAX_DECRYPT_PENDIENTES:
                 self._decrypt_pendientes.pop(next(iter(self._decrypt_pendientes)))
-        log.warning(
-            "[LIVE] decrypt failed id=%s motivo=%s (%d en esta sesion); "
-            "el reintento por receipt sigue su curso",
-            wamid, motivo[:60] or "?", self.decrypt_errors,
+            intento = self.retry_tracker.fallo(
+                clave, motivo, origen=self._origen_del_fallo(event)
+            )
+            intentos = intento.intentos if intento else 1
+
+        # Se agrupan por MOTIVO: cien fallos iguales son un problema que
+        # ocurre cien veces, no cien problemas. El primero se ve siempre.
+        self._avisos_signal.warning(
+            f"decrypt:{motivo[:40]}",
+            "[LIVE] mensaje no descifrado (motivo=%s, intento=%d, %d en esta "
+            "sesion); el reintento por receipt sigue su curso",
+            motivo[:60] or "?",
+            intentos,
+            self.decrypt_errors,
         )
 
-    def _marcar_recuperado(self, wamid: Any) -> None:
-        """El reintento funciono: ese mensaje ya no esta perdido."""
+    def _marcar_recuperado(self, wamid: Any) -> bool:
+        """El reintento funciono: ese mensaje ya no esta perdido.
+
+        Devuelve ``True`` si ESTE mensaje habia fallado antes, para poder
+        atribuirle su procedencia real en el resto del camino.
+        """
         if not wamid:
-            return
+            return False
         clave = str(wamid)
-        if self._decrypt_pendientes.pop(clave, None) is not None:
-            self.bump("decrypt_recovered")
-            self.bump("decrypt_unrecovered", -1)
-            log.info("[LIVE] decrypt recovered id=%s (tras reintento)", clave)
+        if self._decrypt_pendientes.pop(clave, None) is None:
+            return False
+        self.bump("decrypt_recovered")
+        self.bump("decrypt_unrecovered", -1)
+        # El recorrido termina bien: retry_success. Lo persiste el camino
+        # normal, una sola vez; aqui solo se deja constancia de que llego.
+        self.retry_tracker.recuperado(clave)
+        return True
+
+    def resumen_live(self) -> str:
+        """Una linea con lo que ha pasado por el receptor.
+
+        Es lo que sustituye a una linea por mensaje: con trafico de verdad,
+        aquello enterraba todo lo demas y aun asi no respondia a la pregunta
+        util, que es cuantos faltan.
+        """
+        c = self.counters
+        seguimiento = self.retry_tracker.resumen()
+        recibidos = int(c.get("receiver_messages_seen", 0) or 0)
+        propios = int(c.get("live_outgoing_seen", 0) or 0)
+        entrantes = int(c.get("live_incoming_seen", 0) or 0)
+        fallos = int(self.decrypt_errors or 0)
+        return (
+            f"recibidos={recibidos} propios={propios} entrantes={entrantes} "
+            f"descifrados_ok={max(0, recibidos - fallos)} "
+            f"reintentos={seguimiento.get('retry_sent', 0)} "
+            f"recuperados={seguimiento.get('retry_success', 0)} "
+            f"sin_resolver={seguimiento.get('sin_resolver', 0)}"
+        )
+
+    def resumen_propios(self) -> str:
+        """Lo que ha pasado con MIS mensajes, los que envio desde el telefono.
+
+        Aparte del resumen general a proposito: la pregunta «¿aparece en la app
+        lo que acabo de enviar desde el movil?» no se contesta con un contador
+        de todo el trafico. Aqui van solo las copias propias, y sobre todo
+        cuantas FALTAN.
+        """
+        c = self.counters
+        seguimiento = self.retry_tracker.resumen()
+        propios = int(c.get("live_outgoing_seen", 0) or 0)
+        fallidos = int(c.get("own_decrypt_failed", 0) or 0)
+        recuperados = int(seguimiento.get("retry_success", 0) or 0)
+        return (
+            f"[OWN_LIVE] recibidos={propios} "
+            f"descifrados_ok={max(0, propios - fallidos)} "
+            f"fallidos={fallidos} "
+            f"acuses={seguimiento.get('retry_sent', 0)} "
+            f"recuperados={recuperados} "
+            f"faltan={max(0, fallidos - recuperados)}"
+        )
+
+    @staticmethod
+    def _origen_del_fallo(event: Any) -> str:
+        """De cual de mis dispositivos venia lo que no cuadro, si es mio.
+
+        Lo dice el ultimo mensaje propio observado por el diagnostico, que ya
+        clasifica por DISPOSITIVO y no solo por identificador de cuenta.
+        """
+        try:
+            from app.compat import lid_diagnostics
+
+            return lid_diagnostics.ultimo_origen() or "peer"
+        except Exception:  # noqa: BLE001
+            return "peer"
 
     def bump(self, nombre: str, cantidad: int = 1) -> None:
         """Sube un contador de etapa. Nunca lanza."""
@@ -1101,6 +1565,19 @@ class AppRuntime:
             return
         self._stopping.set()
 
+        # El worker de Node primero: lleva un Chromium detras y conviene
+        # darle ocasion de cerrarlo antes de que se caiga todo lo demas.
+        vigilante = getattr(self, "auto_recovery", None)
+        if vigilante is not None:
+            vigilante.stop()
+
+        companion = getattr(self, "web_companion", None)
+        if companion is not None:
+            try:
+                companion.stop()
+            except Exception:  # noqa: BLE001 - cerrar no puede fallar hacia fuera
+                log.debug("Fallo cerrando el Web Companion")
+
         self.pairing.stop()
         if self.client is not None:
             try:
@@ -1162,3 +1639,19 @@ __all__ = [
     "build_service_app",
     "build_service_runtime",
 ]
+
+
+def _wamids_del_blob(full: Any) -> list[str]:
+    """Los identificadores que traia un History Sync, sin nada mas.
+
+    Solo identificadores: ni texto, ni remitentes, ni marcas. Sirven para
+    saber si un bloque ya alcanzo lo que habia guardado.
+    """
+    salida: list[str] = []
+    for conversacion in getattr(full, "conversations", ()) or ():
+        for mensaje in getattr(conversacion, "messages", ()) or ():
+            clave = getattr(mensaje, "key", None) or getattr(mensaje, "message", None)
+            wamid = getattr(clave, "id", None) if clave is not None else None
+            if isinstance(wamid, str) and wamid:
+                salida.append(wamid)
+    return salida

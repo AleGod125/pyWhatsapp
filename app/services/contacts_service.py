@@ -61,7 +61,10 @@ class ContactService:
         with self._database.transaction() as session:
             repo.upsert_contact(session, jid=jid, display_name=display)
         self.resolved += 1
-        log.info("Contacto resuelto: %s", display)
+        # El NOMBRE de un contacto no va a INFO: es un dato personal y ademas
+        # una linea por contacto llena la consola. El resumen lo publica
+        # ``resumen()`` con la cuenta, sin nombres.
+        log.debug("Contacto resuelto")
         return {"jid": jid, "name": display}
 
     def handle_pushname(self, event: Any) -> dict[str, Any] | None:
@@ -189,3 +192,8 @@ def _jid(value: Any) -> str | None:
     if not user:
         return None
     return f"{user}@{server}" if server else str(user)
+
+
+    def resumen(self) -> str:
+        """Una linea con lo hecho. Sin nombres ni telefonos."""
+        return f"Contactos actualizados: {self.resolved}"

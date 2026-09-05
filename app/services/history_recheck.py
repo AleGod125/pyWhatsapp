@@ -46,8 +46,8 @@ from typing import Any
 from sqlalchemy import select, update
 
 from app.core.logging_setup import get_logger
-from app.models import Chat, ChatHistoryState, Contact
-from app.services import repository as repo
+from app.models import Chat, ChatHistoryState
+from app.history.cursor import persist_cursor
 from app.services.seed_recovery import DESPIERTAN
 
 log = get_logger("BACKFILL")
@@ -88,39 +88,25 @@ class RecheckResult:
 class HistoryRecheck:
     """Revisa un chat concreto a peticion del usuario."""
 
-    def __init__(self, database: Any, settings: Any) -> None:
+    def __init__(
+        self, database: Any, settings: Any, whatsapp_account_id: Any = None
+    ) -> None:
         self._database = database
         self._settings = settings
+        self._cuenta_id = whatsapp_account_id
 
     # -- 1. Alias ------------------------------------------------------------
 
     def aliases_de(self, session, chat_jid: str) -> list[str]:
         """Todos los identificadores conocidos del mismo contacto.
 
-        No se deduce ninguno: se leen de ``contacts``, que ``lid_bridge``
-        rellena desde el ``lid_map`` que pywhats va aprendiendo. Un telefono y
-        un LID no son convertibles el uno en el otro.
+        Delega en :func:`app.history.cursor.aliases_de`: la resolucion de
+        alias tiene que ser la misma aqui y en el motor, o el boton diria que
+        hay ancla y la excavacion no la encontraria.
         """
-        encontrados = {chat_jid}
-        usuario = chat_jid.split("@")[0].split(":")[0].split(".")[0]
-        servidor = chat_jid.partition("@")[2]
+        from app.history.cursor import aliases_de
 
-        if servidor == "lid":
-            for jid in session.execute(
-                select(Contact.jid).where(
-                    Contact.lid.in_([chat_jid, usuario])
-                )
-            ).scalars():
-                if jid:
-                    encontrados.add(jid)
-        elif servidor == "s.whatsapp.net":
-            for lid in session.execute(
-                select(Contact.lid).where(Contact.jid == chat_jid)
-            ).scalars():
-                if lid:
-                    encontrados.add(lid if "@" in lid else f"{lid}@lid")
-
-        return sorted(encontrados)
+        return aliases_de(session, chat_jid)
 
     # -- 3. Blobs ya guardados ----------------------------------------------
 
@@ -161,6 +147,11 @@ class HistoryRecheck:
                     sync,
                     own_jid=self._own_jid(),
                     signal_db=getattr(self._settings, "signal_store_file", None),
+                    # De quien son los chats que salgan de reinterpretar los
+                    # blobs. Sin esto quedarian sin dueno y el filtro de
+                    # propiedad los dejaria invisibles: existirian en la base
+                    # y no los veria nadie.
+                    whatsapp_account_id=self._cuenta_id,
                 )
                 recuperados += getattr(resultado, "messages_inserted", 0)
             except Exception:  # noqa: BLE001
@@ -204,7 +195,7 @@ class HistoryRecheck:
             )
 
             # 2. Ancla entre lo que ya tenemos.
-            cursor = self._buscar_cursor(session, aliases)
+            cursor = self._buscar_cursor(session, chat_jid)
 
             # 3. Solo si no hay ancla se vuelven a leer los blobs: reprocesar
             #    115 archivos no es gratis y no aporta nada si ya se puede
@@ -217,7 +208,7 @@ class HistoryRecheck:
                 resultado.mensajes_recuperados = recuperados
                 if recuperados:
                     session.flush()
-                    cursor = self._buscar_cursor(session, aliases)
+                    cursor = self._buscar_cursor(session, chat_jid)
 
             # 4. Con ancla, el chat vuelve a la cola de excavacion.
             if cursor is not None:
@@ -225,14 +216,17 @@ class HistoryRecheck:
                 resultado.cursor_id = cursor.message_id
                 resultado.cursor_timestamp = cursor.timestamp
                 if estado_anterior in DESPIERTAN or estado_anterior is None:
+                    # El cursor primero, el estado despues: es el mismo
+                    # orden que en el resto del sistema.
+                    persist_cursor(session, chat_jid, cursor)
                     session.execute(
                         update(ChatHistoryState)
                         .where(ChatHistoryState.chat_jid == chat_jid)
                         .values(
                             history_status="pending",
-                            oldest_message_id=cursor.message_id,
-                            oldest_message_timestamp=cursor.timestamp,
                             consecutive_no_progress=0,
+                            attempt_count=0,
+                            next_retry_at=None,
                         )
                     )
                     resultado.estado = "pending"
@@ -260,16 +254,15 @@ class HistoryRecheck:
 
             return resultado
 
-    def _buscar_cursor(self, session, aliases: list[str]) -> Any:
-        """El ancla mas antigua entre TODOS los alias del contacto."""
-        mejor = None
-        for alias in aliases:
-            cursor = repo.get_oldest_valid_history_cursor(session, alias)
-            if cursor is None:
-                continue
-            if mejor is None or cursor.timestamp < mejor.timestamp:
-                mejor = cursor
-        return mejor
+    def _buscar_cursor(self, session, chat_jid: str) -> Any:
+        """El ancla mas antigua del contacto, con LA definicion de siempre.
+
+        Los alias los resuelve la funcion central; aqui se le pasa el JID del
+        chat, que es el que ademas permite mirar su catalogo de semillas.
+        """
+        from app.history.cursor import get_valid_history_cursor
+
+        return get_valid_history_cursor(session, chat_jid=chat_jid)
 
 
 def _corto(jid: str) -> str:

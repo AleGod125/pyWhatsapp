@@ -123,5 +123,5 @@ def apply(*, timeout: float = 20.0) -> bool:
     setattr(run, _MARKER, True)
     Pairer.run = run  # type: ignore[method-assign]
 
-    log.info("Adaptacion de espera del restart 515 aplicada (timeout=%.0fs)", timeout)
+    log.debug("Adaptacion de espera del restart 515 aplicada (timeout=%.0fs)", timeout)
     return True

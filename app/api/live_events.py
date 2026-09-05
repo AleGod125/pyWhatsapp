@@ -93,6 +93,12 @@ def _resumen(nombre: str, datos: Any) -> str:
         )
     if nombre == "chat.updated":
         return f"chat={datos.get('chat_id')} mensajes={datos.get('message_count')}"
+    if nombre == "history.progress":
+        return (
+            f"chats={len(datos.get('chat_jids') or [])} "
+            f"mensajes={datos.get('messages', 0)} "
+            f"filas={len(datos.get('chats') or [])}"
+        )
     if nombre == "media.updated":
         return (
             f"chat={datos.get('chat_id')} media={datos.get('media_id')} "
@@ -109,7 +115,75 @@ def _translate(event: Any, runtime: Any) -> list[tuple[str, Any]]:
         return _mensaje_guardado(carga, runtime)
     if nombre == "media_ready":
         return _adjunto_listo(carga, runtime)
+    if nombre == "history_ingested":
+        return _historial_ingerido(carga, runtime)
     return []
+
+
+#: Cuantas conversaciones se mandan enteras en un aviso de historial. Por
+#: encima de esto va solo la lista de identificadores y la pantalla se refresca
+#: una vez: un `INITIAL_BOOTSTRAP` toca decenas de golpe y mandar todas las
+#: filas convertiria un aviso en una carga util enorme.
+TOPE_DE_FILAS = 25
+
+
+def _historial_ingerido(carga: Any, runtime: Any) -> list[tuple[str, Any]]:
+    """Entro historial: que conversaciones cambiaron y como quedaron.
+
+    POR QUE VAN LAS FILAS DENTRO
+    ----------------------------
+    Antes esto decia solo en que conversaciones habia entrado algo, y la
+    pantalla tenia que pedir la lista entera para enterarse del contador nuevo.
+    Una excavacion produce un aviso por cada bloque de cincuenta mensajes, asi
+    que recuperar tres mil eran sesenta peticiones contra la misma lista.
+
+    Con la fila dentro, la pantalla actualiza en el sitio: contador, previa y
+    estado. Y el chat abierto puede recargar solo sus mensajes, que es lo
+    unico que el aviso no trae.
+    """
+    if not isinstance(carga, dict):
+        # Compatibilidad: antes viajaba una cadena suelta.
+        return [("history.progress", {"summary": str(carga) if carga else ""})]
+
+    jids = [j for j in (carga.get("chat_jids") or []) if j]
+    datos: dict[str, Any] = {
+        "summary": carga.get("summary"),
+        "chat_jids": jids,
+        "messages": int(carga.get("messages") or 0),
+        "sync_type": carga.get("sync_type"),
+    }
+
+    if not jids or len(jids) > TOPE_DE_FILAS:
+        # Demasiadas: se dice cuales y la pantalla se refresca una sola vez.
+        return [("history.progress", datos)]
+
+    sesion = _session(runtime)
+    if sesion is None:
+        return [("history.progress", datos)]
+    try:
+        from app.api.serializers import chat_to_json
+        from app.models import Chat
+        from app.services import repository as repo
+        from sqlalchemy import select
+
+        filas = []
+        for jid in jids:
+            chat_id = sesion.execute(
+                select(Chat.id).where(Chat.jid == jid)
+            ).scalar_one_or_none()
+            if chat_id is None:
+                continue
+            resumen = repo.chat_summary(sesion, chat_id)
+            if resumen is not None:
+                filas.append(chat_to_json(resumen))
+        if filas:
+            datos["chats"] = filas
+    except Exception:  # noqa: BLE001 - sin filas el aviso sigue sirviendo
+        log.debug("No se pudieron enriquecer las conversaciones del historial")
+    finally:
+        sesion.close()
+
+    return [("history.progress", datos)]
 
 
 def _mensaje_guardado(carga: Any, runtime: Any) -> list[tuple[str, Any]]:

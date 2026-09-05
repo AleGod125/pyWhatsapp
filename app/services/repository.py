@@ -105,14 +105,22 @@ def upsert_chat(
     last_message: str | None = None,
     last_message_timestamp: int | None = None,
     raw_metadata: dict[str, Any] | None = None,
+    whatsapp_account_id: Any = None,
 ) -> int:
     """Inserta o actualiza un chat y devuelve su ``id``.
 
     Los campos que llegan como ``None`` NO pisan lo que ya hubiera: History
     Sync y los mensajes live traen informacion parcial distinta y un update
     ciego borraria el nombre que ya se habia resuelto.
+
+    ``whatsapp_account_id`` dice DE QUIEN es el chat. Sin el, el chat queda
+    sin dueno y el filtro de propiedad lo excluye de la lista: existe en la
+    base y no lo ve nadie. Es lo que dejaba el panel vacio con 40 chats
+    dentro.
     """
     values: dict[str, Any] = {"jid": jid, "chat_type": chat_type or "unknown"}
+    if whatsapp_account_id is not None:
+        values["whatsapp_account_id"] = whatsapp_account_id
     for column, value in (
         ("name", name),
         ("last_message", last_message),
@@ -128,6 +136,14 @@ def upsert_chat(
         for column in ("name", "last_message", "raw_metadata")
         if column in values
     }
+    if "whatsapp_account_id" in values:
+        # Se rellena si falta, pero NO se reasigna: cambiar el dueno de un
+        # chat que ya lo tiene seria entregarle a alguien la conversacion de
+        # otro. Un chat huerfano si puede adoptarse por su cuenta legitima.
+        updates["whatsapp_account_id"] = func.coalesce(
+            Chat.__table__.c.whatsapp_account_id,
+            stmt.excluded.whatsapp_account_id,
+        )
     # El chat_type solo mejora: 'unknown' nunca pisa un tipo ya conocido.
     if chat_type and chat_type != "unknown":
         updates["chat_type"] = stmt.excluded.chat_type
@@ -302,6 +318,11 @@ def count_messages(session: Session, chat_jid: str | None = None) -> int:
 # abrir un chat. ``raw_metadata`` si viene, porque es JSONB pequeno y lleva el
 # ``stub_type`` con el que se rotula un evento de sistema; el clasificador
 # sabe trabajar solo con eso.
+#: Lo que se lee para pintar una pagina de conversacion.
+#:
+#: ``text`` sigue aqui, pero como PREVIA y respaldo: el contenido completo
+#: vive en el segmento. Las tres ultimas columnas son las que permiten ir a
+#: buscarlo sin recorrer el archivo entero.
 _PAGE_COLUMNS = (
     Message.id,
     Message.chat_id,
@@ -313,6 +334,9 @@ _PAGE_COLUMNS = (
     Message.timestamp,
     Message.from_me,
     Message.raw_metadata,
+    Message.segment_id,
+    Message.segment_index,
+    Message.storage_status,
 )
 
 
@@ -400,32 +424,56 @@ class ChatSummary:
     history_status: str | None = None
 
 
-def display_name_for(jid: str, *candidates: str | None) -> str:
-    """Primer nombre util, con el JID como ultimo recurso.
+def display_name_for(
+    jid: str, *candidates: str | None, phone_jid: str | None = None
+) -> str:
+    """Primer nombre util. Nunca un LID crudo si hay algo mejor.
 
-    Prioridad: nombre de la conversacion, metadata del contacto,
-    pushname, asunto del grupo y, si no hay nada, el identificador. Nunca se
-    inventa un nombre ni se convierte un LID en telefono.
+    Prioridad: nombre de la conversacion, metadata del contacto, pushname y
+    -- solo para los chats identificados por LID -- el telefono que el mapa de
+    contactos ya asocia a ese LID. Nunca se inventa un nombre ni se convierte
+    un LID en telefono: ``phone_jid`` viene del contacto, no de un calculo.
+
+    Cuando no hay NADA se dice que no hay nombre, en vez de ensenar el
+    identificador interno. ``21935119425699 (LID)`` no le dice nada a nadie:
+    no es un telefono, no es un nombre, y ocupa el sitio donde deberia estar
+    la persona.
     """
     for candidate in candidates:
         if candidate and candidate.strip():
             return candidate.strip()
+
     user = jid.split("@")[0]
     if jid.endswith("@lid"):
-        # Un LID no es un telefono: se marca para no dar a entender lo que no es.
-        return f"{user} (LID)"
+        # El telefono SI es legible, y es la misma persona. Solo se usa si el
+        # contacto lo tiene guardado; no se deduce del LID.
+        if phone_jid and phone_jid.endswith("@s.whatsapp.net"):
+            numero = phone_jid.split("@")[0].split(":")[0]
+            if numero.isdigit():
+                return f"+{numero}"
+        return "Contacto sin nombre"
     if jid.endswith("@g.us"):
-        return f"Grupo {user.split('-')[0]}"
-    return user
+        return "Grupo sin nombre"
+    if user.isdigit():
+        return f"+{user}"
+    return user or "Contacto sin nombre"
 
 
 def list_chat_summaries(
-    session: Session, *, search: str | None = None, limit: int = 500
+    session: Session,
+    *,
+    search: str | None = None,
+    limit: int = 500,
+    accounts: list | None = None,
 ) -> list[ChatSummary]:
     """Chats para el sidebar con nombre resuelto y numero de mensajes.
 
     Se resuelve en una sola consulta con LEFT JOIN a contactos y un conteo
     agregado: hacerlo por chat seria N+1 y con cientos de chats se notaria.
+
+    ``accounts`` acota a las cuentas de WhatsApp de un usuario. Es obligatorio
+    en la API: sin el, un usuario veria los chats de todos. Se deja opcional
+    para el mantenimiento interno, que si trabaja sobre la base entera.
     """
     message_counts = (
         select(Message.chat_id, func.count().label("total"))
@@ -444,6 +492,9 @@ def list_chat_summaries(
             Chat.last_message_timestamp,
             Contact.display_name,
             Contact.push_name,
+            # El JID de telefono del contacto. Para un chat @lid es la unica
+            # forma legible de nombrarlo cuando no hay nombre guardado.
+            Contact.jid,
             func.coalesce(message_counts.c.total, 0),
             ChatHistoryState.history_status,
         )
@@ -453,6 +504,13 @@ def list_chat_summaries(
         .order_by(Chat.last_message_timestamp.desc().nulls_last(), Chat.id.desc())
         .limit(limit)
     )
+
+    if accounts is not None:
+        # Lista vacia -> condicion imposible, no ausencia de filtro. Un filtro
+        # que "no aplica" seria un filtro que deja verlo todo.
+        stmt = stmt.where(
+            Chat.whatsapp_account_id.in_(accounts) if accounts else Chat.id.is_(None)
+        )
 
     if search:
         pattern = f"%{search.strip()}%"
@@ -475,6 +533,7 @@ def list_chat_summaries(
             last_timestamp,
             contact_name,
             push_name,
+            contact_jid,
             total,
             history_status,
         ) = row
@@ -482,7 +541,9 @@ def list_chat_summaries(
             ChatSummary(
                 id=chat_id,
                 jid=jid,
-                display_name=display_name_for(jid, name, contact_name, push_name),
+                display_name=display_name_for(
+                    jid, name, contact_name, push_name, phone_jid=contact_jid
+                ),
                 chat_type=chat_type,
                 last_message=last_message,
                 last_message_timestamp=last_timestamp,
@@ -511,6 +572,7 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
             Chat.last_message_timestamp,
             Contact.display_name,
             Contact.push_name,
+            Contact.jid,
         )
         .outerjoin(Contact, (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid))
         .where(Chat.id == chat_id)
@@ -524,12 +586,14 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
     ).scalar_one()
     (
         row_id, jid, name, chat_type, last_message, last_timestamp,
-        contact_name, push_name,
+        contact_name, push_name, contact_jid,
     ) = fila
     return ChatSummary(
         id=row_id,
         jid=jid,
-        display_name=display_name_for(jid, name, contact_name, push_name),
+        display_name=display_name_for(
+            jid, name, contact_name, push_name, phone_jid=contact_jid
+        ),
         chat_type=chat_type,
         last_message=last_message,
         last_message_timestamp=last_timestamp,
@@ -753,6 +817,10 @@ def history_state_for(session: Session, chat_jid: str) -> Any | None:
             ChatHistoryState.newest_message_timestamp,
             ChatHistoryState.message_count,
             ChatHistoryState.last_error,
+            # Para que el panel pueda decir "reintento pendiente" con la hora
+            # de verdad, en vez de suponerla.
+            ChatHistoryState.attempt_count,
+            ChatHistoryState.next_retry_at,
         ).where(ChatHistoryState.chat_jid == chat_jid)
     ).first()
 

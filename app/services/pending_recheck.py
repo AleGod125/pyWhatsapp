@@ -2,11 +2,20 @@
 
 QUE HACE
 --------
-Recorre los chats en ``waiting_seed`` y le pasa a cada uno la MISMA revision
-que el boton individual (``HistoryRecheck``): resolver alias, buscar un
-mensaje con ID real de WhatsApp, y si no lo hay, reinterpretar los blobs de
-History Sync que ya estan en disco. Si aparece un ancla, el chat vuelve a la
-cola de excavacion y pywhats pide su historial.
+Recorre los chats en ``waiting_seed`` buscando si ha aparecido un ancla:
+primero entre lo que ya hay (mensajes y catalogo de semillas, alias
+incluidos), y despues escaneando los blobs de History Sync que TODAVIA NO se
+hayan escaneado. Si aparece un ancla, el chat vuelve a la cola de excavacion
+y se pide su historial.
+
+UNA LECTURA POR ARCHIVO, NO UNA POR CHAT
+----------------------------------------
+La version anterior le pasaba a cada chat la revision individual, y esa
+reinterpretaba TODOS los ``.pb`` del disco. Con 27 pendientes y 4 blobs eran
+108 descompresiones —y 108 ingestas completas— para descubrir exactamente lo
+mismo que la primera. Ahora cada archivo se lee una vez, se anota su SHA-256,
+y la siguiente revision solo mira los que no habia visto. El escaneo NO
+reingiere mensajes: solo saca referencias.
 
 QUE **NO** HACE, Y ES EL PUNTO
 ------------------------------
@@ -205,6 +214,26 @@ class PendingRecheckService:
                     return reciente
 
             pendientes = self._pendientes()
+
+            if auto and pendientes and not self._hay_algo_nuevo(runtime):
+                # Nada ha cambiado desde la ultima vez: ni blobs sin escanear,
+                # ni anclas nuevas. El panel llama a esto al abrirse y en cada
+                # refresco, asi que tiene que poder salir sin tocar disco.
+                sin_novedad = RecheckJob(
+                    job_id=uuid.uuid4().hex[:8],
+                    total=len(pendientes),
+                    state="completed",
+                    still_waiting=len(pendientes),
+                    skipped=True,
+                    skipped_reason="no hay blobs ni anclas nuevas",
+                    finished_at=time.time(),
+                )
+                self._trabajos[sin_novedad.job_id] = sin_novedad
+                self._ultimo = sin_novedad
+                log.debug("%s Sin novedades; revision automatica no hace nada", ETIQUETA)
+                self._emitir("history.recheck.completed", sin_novedad.to_json())
+                return sin_novedad
+
             trabajo = RecheckJob(
                 job_id=uuid.uuid4().hex[:8],
                 total=len(pendientes),
@@ -254,71 +283,102 @@ class PendingRecheckService:
     def _revisar(
         self, trabajo: RecheckJob, pendientes: list[dict[str, Any]], runtime: Any
     ) -> None:
-        from app.services.history_recheck import HistoryRecheck
+        """UNA lectura de cada blob nuevo, no una por conversacion.
 
-        revisor = HistoryRecheck(self._database, self._settings)
+        La version anterior le pasaba a cada chat pendiente la revision
+        individual, y esa reinterpretaba TODOS los ``.pb`` del disco buscando
+        sus alias. Con 27 pendientes y 4 blobs son 108 descompresiones para
+        descubrir exactamente lo mismo que la primera, y ademas volvia a
+        ejecutar la ingesta completa por cada chat.
+
+        Ahora: se mira si hay blobs sin escanear (comparando huellas, sin
+        abrir nada), se escanean SOLO esos una vez, y las anclas que salgan
+        pasan por el colector, que ya sabe validar, deduplicar y despertar.
+        """
+        from app.history.blob_scanner import BlobSeedScanner
+        from app.history.cursor import get_valid_history_cursor
+
+        cuenta = getattr(runtime, "runtime_owner_account_id", None)
+        colector = getattr(runtime, "seed_collector", None)
+
         trabajo.state = "running"
         self._emitir("history.recheck.started", trabajo.to_json())
-        log.info(
-            "%s Revisando %d conversacion(es) que esperan un ancla. Todo local: "
-            "no se pide nada al servidor.",
-            ETIQUETA,
-            trabajo.total,
-        )
 
+        # 1. Las que ya tienen ancla: no hace falta abrir un solo archivo.
+        #    Puede haber aparecido una desde la ultima vez (un mensaje en
+        #    vivo, un alias nuevo) y entonces el chat despierta aqui.
         despertados: list[str] = []
         for chat in pendientes:
-            progreso = next(
-                c for c in trabajo.chats if c.chat_id == chat["chat_id"]
-            )
-            progreso.state = "rechecking"
-            trabajo.current = progreso
-            self._emitir("history.recheck.progress", trabajo.to_json())
-
-            try:
-                resultado = revisor.recheck(chat["chat_id"])
-            except Exception:  # noqa: BLE001 - un chat roto no corta la revision
-                log.exception("%s No se pudo revisar el chat %s", ETIQUETA, chat["chat_id"])
-                progreso.state = "error"
-                trabajo.errors += 1
-                resultado = None
-
-            if resultado is not None:
-                trabajo.messages_recovered += resultado.mensajes_recuperados
-                if resultado.puede_excavar:
-                    progreso.state = "fetching_history"
-                    trabajo.recovered += 1
-                    despertados.append(resultado.chat_jid)
-                else:
-                    progreso.state = "waiting_seed"
-                    trabajo.still_waiting += 1
-
+            progreso = next(c for c in trabajo.chats if c.chat_id == chat["chat_id"])
+            with self._database.transaction() as sesion:
+                cursor = get_valid_history_cursor(
+                    sesion, chat_id=chat["chat_id"], chat_jid=chat["chat_jid"]
+                )
+            if (
+                cursor is not None
+                and colector is not None
+                and colector.promote_waiting_chat(chat["chat_id"])
+            ):
+                progreso.state = "fetching_history"
+                trabajo.recovered += 1
+                despertados.append(chat["chat_jid"])
+            else:
+                progreso.state = "waiting_seed"
             trabajo.processed += 1
             self._emitir("history.recheck.progress", trabajo.to_json())
 
+        # 2. Los blobs. La comprobacion es barata: solo compara huellas.
+        escaner = BlobSeedScanner(self._database, self._settings, account_id=cuenta)
+        blobs_nuevos = 0
+        semillas_nuevas = 0
+        if colector is None or not getattr(colector, "listo", False):
+            log.debug("%s Sin cuenta propietaria; no se escanean blobs", ETIQUETA)
+        elif not escaner.hay_blobs_nuevos():
+            log.debug("%s Ningun blob sin escanear; nada que reinterpretar", ETIQUETA)
+        else:
+            candidatos, resumen = escaner.escanear(solo_nuevos=True, marcar=True)
+            blobs_nuevos = resumen.blobs_nuevos
+            antes = colector.metricas.validas
+            despertados_antes = colector.metricas.despertados
+            colector.observe_many(candidatos)
+            semillas_nuevas = colector.metricas.validas - antes
+            if colector.metricas.despertados > despertados_antes:
+                # Cuales despertaron se LEE de la base; no se deduce del
+                # contador, que cuenta tambien chats que no estaban en esta
+                # lista (una semilla en vivo puede llegar mientras tanto).
+                nuevos = self._ya_no_esperan(pendientes, despertados)
+                for jid in nuevos:
+                    chat = next(c for c in pendientes if c["chat_jid"] == jid)
+                    progreso = next(
+                        c for c in trabajo.chats if c.chat_id == chat["chat_id"]
+                    )
+                    progreso.state = "fetching_history"
+                    trabajo.recovered += 1
+                despertados.extend(nuevos)
+
+        trabajo.processed = trabajo.total
+        trabajo.still_waiting = max(0, trabajo.total - trabajo.recovered)
         trabajo.current = None
         trabajo.state = "completed"
 
-        # Lo que despierta se excava con el motor de siempre: ON_DEMAND
-        # secuencial, cursor recalculado tras cada respuesta.
         if despertados:
-            self._encolar(runtime, despertados)
+            self._encolar(runtime, sorted(set(despertados)))
             self._emitir(
                 "history.backfill.started",
-                {"job_id": trabajo.job_id, "chats": len(despertados)},
+                {"job_id": trabajo.job_id, "chats": len(set(despertados))},
             )
 
+        # UNA linea. Antes eran 27 lineas de "sigue sin ancla", una por chat.
         log.info(
-            "%s Revision terminada: %d con ancla nueva, %d siguen esperando, "
-            "%d error(es), %d mensaje(s) reinterpretados",
+            "%s waiting=%d blobs_nuevos=%d semillas_nuevas=%d despertados=%d",
             ETIQUETA,
+            trabajo.total,
+            blobs_nuevos,
+            semillas_nuevas,
             trabajo.recovered,
-            trabajo.still_waiting,
-            trabajo.errors,
-            trabajo.messages_recovered,
         )
         if trabajo.still_waiting:
-            log.info(
+            log.debug(
                 "%s %d conversacion(es) siguen sin ancla. NO estan vacias: "
                 "WhatsApp todavia no ha entregado un mensaje desde el que pedir "
                 "lo anterior. Despiertan solas en cuanto llegue uno real.",
@@ -327,7 +387,73 @@ class PendingRecheckService:
             )
         self._emitir("history.recheck.completed", trabajo.to_json())
 
+    def _ya_no_esperan(
+        self, pendientes: list[dict[str, Any]], ya: list[str]
+    ) -> list[str]:
+        """Los que estaban esperando y ya no. Se lee de la base, no se supone."""
+        from app.models import ChatHistoryState
+
+        jids = [c["chat_jid"] for c in pendientes if c["chat_jid"] not in ya]
+        if not jids:
+            return []
+        with self._database.transaction() as sesion:
+            return list(
+                sesion.execute(
+                    select(ChatHistoryState.chat_jid).where(
+                        ChatHistoryState.chat_jid.in_(jids),
+                        ChatHistoryState.history_status == "pending",
+                    )
+                ).scalars()
+            )
+
     # -- Piezas --------------------------------------------------------------
+
+    def _hay_algo_nuevo(self, runtime: Any) -> bool:
+        """Si merece la pena mirar. Barato: no descomprime ni un archivo.
+
+        Dos preguntas, en orden de coste:
+
+        1. ¿hay algun blob cuya huella no este anotada?  (solo SHA-256)
+        2. ¿ha llegado alguna ancla desde la ultima revision? (una consulta)
+
+        Si las dos dicen que no, la revision no puede encontrar nada que la
+        anterior no encontrara ya, y hacerla seria releer los mismos archivos
+        para llegar a la misma conclusion.
+        """
+        from app.history.blob_scanner import BlobSeedScanner
+        from app.models import HistorySeed
+
+        cuenta = getattr(runtime, "runtime_owner_account_id", None)
+        try:
+            if BlobSeedScanner(
+                self._database, self._settings, account_id=cuenta
+            ).hay_blobs_nuevos():
+                return True
+        except Exception:  # noqa: BLE001 - no poder mirar es motivo para mirar
+            return True
+
+        if self._ultimo is None or self._ultimo.finished_at is None:
+            return True
+        try:
+            from datetime import datetime, timezone
+
+            desde = datetime.fromtimestamp(self._ultimo.finished_at, tz=timezone.utc)
+            with self._database.transaction() as sesion:
+                return (
+                    sesion.execute(
+                        select(HistorySeed.id)
+                        .where(
+                            # Acotado a ESTA cuenta: un ancla de otra no dice
+                            # nada sobre las conversaciones de esta.
+                            HistorySeed.whatsapp_account_id == cuenta,
+                            HistorySeed.first_seen_at >= desde,
+                        )
+                        .limit(1)
+                    ).first()
+                    is not None
+                )
+        except Exception:  # noqa: BLE001
+            return True
 
     def _otro_trabajo_activo(self, runtime: Any) -> str | None:
         """Que otro trabajo pesado esta corriendo, si es que hay alguno.

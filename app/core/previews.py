@@ -12,6 +12,10 @@ queda para lo que de verdad no se ha podido determinar.
 
 from __future__ import annotations
 
+from app.core.logging_setup import get_logger
+
+log = get_logger("COMPAT")
+
 # Etiqueta por tipo normalizado. El icono va delante porque en una lista
 # estrecha se distingue mejor un simbolo que una palabra.
 TYPE_PREVIEWS: dict[str, str] = {
@@ -34,7 +38,7 @@ TYPE_PREVIEWS: dict[str, str] = {
 
 # Etiqueta de ultimo recurso. NO se usa para nada que el clasificador conozca.
 FALLBACK_PREVIEW = "Mensaje"
-UNKNOWN_PREVIEW = "Mensaje sin interpretar"
+UNKNOWN_PREVIEW = "Mensaje no compatible"
 
 PREVIEW_MAX = 70
 
@@ -68,11 +72,14 @@ def preview_for(
     if etiqueta is not None:
         return etiqueta
     if message_type in ("unknown", "", None):
+        proto_type = (metadata or {}).get("proto_type") or "unknown"
+        log.debug("unknown_message_type=%s", proto_type)
         return UNKNOWN_PREVIEW
     if message_type == "protocol":
         # No deberia llegar al sidebar (es interno), pero si llega se dice lo
         # que es en lugar de fingir que era un mensaje.
         return "Mensaje de protocolo"
-    return FALLBACK_PREVIEW
+    log.debug("unknown_message_type=%s", message_type)
+    return UNKNOWN_PREVIEW
 
 

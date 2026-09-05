@@ -211,7 +211,9 @@ def apply(store_path: Path | None = None) -> bool:
                 ),
             )
             self._sessions.save(sid, existing_session)
-            log.info(
+            # Por mensaje. En INFO llenaria la consola en cuanto hay
+            # trafico; lo que interesa en INFO es que la compat este puesta.
+            log.debug(
                 "Reutilizando ratchet existente (sender=%s opk_id=%s base_key_fp=%s); "
                 "decrypt success",
                 sid,
@@ -236,5 +238,5 @@ def apply(store_path: Path | None = None) -> bool:
     setattr(_decrypt_enc, _MARKER, True)
     Receiver._decrypt_enc = _decrypt_enc  # type: ignore[method-assign]
 
-    log.info("Adaptacion de reutilizacion de ratchet (PKMSG) aplicada")
+    log.debug("Adaptacion de reutilizacion de ratchet (PKMSG) aplicada")
     return True
