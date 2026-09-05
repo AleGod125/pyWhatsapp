@@ -62,3 +62,7 @@ session/backups/
 # texto ni identificadores-- pero es el resultado de UNA medicion en UNA
 # maquina, no codigo. El informe es lo que se guarda; esto es su materia prima.
 debug/
+
+# Cache de versiones de whatsapp-web.js. Lo descarga el worker solo y pesa
+# megas: es un artefacto de ejecucion, no codigo.
+web_companion/.wwebjs_cache/
