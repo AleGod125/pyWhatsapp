@@ -100,14 +100,55 @@ def test_el_acuse_solo_toma_el_relevo_a_partir_del_segundo_intento():
 
 
 def test_si_no_se_puede_construir_se_manda_el_de_siempre():
-    """Un acuse con el contador mal es mejor que ningún acuse."""
-    import inspect
+    """Un acuse con el contador mal es mejor que ningún acuse.
+
+    Se comprueba el COMPORTAMIENTO y no el texto del código: antes esto
+    buscaba la cadena ``if not enviado``, y al reescribir el bloque para
+    adjuntar el material público la condición pasó a escribirse al revés. La
+    regla no había cambiado; sólo la forma de escribirla.
+    """
+    import asyncio
+
+    import pywhats.messaging.receiver as receiver_module
 
     from app.compat import retry_observer
 
-    fuente = inspect.getsource(retry_observer.apply)
-    assert "if not enviado" in fuente
-    assert "await original(self, node, sender=sender)" in fuente
+    antes = receiver_module.Receiver._send_retry_receipt
+    originales: list[str] = []
+
+    async def _base(self, node, *, sender):  # noqa: ANN001, ANN202
+        originales.append(node.get_str("id"))
+
+    class _Nodo:
+        def __init__(self, wamid):
+            self.attrs = {"id": wamid, "t": "0"}
+
+        def get_str(self, clave):  # noqa: ANN001
+            return self.attrs.get(clave, "")
+
+    class _Tracker:
+        def intentos_de(self, wamid):  # noqa: ANN001
+            return 3  # obliga a reconstruir la stanza
+
+        def acuse_enviado(self, wamid):  # noqa: ANN001
+            return None
+
+    receiver_module.Receiver._send_retry_receipt = _base
+    retry_observer.reiniciar()
+    try:
+        assert retry_observer.apply(_Tracker()) is True
+        # Un receptor SIN transporte: la reconstrucción no puede completarse.
+        receptor = object()
+        asyncio.run(
+            receiver_module.Receiver._send_retry_receipt(
+                receptor, _Nodo("WAMID-SIN-TRANSPORTE"), sender="x@lid"
+            )
+        )
+        # Y aun así el acuse sale, por el camino de siempre.
+        assert originales == ["WAMID-SIN-TRANSPORTE"]
+    finally:
+        receiver_module.Receiver._send_retry_receipt = antes
+        retry_observer.reiniciar()
 
 
 def test_el_acuse_conserva_el_participante_de_un_grupo():

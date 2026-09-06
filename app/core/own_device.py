@@ -217,10 +217,24 @@ def auditar_sesiones(
 def avisar_de_sesiones_duplicadas(settings: Any) -> AuditoriaDeSesiones:
     """Audita y lo cuenta UNA vez, al arrancar. No arregla nada.
 
-    Un dispositivo propio con sesion por numero Y por LID es la explicacion
-    medible de que algunas copias del telefono no cuadren. Arreglarlo copiando
-    o borrando estado de Signal a ciegas seria peor que el problema: la
-    recuperacion correcta ya existe y es el reintento con ``pkmsg``.
+    COEXISTIR NO ES UN FALLO
+    ------------------------
+    Esto avisaba de que dos sesiones del mismo aparato eran «la explicacion
+    medible de que algunas copias no cuadren». Era una conclusion demasiado
+    fuerte, y al medir la cadena entera resulto estar mal atribuida.
+
+    El numero y el LID son DOS DIRECCIONES CRIPTOGRAFICAS distintas del mismo
+    telefono, y el protocolo permite que cada una tenga su sesion. De hecho
+    hacen falta las dos: por el numero le pedimos historial, y por el LID nos
+    llegan las copias de lo que se escribe desde el.
+
+    Lo que si rompia era MOVER una sobre otra. La migracion borraba la
+    direccion por numero --justo la que usa ON_DEMAND--, la peticion siguiente
+    volvia a saludar, el telefono rehacia su ratchet y la copia siguiente ya no
+    cuadraba. Eso lo impide ahora ``app/compat/self_session_guard.py``.
+
+    Asi que esto se queda como observacion, en DEBUG. Un fallo es un mensaje
+    autenticado que no se puede descifrar; tener dos registros no lo es.
     """
     from app.core.identity import own_identity
 
@@ -235,12 +249,10 @@ def avisar_de_sesiones_duplicadas(settings: Any) -> AuditoriaDeSesiones:
 
     log.debug("Auditoria de sesiones propias: %s", auditoria.resumen())
     if auditoria.hay_duplicados:
-        log.warning(
-            "Tu dispositivo %s tiene DOS sesiones Signal, una por numero y "
-            "otra por LID. Son el mismo aparato con dos ratchets distintos, y "
-            "por eso alguna copia de lo que escribes desde el telefono puede "
-            "no cuadrar. No se toca ninguna: cuando pase, se pide el reenvio y "
-            "el mensaje llega autenticado.",
+        log.debug(
+            "Sesiones por numero y por LID coexistentes para %s. Es lo "
+            "esperado: por el numero se pide historial y por el LID llegan las "
+            "copias del telefono. No se toca ninguna.",
             ", ".join(str(d) for d in auditoria.duplicados),
         )
     return auditoria

@@ -57,6 +57,11 @@ SEED_SOURCES = (
     "offline",
     "retry_resend",
     "blob_scan",
+    # Promovida desde un mensaje REAL que ya estaba guardado. No es una fuente
+    # nueva de informacion: es una que teniamos y no estabamos usando. Se
+    # etiqueta aparte para no confundirla con la lectura de los blobs, que si
+    # abre archivos.
+    "stored_message",
 )
 
 

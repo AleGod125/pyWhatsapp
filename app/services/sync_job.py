@@ -395,11 +395,36 @@ class SyncJob:
             self._settings,
             account_id=getattr(runtime, "runtime_owner_account_id", None),
         )
-        if not escaner.hay_blobs_nuevos():
+        if escaner.hay_blobs_nuevos():
+            candidatos, _ = escaner.escanear(solo_nuevos=True, marcar=True)
+            colector.observe_many(candidatos)
+        else:
             log.debug("Ningun blob sin escanear; no hay anclas nuevas que buscar")
-            return
-        candidatos, _ = escaner.escanear(solo_nuevos=True, marcar=True)
-        colector.observe_many(candidatos)
+
+        # Y despues, lo que YA estaba guardado y no se estaba usando.
+        #
+        # Una conversacion puede tener doscientos mensajes reales --traidos por
+        # el historial inicial, por excavacion o en vivo-- y aun asi figurar sin
+        # ancla propia, porque nadie promovio ninguno de ellos a referencia. Se
+        # midio sobre la base real: 23 conversaciones en ese estado.
+        #
+        # No es una fuente nueva de informacion: es una que ya teniamos. Y
+        # sirve para que una conversacion, una vez que tiene mensajes reales, no
+        # vuelva a depender del segundo dispositivo nunca mas.
+        self._resolver_anclas_propias(runtime, colector)
+
+    def _resolver_anclas_propias(self, runtime: Any, colector: Any) -> None:
+        """Promueve a referencia los mensajes reales ya guardados. Nunca lanza."""
+        from app.discovery.primary_seed_resolver import PrimarySeedResolver
+
+        try:
+            resolutor = PrimarySeedResolver(
+                self._database,
+                account_id=getattr(runtime, "runtime_owner_account_id", None),
+            )
+            resolutor.resolver(colector)
+        except Exception:  # noqa: BLE001 - una mejora opcional no corta el ciclo
+            log.exception("Fallo resolviendo anclas propias")
 
     async def _fase_web(self, runtime: Any) -> None:
         """Si quedan conversaciones esperando ancla, preguntarle a WhatsApp Web.

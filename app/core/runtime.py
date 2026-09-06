@@ -1044,7 +1044,9 @@ class AppRuntime:
         try:
             from app.compat import retry_observer
 
-            retry_observer.apply(self.retry_tracker)
+            # Los ajustes van tambien: sin ellos el acuse no puede reunir
+            # el material publico con el que el telefono rehace el saludo.
+            retry_observer.apply(self.retry_tracker, self.settings)
         except Exception:  # noqa: BLE001 - observar no puede impedir el arranque
             log.debug("No se pudo seguir los acuses de reintento")
 
@@ -1482,6 +1484,11 @@ class AppRuntime:
 
             if own_lid_map.seed(self.settings, lid_hint=self._lid_del_dispositivo_vivo()):
                 log.info("Par PN<->LID propio registrado (%s)", motivo)
+                # Y la guarda, aqui mismo. Se instala al arrancar, pero en una
+                # vinculacion NUEVA aquel momento es demasiado pronto: todavia
+                # no hay identidad propia, asi que no se instalaria nunca. Es
+                # el mismo fallo que tenia la siembra, y se cierra igual.
+                self._guardar_sesion_propia()
             else:
                 log.warning(
                     "No se pudo registrar el par PN<->LID propio (%s): los "
@@ -1491,6 +1498,26 @@ class AppRuntime:
                 )
         except Exception:  # noqa: BLE001 - sembrar no puede tumbar la sesion
             log.exception("Fallo registrando el par PN<->LID propio")
+
+    def _guardar_sesion_propia(self) -> None:
+        """Instala la guarda que impide migrar NUESTRA propia sesion.
+
+        Migrarla borra la direccion por numero, que es justo la que usa
+        ON_DEMAND; la peticion siguiente saluda de nuevo, el telefono rehace su
+        ratchet y la copia propia siguiente ya no cuadra. Es idempotente.
+        """
+        try:
+            from app.compat import self_session_guard
+
+            if self_session_guard.apply(self.settings):
+                log.debug("Guarda de sesion propia lista")
+
+            from app.compat import own_lid_recovery
+
+            if own_lid_recovery.apply(self.settings):
+                log.debug("Recuperacion de sesion LID propia lista")
+        except Exception:  # noqa: BLE001 - no puede tumbar la conexion
+            log.exception("Fallo instalando la guarda de sesion propia")
 
     def _lid_del_dispositivo_vivo(self) -> str | None:
         """El LID que ya conoce el cliente conectado, si lo conoce.

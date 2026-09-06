@@ -260,9 +260,13 @@ def _direcciones_propias(settings) -> None:
     print(f"  sesion por numero (PN)         {len(por_pn)}")
     print(f"  sesion por LID                 {len(por_lid)}")
     print()
-    if resuelve:
-        print("  Bien. Cuando llegue una copia dirigida al LID, la sesion del")
-        print("  numero se migra sola y el mensaje se descifra.")
+    if resuelve and por_lid and por_pn:
+        print("  Bien, y asi debe estar: cada direccion con su sesion. Por el")
+        print("  numero se pide historial; por el LID llegan tus copias.")
+    elif resuelve:
+        print("  El par esta. Falta la sesion por LID, y se creara sola: la")
+        print("  primera copia fallara una vez, se pedira el reenvio y el")
+        print("  telefono la mandara como pkmsg, que es lo que la establece.")
     else:
         print("  ESTO ES EL FALLO. Sin el par, una copia dirigida a tu propio")
         print("  LID no encuentra sesion y muere con 'no session for peer'.")
@@ -273,13 +277,25 @@ def _direcciones_propias(settings) -> None:
 # El resumen que pide el plan
 # ---------------------------------------------------------------------------
 
-#: Lo que se busca en el registro. Cada patron contesta una casilla, y ninguno
-#: depende del texto del mensaje: el registro no lo lleva, a proposito.
+#: Lo que se busca en el registro, SOLO en lineas de copias propias. Cada
+#: patron contesta una casilla, y ninguno depende del texto del mensaje: el
+#: registro no lo lleva, a proposito.
 _HUELLAS = {
     "no_session": "no session for peer",
     "mac_fail": "mac check failed",
-    "pkmsg": "type=pkmsg",
+    "pkmsg_entrante": "type=pkmsg",
     "opk_desconocida": "unknown one-time pre-key id",
+}
+
+#: Lo NUESTRO saliendo hacia el telefono. Va aparte a proposito.
+#:
+#: El diagnostico anterior contaba `pkmsg` a secas y eso mezclaba dos cosas
+#: que no tienen nada que ver: el saludo que MANDAMOS al pedir historial, y el
+#: reenvio que el telefono nos manda para recuperar una copia propia. Contarlos
+#: juntos daba "125 pkmsg" y no decia nada.
+_HUELLAS_SALIENTES = {
+    "ondemand_pkmsg": "ON_DEMAND sobre sesion NUEVA",
+    "ondemand_msg": "enc=msg sesion_por_pn",
 }
 
 
@@ -307,7 +323,8 @@ def _resumen_own_live(settings) -> None:
         return
 
     conteo = dict.fromkeys(_HUELLAS, 0)
-    lineas = 0
+    salientes = dict.fromkeys(_HUELLAS_SALIENTES, 0)
+    lineas = guardados = 0
     with registro.open("r", encoding="utf-8", errors="replace") as fichero:
         try:
             fichero.seek(max(0, registro.stat().st_size - 4_000_000))
@@ -315,6 +332,11 @@ def _resumen_own_live(settings) -> None:
         except OSError:
             pass
         for linea in fichero:
+            for clave, patron in _HUELLAS_SALIENTES.items():
+                if patron in linea:
+                    salientes[clave] += 1
+            if "deviceSentMessage" in linea:
+                guardados += 1
             if lid not in linea or "decrypt failed" not in linea:
                 continue
             lineas += 1
@@ -322,15 +344,26 @@ def _resumen_own_live(settings) -> None:
                 if patron in linea:
                     conteo[clave] += 1
 
-    print(f"  fallos en copias PROPIAS       {lineas}")
-    for clave in ("no_session", "mac_fail", "opk_desconocida"):
-        print(f"    {clave:<28} {conteo[clave]}")
+    print("  ENTRANTE: copias de lo que escribes desde el telefono")
+    print(f"    copias enrutadas y guardadas   {guardados}")
+    print(f"    fallos                         {lineas}")
+    for clave in ("no_session", "mac_fail", "pkmsg_entrante", "opk_desconocida"):
+        print(f"      {clave:<28} {conteo[clave]}")
     print()
-    print("  (ultimos 4 MB del registro, y solo lo dirigido a tu propio LID)")
+    print("  SALIENTE: lo que NOSOTROS mandamos al telefono al pedir historial")
+    print(f"    peticiones sobre sesion nueva  {salientes['ondemand_pkmsg']}")
+    print(f"    peticiones sobre sesion viva   {salientes['ondemand_msg']}")
+    print()
+    print("  (ultimos 4 MB del registro)")
     print()
     if conteo["no_session"]:
         print("  'no_session' en copias propias apunta al par PN<->LID: mira")
         print("  la seccion de arriba.")
+    if conteo["mac_fail"] and salientes["ondemand_pkmsg"]:
+        print("  OJO A ESTA COMBINACION. Si hay MAC fallidos Y peticiones sobre")
+        print("  sesion nueva, mira si los primeros empiezan justo despues de")
+        print("  las segundas: esa era la cadena que rompia las copias propias,")
+        print("  y la guarda de sesion propia existe para impedirla.")
     if conteo["opk_desconocida"]:
         print("  'opk_desconocida' es un pkmsg que reusa una clave de un solo")
         print("  uso ya consumida. La compatibilidad de reutilizacion de")

@@ -52,6 +52,25 @@ def apply_all(settings) -> list[str]:  # type: ignore[no-untyped-def]
         if own_lid_map.apply(settings):
             applied.append("own_lid_map")
 
+    # No migrar la sesion Signal de NUESTRO PROPIO telefono. Se midio la
+    # cadena entera: la migracion borra la direccion por numero, que es justo
+    # la que usa ON_DEMAND; la peticion siguiente saluda de nuevo, el telefono
+    # rehace su ratchet, y la copia propia siguiente ya no cuadra.
+    if settings.compat_own_lid_map:
+        from app.compat import self_session_guard
+
+        if self_session_guard.apply(settings):
+            applied.append("self_session_guard")
+
+        # Y la cura del registro que YA estaba roto. La guarda impide que
+        # vuelva a pasar; no sana el que la migracion dejo desincronizado antes
+        # de existir. Se midio: misma huella durante minutos, fallando el MAC
+        # en cada copia propia.
+        from app.compat import own_lid_recovery
+
+        if own_lid_recovery.apply(settings):
+            applied.append("own_lid_recovery")
+
     # Observacion del camino real del receptor cuando llega un mensaje
     # NUESTRO. No cambia nada: solo dice por que encuentra (o no) la sesion,
     # y de cual de mis dispositivos venia.
