@@ -350,7 +350,46 @@ def test_dos_peticiones_no_pueden_solaparse(servicio, monkeypatch):
         )
 
     asyncio.run(escenario())
-    assert max(solapadas) == 1, "solo puede haber UNA peticion ON_DEMAND en vuelo"
+    # ANTES ESTA PRUEBA EXIGIA UNA SOLA, y tenia su motivo: se midieron dos
+    # peticiones en vuelo con dos segundos de diferencia y el riesgo era no
+    # poder atribuir cada respuesta. Pero serializar era la respuesta gruesa a
+    # ese riesgo; la fina es la correlacion, y ya existe (esperas por chat,
+    # identificador exacto de stanza, respuesta tardia descartada). Lo que se
+    # sigue prohibiendo es pasarse del tope.
+    tope = servicio._settings.max_on_demand_concurrency
+    assert max(solapadas) <= tope, f"nunca mas de {tope} en vuelo"
+
+
+def test_la_misma_conversacion_nunca_se_solapa_consigo_misma(servicio, monkeypatch):
+    """EL INVARIANTE QUE NO SE NEGOCIA.
+
+    Dos conversaciones distintas a la vez se pueden atribuir: cada respuesta
+    trae su chat. Dos peticiones del MISMO chat, no.
+    """
+    vivas: dict[str, int] = {}
+    maximo = 0
+
+    async def falso(self, chat_id, chat_jid, max_rounds):
+        nonlocal maximo
+        vivas[chat_jid] = vivas.get(chat_jid, 0) + 1
+        maximo = max(maximo, vivas[chat_jid])
+        await asyncio.sleep(0.02)
+        vivas[chat_jid] -= 1
+
+    # Se parchea el CUERPO, no `_process_chat`: el guard por conversacion vive
+    # dentro de `_process_chat`, y sustituirlo seria quitar justo lo que esta
+    # prueba comprueba.
+    monkeypatch.setattr(
+        BackfillService, "_process_chat_locked", falso, raising=True
+    )
+
+    async def escenario():
+        await servicio._procesar_en_paralelo(
+            [(1, "a@lid"), (1, "a@lid"), (1, "a@lid"), (1, "a@lid")], 1
+        )
+
+    asyncio.run(escenario())
+    assert maximo == 1, "la misma conversacion no puede tener dos en vuelo"
 
 
 def test_el_candado_es_el_mismo_para_todos_los_caminos(servicio):

@@ -122,6 +122,9 @@ class SyncState:
     retry_pending: int = 0
     recovered_messages: int = 0
     new_seeds: int = 0
+    #: Conversaciones que llevan varias pasadas sin aparecer. NO se borran:
+    #: es una anotacion, no una decision.
+    stale_candidates: int = 0
     drive_pending: int = 0
     #: Conversaciones que despertaron gracias a una referencia de WhatsApp Web.
     web_promoted: int = 0
@@ -131,6 +134,29 @@ class SyncState:
     #: Chats en espera de reintento a los que esta revision SI llego, porque
     #: la accion profunda adelanta esa espera una vez.
     retries_reopened: int = 0
+
+    # -- Lo que se puede MEDIR del boton -----------------------------------
+    #
+    # `new_seeds` cuenta FILAS de ancla insertadas, y resulto enganoso: en una
+    # pasada real marco 3410 mientras el numero de conversaciones que pasaron
+    # a poder pedir historial era CERO. No habia contradiccion --las 3410 eran
+    # anclas de la excavacion de ocho conversaciones que YA funcionaban-- pero
+    # el numero grande sugeria un avance que no existia.
+    #
+    # Lo que responde a "¿ha servido de algo pulsar?" es este bloque: cuantas
+    # esperaban antes, cuantas esperan despues, y cuantas cambiaron de estado.
+    waiting_before: int = 0
+    waiting_after: int = 0
+    #: Conversaciones que pasaron de esperar a poder pedir su historial.
+    promoted: int = 0
+    #: Conversaciones nuevas descubiertas en esta pasada.
+    new_chats: int = 0
+    #: Conversaciones que entraron a la cola de excavacion.
+    backfill_started: int = 0
+    #: Blobs releidos de principio a fin en esta pasada (0 = solo los nuevos).
+    blobs_rescanned: int = 0
+    #: Conversaciones que habia al empezar, para poder restar al final.
+    chats_al_empezar: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -168,7 +194,21 @@ class SyncState:
                 "retry_pending": self.retry_pending,
                 "recovered_messages": self.recovered_messages,
                 "new_seeds": self.new_seeds,
+                "stale_candidates": self.stale_candidates,
                 "drive_pending": self.drive_pending,
+            },
+            # Lo que de verdad hizo el boton, para poder medirlo. Va aparte
+            # del resumen de estado porque responde a otra pregunta: no "como
+            # esta la cuenta" sino "que cambio por haber pulsado".
+            "recovery": {
+                "waiting_before": self.waiting_before,
+                "seeds_found": self.new_seeds,
+                "promoted": self.promoted,
+                "waiting_after": self.waiting_after,
+                "new_chats": self.new_chats,
+                "messages_added": self.recovered_messages,
+                "backfill_started": self.backfill_started,
+                "blobs_rescanned": self.blobs_rescanned,
             },
             "last_error": self.last_error,
             "reconciled": self.reconciled,
@@ -338,6 +378,7 @@ class SyncJob:
             await self._fase_web(runtime)
             await self._fase_revalidar(runtime)
             await self._fase_backfill(runtime)
+            await self._fase_bordes_perdidos(runtime)
             await self._fase_media(runtime)
             await self._fase_almacenamiento(runtime)
             await self._fase_final(runtime)
@@ -372,17 +413,32 @@ class SyncJob:
         archivo.
         """
         self._fase("seeds")
+
+        # El punto de partida se LEE de la base antes de tocar nada. Sin esto
+        # no se puede decir si el boton sirvio: "27 esperan" al final no
+        # significa nada si no se sabe cuantas esperaban al principio.
+        cuenta = getattr(runtime, "runtime_owner_account_id", None)
+        await asyncio.to_thread(
+            self._refrescar_conteos, getattr(runtime, "backfill", None), account_id=cuenta
+        )
+        self.state.waiting_before = self.state.waiting_seed
+        self.state.chats_al_empezar = self.state.chats_total
+
         colector = getattr(runtime, "seed_collector", None)
         if colector is None or not getattr(colector, "listo", False):
             return
 
         antes = int(getattr(colector.metricas, "validas", 0) or 0)
+        despertados_antes = int(getattr(colector.metricas, "despertados", 0) or 0)
         try:
             await asyncio.to_thread(self._buscar_semillas, runtime, colector)
         except Exception:  # noqa: BLE001 - buscar anclas no puede tumbar el ciclo
             log.exception("Fallo buscando anclas nuevas")
         self.state.new_seeds = max(
             0, int(getattr(colector.metricas, "validas", 0) or 0) - antes
+        )
+        self.state.promoted = max(
+            0, int(getattr(colector.metricas, "despertados", 0) or 0) - despertados_antes
         )
         self._emitir()
 
@@ -395,8 +451,38 @@ class SyncJob:
             self._settings,
             account_id=getattr(runtime, "runtime_owner_account_id", None),
         )
-        if escaner.hay_blobs_nuevos():
-            candidatos, _ = escaner.escanear(solo_nuevos=True, marcar=True)
+
+        # RELEER TODO cuando queda alguien esperando.
+        #
+        # Saltarse los blobs ya vistos parecia gratis y no lo era. Un blob se
+        # marca como escaneado aunque sus anclas no se hayan podido atribuir a
+        # nadie, y eso pasa constantemente al principio: el `INITIAL_BOOTSTRAP`
+        # llega ANTES de que existan las filas de conversacion, asi que sus
+        # anclas se rechazan por "no se pudo resolver el chat" y el blob queda
+        # marcado para siempre.
+        #
+        # Se midio en la base local: la conversacion 170686312136883@lid
+        # llevaba 120 anclas VALIDAS dentro de blobs ya marcados, y seguia en
+        # `waiting_seed` sin forma de salir.
+        #
+        # Y el ahorro no existia: releer los 192 blobs enteros cuesta 0,4
+        # segundos, contra 0,1 de comparar huellas. Por una decima de segundo
+        # se estaban perdiendo anclas de forma permanente.
+        #
+        # Cuando no espera nadie se mantiene el camino barato: no hay nada que
+        # rescatar y la pasada no tiene por que hacer trabajo.
+        rescan = self.state.waiting_before > 0
+        if rescan or escaner.hay_blobs_nuevos():
+            candidatos, informe = escaner.escanear(solo_nuevos=not rescan, marcar=True)
+            if rescan:
+                self.state.blobs_rescanned = informe.blobs_nuevos
+                log.info(
+                    "[PLAN_E] %d conversacion(es) esperando: se releen los %d "
+                    "blobs enteros (%d referencias dentro)",
+                    self.state.waiting_before,
+                    informe.blobs_nuevos,
+                    informe.candidatos,
+                )
             colector.observe_many(candidatos)
         else:
             log.debug("Ningun blob sin escanear; no hay anclas nuevas que buscar")
@@ -412,6 +498,58 @@ class SyncJob:
         # sirve para que una conversacion, una vez que tiene mensajes reales, no
         # vuelva a depender del segundo dispositivo nunca mas.
         self._resolver_anclas_propias(runtime, colector)
+
+        # Y por ultimo se vuelve a preguntar por CADA conversacion que espera.
+        self._repescar_esperando(colector)
+
+    def _repescar_esperando(self, colector: Any) -> None:
+        """Vuelve a evaluar todas las conversaciones que esperan referencia.
+
+        Que una conversacion no tuviera ancla la ultima vez no dice nada sobre
+        si la tiene ahora: puede haber llegado un mensaje en vivo, puede
+        haberse resuelto un alias entre telefono y LID, o puede que la
+        referencia estuviera guardada desde el principio y nadie la mirara.
+
+        No inventa nada. Usa la MISMA funcion que el motor de extraccion para
+        elegir ancla, asi que si no hay una referencia real la conversacion se
+        queda esperando, que es lo correcto.
+        """
+        from sqlalchemy import select
+
+        from app.models import Chat, ChatHistoryState
+
+        try:
+            with self._database.transaction() as sesion:
+                esperando = [
+                    fila[0]
+                    for fila in sesion.execute(
+                        select(ChatHistoryState.chat_id)
+                        .join(Chat, Chat.id == ChatHistoryState.chat_id)
+                        .where(ChatHistoryState.history_status == "waiting_seed")
+                    ).all()
+                    if fila[0] is not None
+                ]
+        except Exception:  # noqa: BLE001 - la repesca es una mejora, no un requisito
+            log.exception("No se pudieron listar las conversaciones que esperan")
+            return
+
+        if not esperando:
+            return
+
+        rescatadas = 0
+        for chat_id in esperando:
+            try:
+                if colector.promote_waiting_chat(chat_id):
+                    rescatadas += 1
+            except Exception:  # noqa: BLE001 - una conversacion no para al resto
+                log.debug("No se pudo reevaluar el chat %s", chat_id, exc_info=True)
+
+        log.info(
+            "[PLAN_E] repesca: %d de %d conversacion(es) que esperaban ya "
+            "tienen una referencia real con la que pedir historial",
+            rescatadas,
+            len(esperando),
+        )
 
     def _resolver_anclas_propias(self, runtime: Any, colector: Any) -> None:
         """Promueve a referencia los mensajes reales ya guardados. Nunca lanza."""
@@ -548,6 +686,7 @@ class SyncJob:
         self.state.chats_processed = int(
             getattr(backfill.stats, "chats_processed", 0) or 0
         )
+        self.state.backfill_started = self.state.chats_processed
         self._emitir()
         self._publish("backfill_progress", self.snapshot())
 
@@ -600,6 +739,28 @@ class SyncJob:
         except Exception:  # noqa: BLE001
             return 0
 
+    async def _fase_bordes_perdidos(self, runtime: Any) -> None:
+        """Cierra los agujeros de los mensajes en vivo indescifrables.
+
+        Va DESPUES de la excavacion normal y usa otro motor: aquella baja
+        desde el ancla mas antigua, y lo que falta aqui esta por arriba. No
+        reabre ningun ``exhausted``.
+        """
+        backfill = getattr(runtime, "backfill", None)
+        cliente = getattr(getattr(runtime, "client", None), "_client", None)
+        if backfill is None or cliente is None:
+            return
+        try:
+            from app.services.missed_live_filler import MissedLiveFiller
+
+            resumen = await MissedLiveFiller(self._database, backfill).cerrar_pendientes(
+                cliente
+            )
+        except Exception:  # noqa: BLE001 - una via de rescate no tumba el ciclo
+            log.exception("Fallo cerrando los bordes de mensajes perdidos")
+            return
+        self.state.recovered_messages += int(resumen.get("mensajes", 0) or 0)
+
     async def _fase_media(self, runtime: Any) -> None:
         """Recoge lo que quede pendiente de descargar."""
         self._fase("media")
@@ -611,9 +772,52 @@ class SyncJob:
         self.state.media_pending = media.pending_count()
         self._emitir()
 
+    def _anotar_ausencias(self, runtime: Any) -> None:
+        """Deja constancia de que conversaciones aparecieron en esta pasada.
+
+        NO borra ninguna. Una foto de WhatsApp puede venir incompleta --se
+        midieron 41 y 39 conversaciones en dos arranques de la misma cuenta--
+        y actuar sobre una sola ausencia convertiria un hueco temporal en una
+        perdida de historial.
+
+        Aqui solo se anota. Hacen falta varias ausencias seguidas para llamar
+        dudosa a una conversacion, y volver a aparecer lo deshace.
+        """
+        from app.services.ghost_chats import anotar_snapshot
+
+        vistos = getattr(self, "_vistos_en_la_pasada", None)
+        if not vistos:
+            # SIN FOTO NO SE ANOTA NADA, y es deliberado.
+            #
+            # Hoy la unica fuente de una lista COMPLETA de conversaciones es
+            # el inventario del segundo dispositivo (apagado por defecto) o un
+            # `INITIAL_BOOTSTRAP`. Derivarla de la propia base seria circular:
+            # todas las conversaciones apareceran siempre, y no se anotaria ni
+            # una ausencia jamas.
+            #
+            # Quien produzca una foto de verdad la deja en
+            # `_vistos_en_la_pasada` antes de la fase final. Mientras no la
+            # haya, esto no hace nada, que es lo correcto: castigar a las
+            # conversaciones porque la pasada no trajo lista es justo el error
+            # que esta capa evita.
+            log.debug("[SYNC] sin foto de conversaciones: no se anotan ausencias")
+            return
+        try:
+            with self._database.transaction() as sesion:
+                resultado = anotar_snapshot(
+                    sesion,
+                    vistos,
+                    account_id=getattr(runtime, "runtime_owner_account_id", None),
+                )
+            with self._lock:
+                self.state.stale_candidates = resultado.dudosas_totales
+        except Exception:  # noqa: BLE001 - anotar no puede tumbar el ciclo
+            log.exception("No se pudieron anotar las ausencias de la pasada")
+
     async def _fase_final(self, runtime: Any) -> None:
         """Segunda reconciliacion: lo recien traido cambia contadores."""
         self._fase("finalize")
+        await asyncio.to_thread(self._anotar_ausencias, runtime)
         from app.services.maintenance_service import MaintenanceService
 
         await asyncio.to_thread(
@@ -631,6 +835,14 @@ class SyncJob:
             getattr(runtime, "backfill", None),
             account_id=getattr(runtime, "runtime_owner_account_id", None),
         )
+        # El cierre del recuento: cuantas siguen esperando DESPUES de todo lo
+        # que esta pasada pudo hacer. Junto con `waiting_before` es lo unico
+        # que contesta si pulsar sirvio de algo.
+        self.state.waiting_after = self.state.waiting_seed
+        self.state.new_chats = max(
+            0, self.state.chats_total - (self.state.chats_al_empezar or 0)
+        )
+
         with self._lock:
             self.state.state = COMPLETE
             self.state.phase = None
@@ -638,12 +850,20 @@ class SyncJob:
 
         # UNA linea con lo que de verdad paso. Es lo que se lee para saber si
         # el ciclo sirvio de algo.
+        # `anclas_nuevas` cuenta FILAS de ancla insertadas, no conversaciones
+        # rescatadas: en una pasada real marco 3410 mientras `con_ancla` era 0,
+        # porque las 3410 salieron de excavar ocho conversaciones que ya
+        # funcionaban. Por eso al lado va SIEMPRE `promovidas`, que es la que
+        # responde a si el ciclo desatasco algo.
         log.info(
-            "complete chats=%d con_ancla=%d esperando=%d reintentos=%d "
+            "complete chats=%d con_ancla=%d esperando=%d (antes %d) "
+            "promovidas=%d reintentos=%d "
             "recuperados=%d anclas_nuevas=%d drive_pendiente=%d",
             self.state.chats_total,
             self.state.with_cursor,
             self.state.waiting_seed,
+            self.state.waiting_before,
+            self.state.promoted,
             self.state.retried,
             self.state.recovered_messages,
             self.state.new_seeds,

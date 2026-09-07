@@ -354,7 +354,10 @@ def test_la_cola_de_despertados_espera_su_turno(servicio, monkeypatch):
         )
 
     asyncio.run(escenario())
-    assert maximo == 1
+    # Antes se exigia UNA. Ahora el tope lo pone el ajuste: lo que no puede
+    # pasar es rebasarlo, ni que se solapen dos del mismo chat --y de eso se
+    # encarga el guard por conversacion, no este turno.
+    assert maximo <= servicio._settings.max_on_demand_concurrency
 
 
 # ---------------------------------------------------------------------------

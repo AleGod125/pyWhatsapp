@@ -483,6 +483,25 @@ def _whatsapp_vinculado(rt: Any, usuario: Any) -> bool:
     # vinculacion que se completo antes de que existiera este puente.
     _reconciliar_si_hace_falta(rt, usuario)
 
+    # Y LA RECONCILIACION AL REVES, que faltaba y era la causa del fallo.
+    #
+    # Habia DOS fuentes de verdad que se contradecian:
+    #
+    #   el guard     -> /onboarding/status -> columna `session_status`
+    #   el panel     -> /session           -> estado VIVO del runtime
+    #
+    # La columna sobrevive a una sesion revocada: el usuario desvincula desde
+    # el telefono, llegan los 401, y hasta que se archiva la sesion la fila
+    # sigue diciendo `linked`. Resultado medido: el onboarding contestaba
+    # `dashboard`, el guard dejaba entrar, y el panel ensenaba un cartel de
+    # "vuelve a vincular" dentro de una pantalla que no podia funcionar.
+    #
+    # Con el estado vivo diciendo que no hay vinculacion utilizable, no se
+    # puede contestar que la hay. La columna se corregira cuando se archive;
+    # el enrutado no puede esperar a eso.
+    if _sin_vinculacion_utilizable(rt, usuario):
+        return False
+
     with rt.database.transaction() as session_db:
         estados = session_db.execute(
             select(WhatsAppAccount.session_status).where(
@@ -490,6 +509,37 @@ def _whatsapp_vinculado(rt: Any, usuario: Any) -> bool:
             )
         ).scalars().all()
     return any(e in LINKED_STATUSES for e in estados)
+
+
+#: Estados del runtime que significan "ahora mismo NO hay vinculacion".
+#:
+#: `DISCONNECTED` y `RECONNECTING` quedan FUERA a proposito. El socket se cae
+#: constantemente --red, suspension, cambio de wifi-- y mandar al codigo QR
+#: por eso seria pedirle al usuario que rehaga algo que no esta roto. Son los
+#: unicos estados en los que de verdad hay que escanear.
+SIN_VINCULACION = frozenset(
+    {"NO_SESSION", "PAIRING", "PAIRING_REQUIRED", "QR_READY", "SESSION_INVALID"}
+)
+
+
+def _sin_vinculacion_utilizable(rt: Any, usuario: Any) -> bool:
+    """El runtime dice que no hay vinculacion, y es la de ESTE usuario.
+
+    Nunca se le quita la vinculacion a alguien por lo que le pase a la sesion
+    de otro: si el runtime no es suyo, esto no opina.
+    """
+    try:
+        estado = rt.state.state.value
+    except Exception:  # noqa: BLE001 - sin estado legible no se concluye nada
+        return False
+    if estado not in SIN_VINCULACION:
+        return False
+    dueno = getattr(rt, "runtime_owner_user_id", None)
+    # Sin dueno todavia --el runtime arranco y no ha vinculado a nadie-- el
+    # estado SI aplica: no hay sesion de nadie, y menos de este usuario.
+    if dueno is None:
+        return True
+    return dueno == usuario.id
 
 
 def _reconciliar_si_hace_falta(rt: Any, usuario: Any) -> None:

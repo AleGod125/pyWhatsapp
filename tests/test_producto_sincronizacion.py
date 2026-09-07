@@ -405,16 +405,23 @@ def test_un_cambio_de_estado_se_publica(session, settings):
     # Y con el identificador dentro: la pantalla indexa por `id`, y una
     # conversacion que llego por LID puede estar en la lista con el JID del
     # telefono, asi que comparar cadenas fallaria justo en ese caso.
-    assert avisos == [
-        (
-            "chat_history_status",
-            {
-                "chat_jid": chat.jid,
-                "chat_id": chat.id,
-                "history_status": "fetching",
-            },
-        )
-    ]
+    assert (
+        "chat_history_status",
+        {
+            "chat_jid": chat.jid,
+            "chat_id": chat.id,
+            "history_status": "fetching",
+        },
+    ) in avisos
+
+    # Y ademas el detalle POR CONVERSACION, que es lo que mira la vista del
+    # chat abierto. Antes esta prueba exigia la lista EXACTA de avisos; se
+    # cambia a comprobar los dos que importan, porque fijar la lista entera
+    # convierte cualquier aviso nuevo en un fallo aunque sea correcto.
+    porNombre = {nombre: datos for nombre, datos in avisos}
+    assert "history_chat_started" in porNombre
+    assert porNombre["history_chat_started"]["chat_id"] == chat.id
+    assert porNombre["history_chat_started"]["state"] == "fetching"
 
 
 def test_avisar_no_puede_cortar_la_excavacion(session, settings):

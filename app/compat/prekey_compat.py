@@ -118,6 +118,111 @@ class EstablishmentRegistry:
 
 _registry: EstablishmentRegistry | None = None
 
+#: La ruta del registro, recordada para poder reabrirlo solo.
+#:
+#: EL FALLO QUE ESTO CIERRA, MEDIDO EN UNA VINCULACION NUEVA
+#: ---------------------------------------------------------
+#: ``archive_session`` cierra el registro y lo deja en ``None`` --hace falta
+#: para poder mover el archivo en Windows-- y ``apply()`` solo corre una vez,
+#: en ``prepare_pywhats``, ANTES de crear el cliente. Si la sesion se archiva
+#: despues (un 401, un re-emparejamiento) nadie lo vuelve a abrir.
+#:
+#: Y el cuerpo del parche, con ``_registry`` en ``None``, cae de largo al
+#: camino original SIN DECIR NADA. La compatibilidad queda muerta para el
+#: resto de la vida del proceso.
+#:
+#: Se midio exactamente eso::
+#:
+#:     22:06:06  Adaptaciones activas: ... prekey_replay ...
+#:     22:06:29  Sesion archivada (revoked-401)      <- _registry = None
+#:     22:07:03  vinculacion nueva
+#:     22:07:04  uploaded 50 one-time prekeys (1..50)
+#:     22:07:26  primer mensaje de 855390@lid        -> OK, consume la OPK 21
+#:     22:07:52  segundo mensaje del MISMO dispositivo
+#:               unknown one-time pre-key id 21      -> y ya no hay quien lo salve
+#:
+#: Cero lineas ``PKMSG sender=`` en toda la ventana, y ``compat_prekey.db``
+#: sin llegar a existir: la prueba de que el parche no se ejecuto ni una vez.
+_ruta_del_registro: Path | None = None
+
+
+# ---------------------------------------------------------------------------
+# Establecimientos que NO se pueden completar
+# ---------------------------------------------------------------------------
+#
+# EL CASO, MEDIDO
+# ---------------
+# Un dispositivo de un contacto (``206566***:44@lid``) lleva desde el 3 de
+# septiembre mandando PreKeySignalMessage con la MISMA base key
+# (``b7331e3e``) y la MISMA clave de un solo uso (``17``). Esa clave se
+# consumio, correctamente, en otro establecimiento anterior, y su parte
+# privada ya no existe.
+#
+# Sin esa privada no se puede completar el X3DH. No es que falte codigo: el
+# secreto compartido no se puede derivar. El mensaje es indescifrable, y va a
+# seguir siendolo.
+#
+# LO QUE SE HACIA, Y POR QUE NO SERVIA
+# ------------------------------------
+# Por cada intento se mandaba un acuse de reintento, y a partir del segundo
+# con material publico para que el emisor rehiciera el saludo. Se midio: 69
+# acuses a ese dispositivo, 17 de ellos CON material, 180 intentos de
+# descifrado. La base key nunca cambio. El emisor no rehace el saludo.
+#
+# Asi que a partir de cierto punto insistir solo gasta: una clave de un solo
+# uso por acuse con material, y ruido en el registro. Se sigue intentando
+# descifrar cada mensaje --si el emisor rehace el saludo se vera al instante,
+# porque la base key sera otra-- pero se deja de pedir lo que no llega.
+#
+# NO se descarta ningun mensaje, NO se marca nada como leido y NO se toca
+# Signal. Lo unico que se corta es el acuse.
+
+#: Acuses por establecimiento antes de dejar de pedir. Cinco: bastante para
+#: que un emisor que SI reacciona tenga ocasion de hacerlo.
+ACUSES_ANTES_DE_DESISTIR = 5
+
+_imposibles: dict[str, dict[str, Any]] = {}
+MAXIMO_DE_IMPOSIBLES = 200
+
+
+def _anotar_imposible(sid: str, base_key: bytes, opk_id: int | None) -> None:
+    """Anota que este establecimiento no se puede completar.
+
+    Si la base key cambia, el emisor rehizo el saludo: se empieza de cero,
+    porque ese intento SI puede salir bien.
+    """
+    huella = _fingerprint(base_key)
+    anotado = _imposibles.get(sid)
+    if anotado is None or anotado.get("base_key_fp") != huella:
+        if len(_imposibles) >= MAXIMO_DE_IMPOSIBLES:
+            _imposibles.pop(next(iter(_imposibles)))
+        _imposibles[sid] = {
+            "base_key_fp": huella,
+            "opk_id": opk_id,
+            "fallos": 1,
+            "desde": time.time(),
+        }
+        return
+    anotado["fallos"] = int(anotado.get("fallos", 0)) + 1
+
+
+def insistir_es_inutil(sid: str) -> bool:
+    """Si ya se pidio bastante por un establecimiento que no puede completarse."""
+    anotado = _imposibles.get(sid)
+    if anotado is None:
+        return False
+    return int(anotado.get("fallos", 0)) > ACUSES_ANTES_DE_DESISTIR
+
+
+def establecimientos_imposibles() -> dict[str, dict[str, Any]]:
+    """Copia de lo anotado. Para diagnostico; no se modifica desde fuera."""
+    return {sid: dict(datos) for sid, datos in _imposibles.items()}
+
+
+def olvidar_imposibles() -> None:
+    """Para las pruebas y para un re-emparejamiento."""
+    _imposibles.clear()
+
 
 def _matches(pkmsg: Any, recorded: tuple[bytes, bytes] | None) -> bool:
     """El mensaje pertenece al establecimiento registrado."""
@@ -125,6 +230,33 @@ def _matches(pkmsg: Any, recorded: tuple[bytes, bytes] | None) -> bool:
         return False
     base_key, identity_key = recorded
     return pkmsg.base_key == base_key and pkmsg.identity_key == identity_key
+
+
+def _reabrir_registro() -> bool:
+    """Vuelve a abrir el registro tras un archivado. ``False`` si no se puede.
+
+    No inventa la ruta: usa la que dejo ``apply()``. Si nunca se aplico la
+    compatibilidad no hay nada que reabrir y se contesta que no.
+    """
+    global _registry
+
+    if _ruta_del_registro is None:
+        return False
+    try:
+        _registry = EstablishmentRegistry(_ruta_del_registro)
+    except Exception:  # noqa: BLE001 - no poder abrirlo no rompe la recepcion
+        log.warning(
+            "[SIGNAL] no se pudo reabrir el registro de establecimientos: los "
+            "PreKeySignalMessage repetidos volveran a pedir una clave de un "
+            "solo uso ya consumida",
+            exc_info=True,
+        )
+        return False
+    log.info(
+        "[SIGNAL] registro de establecimientos reabierto tras archivar la "
+        "sesion; la reutilizacion de ratchet vuelve a estar activa"
+    )
+    return True
 
 
 def apply(store_path: Path | None = None) -> bool:
@@ -141,7 +273,7 @@ def apply(store_path: Path | None = None) -> bool:
     reutilizacion de ratchet deja de existir en silencio y vuelve
     ``unknown one-time pre-key id N`` en cada PKMSG reenviado.
     """
-    global _registry
+    global _registry, _ruta_del_registro
 
     from pywhats.messaging.addressing import session_id
     from pywhats.messaging.receiver import Receiver
@@ -162,13 +294,23 @@ def apply(store_path: Path | None = None) -> bool:
         _registry = None
     if _registry is None:
         _registry = EstablishmentRegistry(store_path)
+    _ruta_del_registro = store_path
 
     original = Receiver._decrypt_enc
     if getattr(original, _MARKER, False):
         return True
 
     def _decrypt_enc(self: Any, sender: Any, enc_type: str, ciphertext: bytes) -> bytes:
-        if enc_type != "pkmsg" or _registry is None:
+        if enc_type != "pkmsg":
+            return original(self, sender, enc_type, ciphertext)
+
+        # Si el registro se cerro al archivar la sesion, se reabre AQUI.
+        #
+        # Antes se caia de largo al original en silencio y la compatibilidad
+        # quedaba muerta hasta reiniciar el proceso. Reabrirlo solo es lo unico
+        # que no depende de que alguien se acuerde de rearmarla despues de cada
+        # archivado, que es justo lo que no ocurrio.
+        if _registry is None and not _reabrir_registro():
             return original(self, sender, enc_type, ciphertext)
 
         # Misma normalizacion de direccion que hace el original antes de
@@ -222,8 +364,98 @@ def apply(store_path: Path | None = None) -> bool:
             )
             return plaintext
 
+        # --- Caso 1b: hay sesion pero NO hay registro -> lo dice el MAC ------
+        #
+        # EL CASO, MEDIDO
+        # ---------------
+        # El establecimiento de un contacto quedo HUERFANO: su sesion existe
+        # en el Signal Store, pero el registro no lo tiene porque cuando se
+        # creo, la compatibilidad estaba muerta (el registro se habia cerrado
+        # al archivar la sesion y nadie lo reabrio)::
+        #
+        #     sesiones Signal:   85539055239413:0@lid   <- existe
+        #     establecimientos:  (ninguno para ese sid)  <- se perdio
+        #     OPK 21:            consumida
+        #
+        # Resultado: cada reenvio cae al X3DH original, que pide la OPK 21 y
+        # falla. Para siempre, porque la privada de esa clave ya no existe y
+        # el registro no se puede reconstruir --las base key no se guardan en
+        # ningun otro sitio.
+        #
+        # POR QUE ESTO NO RELAJA NADA
+        # ---------------------------
+        # El registro solo sirve para DECIDIR que camino intentar. Quien
+        # autentica es el MAC, y aqui se verifica con la misma llamada de
+        # siempre. Si el mensaje pertenece de verdad a ese ratchet, el MAC
+        # cuadra y queda demostrado --prueba criptografica, mas fuerte que
+        # nuestra contabilidad--. Si no pertenece, el MAC falla y se sigue por
+        # el camino original, que es exactamente lo que pasa hoy.
+        #
+        # Ademas se exige que la identidad del emisor sea la MISMA que quedo
+        # fijada al crear la sesion: no se prueba nada contra un tercero.
+        if not matching and existing_session is not None:
+            fijada = self._identity_store.load(sid)
+            if fijada is not None and fijada == pkmsg.identity_key:
+                ad = fijada + self._identity.identity_public
+                try:
+                    plaintext = ratchet_decrypt(
+                        existing_session,
+                        pkmsg.message.header,
+                        pkmsg.message.ciphertext,
+                        ad,
+                        verify_mac=lambda mac_key: pkmsg.message.verify_mac(
+                            fijada,
+                            self._identity.identity_public,
+                            mac_key,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - no era ese ratchet: sigue igual
+                    log.debug(
+                        "Sesion sin registro: el ratchet existente NO descifra "
+                        "(sender=%s base_key_fp=%s); se delega en el original",
+                        sid,
+                        _fingerprint(pkmsg.base_key),
+                    )
+                else:
+                    # El MAC cuadro: este mensaje pertenece a esa sesion. Se
+                    # anota el establecimiento para no repetir la prueba.
+                    self._sessions.save(sid, existing_session)
+                    _registry.record(
+                        sid, pkmsg.base_key, pkmsg.identity_key, opk_id
+                    )
+                    log.info(
+                        "[SIGNAL] establecimiento huerfano recuperado por MAC "
+                        "(sender=%s base_key_fp=%s opk_id=%s): la sesion existia "
+                        "pero no estaba registrada",
+                        sid,
+                        _fingerprint(pkmsg.base_key),
+                        opk_id,
+                    )
+                    return plaintext
+
         # --- Caso 2: base key nueva o sin registro -> X3DH original ----------
-        plaintext = original(self, sender, enc_type, ciphertext)
+        try:
+            plaintext = original(self, sender, enc_type, ciphertext)
+        except Exception as exc:  # noqa: BLE001 - se clasifica y se RELANZA
+            # Una clave de un solo uso que ya no existe no vuelve a existir:
+            # se anota para dejar de pedir por ese establecimiento, y el
+            # error sigue su camino igual que antes.
+            if "unknown one-time pre-key" in str(exc):
+                _anotar_imposible(sid, pkmsg.base_key, opk_id)
+                # Y se anota el AGUJERO: ese mensaje existe, tiene su hora, y
+                # no se va a poder leer nunca por esta via. Lo que falta esta
+                # en el borde reciente y se cierra pidiendo historial, que
+                # llega firmado y por el camino de siempre.
+                try:
+                    from app.services.missed_live import anotar_perdido
+
+                    # La huella del texto cifrado identifica el mensaje sin
+                    # revelar nada: aqui el WAMID todavia va dentro de lo que
+                    # no se ha podido descifrar.
+                    anotar_perdido(sender, _fingerprint(ciphertext), str(exc))
+                except Exception:  # noqa: BLE001 - anotar no puede cortar nada
+                    log.debug("No se pudo anotar el agujero del borde")
+            raise
         # Solo se registra tras un descifrado correcto: si el original hubiera
         # fallado, no habria establecimiento que anotar.
         _registry.record(sid, pkmsg.base_key, pkmsg.identity_key, opk_id)

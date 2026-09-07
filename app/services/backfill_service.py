@@ -37,7 +37,13 @@ from app.services import repository as repo
 from app.core.config import Settings
 from app.core.database import Database
 from app.core.logging_setup import get_logger
-from app.models import Chat, ChatHistoryState, HistoryRequest
+# `Message` lo usan los tres metodos del borde reciente --`_wamids_de`,
+# `_marca_mas_antigua` y el que elige el ancla-- y faltaba. No fallaba porque
+# ese bloque no tenia ni un llamante en produccion: se escribio, se probo la
+# logica de decision por separado, y nadie llego a ejecutar las consultas.
+# El primer llamante real reviento con `NameError: name 'Message' is not
+# defined` en cuanto hubo un agujero que cerrar.
+from app.models import Chat, ChatHistoryState, HistoryRequest, Message
 
 log = get_logger("BACKFILL")
 
@@ -214,7 +220,11 @@ class BackfillService:
         #
         # El Lock se crea perezosamente: el servicio se construye fuera del
         # bucle donde luego se usa.
-        self._ondemand_lock: asyncio.Lock | None = None
+        self._ondemand_lock: asyncio.Semaphore | None = None
+        #: Quien decide el orden. Sin el, se atiende por actividad como antes.
+        from app.history.scheduler import HistoryScheduler
+
+        self.scheduler = HistoryScheduler()
         # Mientras esto vale True, los blobs ON_DEMAND se observan pero NO se
         # persisten. Solo los ON_DEMAND: un INITIAL_BOOTSTRAP que llegue a la
         # vez se guarda como siempre, porque no es lo que se esta probando y
@@ -225,6 +235,11 @@ class BackfillService:
         self.diagnostico_sin_persistir = False
         # Respuestas ON_DEMAND que llegaron sin nadie esperandolas.
         self.respuestas_sin_waiter = 0
+        #: Respuestas que llegaron tarde, cuando su peticion ya no esperaba.
+        #: Con varias peticiones en vuelo esto deja de ser teorico.
+        self.respuestas_tardias = 0
+        #: Numero de orden del ultimo lote publicado, por conversacion.
+        self._orden_de_lote: dict[str, int] = {}
         self._ultimo_aviso_sin_waiter = 0.0
         # ``enc.type`` de la ultima peticion: ``msg`` (sesion establecida) o
         # ``pkmsg`` (sesion nueva). Es la diferencia medida entre las 73
@@ -335,6 +350,20 @@ class BackfillService:
             waiting = self._pending.get(conversation.jid)
             if waiting is None:
                 continue
+            # CON UNA SALVEDAD, y hace falta al permitir varias en vuelo: si la
+            # respuesta trae identificador de peticion y NO es el de la espera
+            # que hay ahora para ese chat, es una respuesta TARDIA de una
+            # peticion anterior. Despertar con ella a la peticion nueva le
+            # atribuiria datos que no son suyos, y encima la daria por
+            # contestada.
+            if sesion and waiting.request_id and waiting.request_id != sesion:
+                self.respuestas_tardias += 1
+                log.debug(
+                    "[ON_DEMAND] respuesta tardia descartada chat=%s: es de otra "
+                    "peticion",
+                    _short(conversation.jid),
+                )
+                continue
             waiting.messages += len(conversation.messages)
             waiting.end_of_history_type = conversation.end_of_history_type
             if waiting.correlacion is None:
@@ -408,7 +437,13 @@ class BackfillService:
 
         with self._database.transaction() as session:
             rows = session.execute(
-                select(Chat.id, Chat.jid, ChatHistoryState.next_retry_at)
+                select(
+                    Chat.id,
+                    Chat.jid,
+                    ChatHistoryState.next_retry_at,
+                    Chat.last_message_timestamp,
+                    ChatHistoryState.history_status,
+                )
                 .outerjoin(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
                 .where(
                     (ChatHistoryState.history_status.is_(None))
@@ -421,18 +456,33 @@ class BackfillService:
                 .order_by(Chat.last_message_timestamp.desc().nulls_last())
                 .limit(limit)
             ).all()
-            listos = []
+            candidatos = []
             en_espera = 0
-            for chat_id, chat_jid, proximo in rows:
+            for chat_id, chat_jid, proximo, ultimo, estado in rows:
                 if not self.is_backfill_candidate(chat_jid):
                     continue
                 if not espera_cumplida(proximo):
                     en_espera += 1
                     continue
-                listos.append((chat_id, chat_jid))
+                candidatos.append(
+                    {
+                        "chat_id": chat_id,
+                        "chat_jid": chat_jid,
+                        "ultimo_mensaje": ultimo,
+                        "reintentando": str(estado or "") in ("timeout", "error"),
+                    }
+                )
         if en_espera:
             log.debug("%d chat(s) esperan su turno de reintento", en_espera)
-        return listos
+
+        # El ORDEN lo decide el planificador: lo que el usuario tiene abierto
+        # va primero. Antes se atendia por actividad y punto, asi que abrir una
+        # conversacion no cambiaba nada y podia costar minutos que le llegara
+        # el turno.
+        planificador = getattr(self, "scheduler", None)
+        if planificador is None:
+            return [(c["chat_id"], c["chat_jid"]) for c in candidatos]
+        return [(t.chat_id, t.chat_jid) for t in planificador.ordenar(candidatos)]
 
     def chats_with_cursor(self, limit: int = 500) -> list[tuple[int, str, Any]]:
         """Los candidatos que ADEMAS tienen un ancla real, con ella.
@@ -929,18 +979,7 @@ class BackfillService:
                 con_cursor,
             )
 
-            for chat_id, chat_jid in chats:
-                if self._stop:
-                    break
-                try:
-                    await self._process_chat(chat_id, chat_jid, max_rounds_per_chat)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - un chat no arrastra al resto
-                    log.exception("Fallo procesando %s", chat_jid)
-                    self._set_status(chat_jid, "error", str(exc)[:400])
-                    self.stats.errors += 1
-                self.stats.chats_processed += 1
+            await self._procesar_en_paralelo(chats, max_rounds_per_chat)
 
             gained = self.stats.messages_new - before_total
             log.info(
@@ -994,6 +1033,62 @@ class BackfillService:
 
     def stop(self) -> None:
         self._stop = True
+
+    async def _procesar_en_paralelo(
+        self, chats: list[tuple[int, str]], max_rounds: int
+    ) -> None:
+        """Varias conversaciones a la vez, sin que una lenta pare a las demas.
+
+        Antes esto era un `for` con `await` dentro: estrictamente una
+        conversacion detras de otra. Con esperas de 45 segundos, cuatro chats
+        que no contestan son tres minutos en los que no avanza nada, teniendo
+        el telefono libre todo el rato.
+
+        El tope real de peticiones en vuelo no lo pone esto: lo pone el
+        semaforo de `_turno_ondemand`. Aqui solo se deja de esperar en fila.
+
+        Una conversacion sigue sin poder tener dos peticiones a la vez: de eso
+        se encarga `_in_flight`, y por eso repartirlas es seguro.
+        """
+        if not chats:
+            return
+
+        pendientes = list(chats)
+        trabajadores = max(
+            1, int(getattr(self._settings, "max_on_demand_concurrency", 1) or 1)
+        )
+        trabajadores = min(trabajadores, len(pendientes))
+
+        indice = 0
+        candado = asyncio.Lock()
+
+        async def _siguiente() -> tuple[int, str] | None:
+            nonlocal indice
+            async with candado:
+                if self._stop or indice >= len(pendientes):
+                    return None
+                elegido = pendientes[indice]
+                indice += 1
+                return elegido
+
+        async def _trabajador() -> None:
+            while True:
+                siguiente = await _siguiente()
+                if siguiente is None:
+                    return
+                chat_id, chat_jid = siguiente
+                try:
+                    await self._process_chat(chat_id, chat_jid, max_rounds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - un chat no arrastra al resto
+                    log.exception("Fallo procesando %s", chat_jid)
+                    self._set_status(chat_jid, "error", str(exc)[:400])
+                    self.stats.errors += 1
+                self.stats.chats_processed += 1
+
+        log.info("[HISTORY] inflight=hasta %d/%d chats", trabajadores, len(pendientes))
+        await asyncio.gather(*(_trabajador() for _ in range(trabajadores)))
 
     async def _process_chat(self, chat_id: int, chat_jid: str, max_rounds: int) -> None:
         """Pide historial de un chat hasta agotarlo DE VERDAD.
@@ -1095,6 +1190,10 @@ class BackfillService:
             # (mensajes nuevos que entraron mientras se esperaba).
             en_vivo = max(0, (after - before) - gained)
             self.stats.messages_new += gained
+            # El estado no cambia entre lotes --sigue en `fetching`--, asi que
+            # sin este aviso la vista del chat abierto no veria avanzar nada
+            # hasta el final.
+            self.avisar_lote(chat_jid, gained)
 
             log.debug(
                 "%s ronda %d: respuesta=%s blob=%d insertados_del_blob=%d "
@@ -1335,11 +1434,38 @@ class BackfillService:
         resultado["capability_after"] = self.capability_state()
         return resultado
 
-    def _lock_ondemand(self) -> asyncio.Lock:
-        """El candado que serializa TODAS las peticiones ON_DEMAND."""
+    def _turno_ondemand(self) -> asyncio.Semaphore:
+        """Cuantas peticiones ON_DEMAND pueden estar en vuelo a la vez.
+
+        ANTES ERA UN CANDADO, Y ESE ERA EL CUELLO DE BOTELLA
+        ----------------------------------------------------
+        Con un candado, un chat que no contesta bloquea a todos los demas
+        durante los 45 segundos que dura su espera. Se midio en la sesion
+        real: cuatro esperas seguidas agotadas son tres minutos en los que no
+        avanza nada, teniendo el telefono libre.
+
+        Y no hacia falta. Lo que exige la correlacion es que cada respuesta
+        despierte UNICAMENTE a su peticion, y eso ya estaba resuelto: las
+        esperas viven en un diccionario por conversacion, se correlaciona
+        primero por el identificador exacto de la stanza y solo despues por
+        JID, y un `INITIAL_BOOTSTRAP` no despierta a nadie. Serializar era una
+        precaucion de mas, no un requisito del protocolo.
+
+        Una sola conversacion sigue sin poder tener dos peticiones en vuelo
+        --de eso se encarga `_in_flight`--, pero cuatro conversaciones
+        distintas pueden avanzar a la vez.
+
+        Se baja a 1 con `MAX_ON_DEMAND_CONCURRENCY=1`, que deja el
+        comportamiento de antes para depurar.
+        """
         if self._ondemand_lock is None:
-            self._ondemand_lock = asyncio.Lock()
+            tope = int(getattr(self._settings, "max_on_demand_concurrency", 3) or 1)
+            self._ondemand_lock = asyncio.Semaphore(max(1, tope))
         return self._ondemand_lock
+
+    #: Nombre de antes. Se conserva porque hay codigo y pruebas que lo usan, y
+    #: un semaforo se usa igual que un candado con `async with`.
+    _lock_ondemand = _turno_ondemand
 
     async def _request_once(self, chat_id: int, chat_jid: str, cursor: Any) -> bool:
         """Emite una peticion y espera su respuesta. ``True`` si llego.
@@ -1597,6 +1723,85 @@ class BackfillService:
                 .values(history_status=status, last_error=error)
             )
         self._avisar_estado(chat_jid, status)
+        self._avisar_del_historial(chat_jid, status, error=error)
+
+    #: Que evento por conversacion corresponde a cada estado.
+    #:
+    #: Se deriva del estado en vez de esparcir emisiones por el bucle: el
+    #: estado ya se fija en todos los puntos que importan, asi que colgarse de
+    #: el evita que un camino nuevo se olvide de avisar.
+    _EVENTO_POR_ESTADO = {
+        "fetching": "history_chat_started",
+        "timeout": "history_chat_retrying",
+        "exhausted": "history_chat_completed",
+        "server_limited": "history_chat_completed",
+        "no_valid_cursor": "history_chat_waiting_seed",
+        "waiting_seed": "history_chat_waiting_seed",
+        "error": "history_chat_error",
+    }
+
+    def _avisar_del_historial(
+        self, chat_jid: str, status: str, *, error: str | None = None, nuevos: int = 0
+    ) -> None:
+        """El detalle por conversacion, para la vista del chat abierto.
+
+        `chat.status` sirve para la lista; esto es para la conversacion que el
+        usuario tiene delante, que necesita saber si esta recuperando, si
+        espera referencia o si ya termino, y cuantos mensajes van entrando.
+
+        Avisar nunca puede cortar la excavacion.
+        """
+        evento = self._EVENTO_POR_ESTADO.get(status)
+        if evento is None:
+            return
+        publicar = getattr(self, "publish", None)
+        if publicar is None:
+            return
+        try:
+            publicar(
+                evento,
+                {
+                    "chat_jid": chat_jid,
+                    "chat_id": self._id_de_chat(chat_jid),
+                    "state": status,
+                    "messages_added": int(nuevos),
+                    "error": (error or None) if status == "error" else None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("No se pudo publicar el detalle del historial")
+
+    def avisar_lote(self, chat_jid: str, nuevos: int) -> None:
+        """Un lote valido acaba de entrar en la base.
+
+        Va aparte del estado porque el estado NO cambia entre lotes: la
+        conversacion sigue en `fetching` mientras encadena peticiones, y sin
+        esto la vista no vería avanzar nada hasta el final.
+        """
+        if nuevos <= 0:
+            return
+        publicar = getattr(self, "publish", None)
+        if publicar is None:
+            return
+        # Un numero de orden por conversacion. Hace falta de verdad: sin el,
+        # la pantalla no puede distinguir "el canal reenvio el mismo aviso"
+        # de "entraron otros cincuenta", porque dos lotes reales de 50 son
+        # identicos byte a byte. Un hash del contenido descartaria el segundo.
+        self._orden_de_lote[chat_jid] = self._orden_de_lote.get(chat_jid, 0) + 1
+        try:
+            publicar(
+                "history_chat_progress",
+                {
+                    "chat_jid": chat_jid,
+                    "chat_id": self._id_de_chat(chat_jid),
+                    "state": "fetching",
+                    "messages_added": int(nuevos),
+                    "seq": self._orden_de_lote[chat_jid],
+                },
+            )
+            log.info("[HISTORY] progress chat=%s new=%d", _short(chat_jid), nuevos)
+        except Exception:  # noqa: BLE001
+            log.debug("No se pudo publicar el avance del historial")
 
     def _id_de_chat(self, chat_jid: str) -> int | None:
         """El identificador numerico, para que la pantalla no tenga que buscarlo.

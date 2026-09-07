@@ -181,6 +181,17 @@ def apply(settings: Any) -> bool:
         if not propio:
             return original(self, sender, enc_type, ciphertext)
 
+        # CUALQUIER cosa que llegue de un dispositivo propio puede ser la
+        # respuesta a un acuse de reintento. Se anota antes de intentar nada:
+        # si el telefono contesta, esto lo dira; y si no contesta nunca, su
+        # ausencia es exactamente el hecho que hay que poder demostrar.
+        try:
+            from app.compat.own_retry_trace import anotar_respuesta
+
+            anotar_respuesta(sender=sender, enc_type=enc_type)
+        except Exception:  # noqa: BLE001 - el diagnostico no corta la recepcion
+            pass
+
         sid = session_id(sender)
         es_lid = getattr(sender, "server", "") == "lid"
         antes = None

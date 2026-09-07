@@ -1489,6 +1489,16 @@ EVENT_NAMES: dict[str, str] = {
     # cargo: un chat podia decir "Recuperando historial" con el trabajo ya
     # terminado, o "Esperando referencia" con tres mil mensajes dentro.
     "chat_history_status": "chat.status",
+    # Y el detalle POR CONVERSACION, para la vista del chat abierto. La lista
+    # se conforma con `chat.status`; la conversacion que el usuario tiene
+    # delante necesita saber si esta recuperando, si espera referencia, si ya
+    # termino, y cuantos mensajes van entrando.
+    "history_chat_started": "history.chat.started",
+    "history_chat_progress": "history.chat.progress",
+    "history_chat_retrying": "history.chat.retrying",
+    "history_chat_waiting_seed": "history.chat.waiting_seed",
+    "history_chat_completed": "history.chat.completed",
+    "history_chat_error": "history.chat.error",
     # El indice de WhatsApp Web termino: puede haber conversaciones nuevas.
     "web_inventory_done": "chat.inventory",
     # Y una por una, con su fila entera dentro. Es lo que permite que una
@@ -1944,3 +1954,91 @@ def history_recheck_pending_status(job_id: str):
     if trabajo is None:
         return _error("trabajo no encontrado", 404)
     return jsonify(trabajo.to_json())
+
+
+@api.post("/chats/<int:chat_id>/history/priority")
+@requiere_drive
+def chat_history_priority(chat_id: int):
+    """El usuario abrio este chat: pasa al principio de la cola.
+
+    POR QUE HACE FALTA
+    ------------------
+    La excavacion atendia las conversaciones por actividad, de la mas nueva a
+    la mas vieja. Abrir una conversacion no cambiaba nada: si estaba en la
+    posicion treinta, le tocaba en la posicion treinta, y cada puesto puede
+    costar hasta 45 segundos. El usuario abria un chat y no pasaba nada.
+
+    QUE HACE, Y QUE NO
+    ------------------
+    Sube la prioridad y despierta al motor. **No** encola una peticion nueva:
+    de que no haya dos peticiones a la vez de la misma conversacion se encarga
+    la guardia por chat del motor, asi que pulsar diez veces sube la prioridad
+    una vez y no produce diez peticiones.
+
+    Tampoco pide nada al servidor por si mismo. Un chat sin ancla sigue sin
+    poder excavarse por mucha prioridad que tenga: se queda esperando
+    referencia, y se dice tal cual en la respuesta.
+    """
+    rt = runtime()
+    if rt.database is None:
+        return _error("la base de datos no esta disponible", 503)
+
+    sesion = _session()
+    if sesion is None:
+        return _error("la base de datos no esta disponible", 503)
+    try:
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
+        from app.models import Chat, ChatHistoryState
+
+        fila = sesion.get(Chat, chat_id)
+        if fila is None:
+            return _error("chat no encontrado", 404)
+        chat_jid = fila.jid
+        estado = (
+            sesion.query(ChatHistoryState)
+            .filter(ChatHistoryState.chat_id == chat_id)
+            .one_or_none()
+        )
+        situacion = estado.history_status if estado is not None else None
+    finally:
+        sesion.close()
+
+    backfill = getattr(rt, "backfill", None)
+    planificador = getattr(backfill, "scheduler", None)
+    if planificador is None:
+        return jsonify(
+            {
+                "chat_id": chat_id,
+                "prioritized": False,
+                "reason": "SCHEDULER_UNAVAILABLE",
+                "state": situacion,
+            }
+        )
+
+    planificador.marcar_interactiva(chat_jid)
+
+    # Y se le da un empujon por la MISMA cola que usa todo lo demas, en vez de
+    # inventar un camino nuevo: encolar es lo que despierta al motor cuando
+    # aparece un ancla, y sirve igual cuando lo que aparece es un usuario
+    # mirando. `enqueue` no bloquea, no espera y no lanza.
+    despertado = False
+    cola = getattr(rt, "seed_queue", None)
+    encolar = getattr(cola, "enqueue", None)
+    if callable(encolar) and situacion != "waiting_seed":
+        try:
+            despertado = bool(encolar([chat_jid]))
+        except Exception:  # noqa: BLE001 - priorizar no puede tumbar la peticion
+            log.debug("No se pudo encolar el chat priorizado")
+
+    return jsonify(
+        {
+            "chat_id": chat_id,
+            "prioritized": True,
+            "woken": despertado,
+            "state": situacion,
+            # Sin ancla la prioridad no sirve de nada todavia, y el frontend
+            # tiene que poder decirlo en vez de girar un spinner para siempre.
+            "waiting_seed": situacion == "waiting_seed",
+        }
+    )

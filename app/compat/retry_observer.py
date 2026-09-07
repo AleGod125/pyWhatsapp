@@ -104,6 +104,40 @@ def _estado_de(wamid: str) -> _EstadoDeReintento:
     return estado
 
 
+def _no_vale_la_pena_insistir(sender: Any) -> bool:
+    """Si ya se pidio de sobra por un establecimiento que no puede completarse.
+
+    Ante la duda se contesta ``False``: dejar de mandar acuses que si servian
+    seria peor que mandar alguno de mas.
+    """
+    try:
+        from pywhats.messaging.addressing import session_id
+
+        from app.compat.prekey_compat import insistir_es_inutil
+
+        return insistir_es_inutil(session_id(sender))
+    except Exception:  # noqa: BLE001 - no saberlo no puede cortar el acuse
+        return False
+
+
+def _sin_sesion_con(receptor: Any, sender: Any) -> bool:
+    """Si no existe NINGUN registro de sesion con ese remitente.
+
+    Se mira el almacen, que es donde esta el hecho. No se deduce del texto del
+    error ni se toca nada: es una lectura.
+
+    Ante la duda se contesta ``False``, que deja la regla de siempre. Adjuntar
+    material publico de mas gasta una clave de un solo uso; no adjuntarlo
+    cuando hacia falta solo repite el acuse simple del intento siguiente.
+    """
+    try:
+        from pywhats.messaging.addressing import session_id
+
+        return receptor._sessions.load(session_id(sender)) is None
+    except Exception:  # noqa: BLE001 - no poder mirarlo no cambia el acuse
+        return False
+
+
 def apply(tracker: Any, settings: Any = None) -> bool:
     """Instala la observación y la corrección del contador. Idempotente."""
     global _tracker, _settings
@@ -124,6 +158,25 @@ def apply(tracker: Any, settings: Any = None) -> bool:
 
         estado = _estado_de(wamid)
         ahora = time.monotonic()
+
+        # Un establecimiento que no puede completarse no se arregla pidiendo.
+        #
+        # Si el emisor insiste con una clave de un solo uso ya consumida, su
+        # parte privada no existe y el X3DH no se puede derivar. Se midio: 69
+        # acuses al mismo dispositivo, 17 con material publico, y la base key
+        # nunca cambio. Cada acuse con material gasta una clave de un solo
+        # uso, asi que a partir de cierto punto insistir solo cuesta.
+        #
+        # Se sigue intentando descifrar cada mensaje: si el emisor rehace el
+        # saludo se vera al momento, porque la base key sera otra y el
+        # recuento empieza de cero.
+        if _no_vale_la_pena_insistir(sender):
+            log.debug(
+                "[SIGNAL] acuse de reintento omitido id=%s: el emisor insiste "
+                "con una clave de un solo uso ya consumida",
+                wamid[:8],
+            )
+            return None
 
         # UN acuse por mensaje a la vez. Se midio el mismo WAMID recibiendo
         # dos en 253 ms; el segundo no aporta nada, porque el emisor todavia
@@ -151,6 +204,37 @@ def apply(tracker: Any, settings: Any = None) -> bool:
         from app.compat.retry_keys import INTENTO_DESDE_EL_QUE_SE_ADJUNTA
 
         con_claves = intentos >= INTENTO_DESDE_EL_QUE_SE_ADJUNTA
+
+        # ... salvo cuando NO HAY SESION NINGUNA con ese remitente.
+        #
+        # EL BLOQUEO, MEDIDO
+        # ------------------
+        # Esperar al segundo intento supone que habra un segundo intento. Para
+        # las copias de nuestro propio telefono no lo hay: el telefono manda
+        # la copia UNA vez, no la descifra nadie, y como nunca vuelve a
+        # mandarla el contador se queda clavado en 1 para siempre.
+        #
+        # En el registro local: 303 acuses a nuestro propio LID, los 303 de
+        # 100 bytes --el acuse simple-- y ni uno con material. El telefono los
+        # confirma con un ack y no reenvia nada, porque sin nuestras claves
+        # publicas no tiene con que rehacer el saludo.
+        #
+        # La razon de esperar era no regalar una clave de un solo uso en cada
+        # mensaje que llegue desordenado. Ese razonamiento vale cuando hay una
+        # sesion: el mensaje puede venir fuera de orden. Sin sesion no hay
+        # nada con lo que estar desordenado, y el material publico es
+        # justamente lo unico que puede desatascarlo.
+        #
+        # OJO: esto NO toca el fallo de MAC. Un MAC que no cuadra significa
+        # que la sesion EXISTE y esta desincronizada, no que falte; ese caso
+        # sigue la regla de siempre y el mensaje sigue sin aceptarse.
+        if not con_claves and _sin_sesion_con(self, sender):
+            con_claves = True
+            log.debug(
+                "[SIGNAL] acuse id=%s: no hay sesion con el remitente, "
+                "se adjunta el material publico ya en el primer intento",
+                wamid[:8],
+            )
 
         if intentos > 1 or con_claves:
             enviado = await _enviar_con_contador(
@@ -222,6 +306,7 @@ async def _enviar_con_contador(
         # El material publico, sólo si toca. Si no se puede reunir, se manda
         # el acuse sin él: un acuse sin claves sigue siendo mejor que ninguno.
         claves_puestas = False
+        material = None
         if con_claves and _settings is not None:
             from app.compat.retry_keys import bloque_de_claves, material_de
 
@@ -232,13 +317,46 @@ async def _enviar_con_contador(
                 claves_puestas = True
 
         atributos: dict[str, Any] = {"id": wamid, "type": "retry", "to": sender}
-        # En un grupo el emisor real va en `participant`, y sin él el servidor
-        # no sabe a quién pedirle el reenvío.
-        if "participant" in node.attrs:
-            atributos["participant"] = node.attrs["participant"]
+        # Los atributos de ENRUTADO se copian tal cual venian.
+        #
+        # `participant` ya se copiaba: en un grupo el emisor real va ahi y sin
+        # el el servidor no sabe a quien pedirle el reenvio.
+        #
+        # `recipient` NO se copiaba, y es el que falta para una copia del
+        # telefono propio. Cuando el mensaje lo escribes tu, la stanza va de
+        # tu cuenta a tu cuenta y quien distingue de que conversacion se trata
+        # es ese atributo. El propio pywhats ya lo reconoce como atributo de
+        # enrutado --`_build_ack_node` copia `participant`, `recipient` y
+        # `type` al construir el ack-- pero su acuse de reintento se dejaba
+        # `recipient` fuera. Esa asimetria es la unica diferencia estructural
+        # que se ha encontrado entre lo que mandamos y lo que manda un cliente
+        # moderno.
+        #
+        # Es una copia condicional: si el atributo no viene, no se anade nada
+        # y la stanza queda EXACTAMENTE como estaba. Para un contacto normal
+        # --el camino que hoy funciona-- no cambia ni un byte.
+        for atributo in ("participant", "recipient"):
+            if atributo in node.attrs:
+                atributos[atributo] = node.attrs[atributo]
 
         acuse = Node(tag="receipt", attrs=atributos, content=hijos)
         await receptor._transport.send(encode(acuse))
+
+        # Y se deja constancia de lo que salio, para poder correlacionar si el
+        # telefono contesta. Es diagnostico: no cambia ninguna decision.
+        try:
+            from app.compat.own_retry_trace import anotar_envio
+
+            anotar_envio(
+                wamid=wamid,
+                destino=sender,
+                atributos_del_mensaje=node.attrs,
+                atributos_del_acuse=atributos,
+                intentos=intentos,
+                material=material if con_claves else None,
+            )
+        except Exception:  # noqa: BLE001 - el diagnostico no puede cortar nada
+            log.debug("No se pudo anotar el acuse", exc_info=True)
     except Exception:  # noqa: BLE001 - que lo mande el original
         log.debug("Fallo enviando el acuse con contador real", exc_info=True)
         return False

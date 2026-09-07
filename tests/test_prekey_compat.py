@@ -189,9 +189,25 @@ def patched(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_bug_reproducido_sin_parche(alice, bob):
-    """Sin parche, el segundo PKMSG del mismo establecimiento revienta."""
+def test_bug_reproducido_sin_parche(alice, bob, monkeypatch):
+    """Sin parche, el segundo PKMSG del mismo establecimiento revienta.
+
+    Es el bug de pywhats 0.2.0, y se documenta aqui para que se vea que la
+    compatibilidad no es un capricho.
+
+    Para reproducirlo hay que dejar la compatibilidad SIN registro y SIN ruta
+    con la que reabrirlo. Antes bastaba con vaciar el registro, porque el
+    parche caia de largo al original en silencio -- y eso resulto ser un fallo
+    real: tras archivar la sesion la compatibilidad quedaba muerta el resto de
+    la vida del proceso. Ahora se reabre sola, asi que simular "sin parche"
+    exige quitarle tambien la ruta.
+    """
     from pywhats.messaging.receiver import Receiver
+
+    from app.compat import prekey_compat
+
+    monkeypatch.setattr(prekey_compat, "_registry", None, raising=False)
+    monkeypatch.setattr(prekey_compat, "_ruta_del_registro", None, raising=False)
 
     receiver = make_receiver(bob)
     session = AliceSession(alice, bob, opk_id=77)
@@ -317,3 +333,97 @@ def test_registro_sobrevive_a_reinicio(alice, bob, tmp_path):
         if prekey_compat._registry is not None:
             prekey_compat._registry.close()
             prekey_compat._registry = None
+
+
+# ---------------------------------------------------------------------------
+# Establecimiento HUERFANO: hay sesion, no hay registro
+# ---------------------------------------------------------------------------
+#
+# EL CASO, MEDIDO
+# ---------------
+# La sesion de un contacto existia en el Signal Store, pero su establecimiento
+# nunca llego al registro: cuando se creo, la compatibilidad estaba muerta --el
+# registro se habia cerrado al archivar la sesion y nadie lo reabrio--.
+#
+#     sesiones Signal:   85539055239413:0@lid   <- existe
+#     establecimientos:  (ninguno para ese sid)  <- se perdio
+#     OPK 21:            consumida
+#
+# Cada reenvio caia al X3DH original, pedia la OPK 21 y fallaba. Para siempre:
+# la privada ya no existe y las base key no se guardan en ningun otro sitio,
+# asi que el registro no se puede reconstruir.
+#
+# QUIEN DECIDE AQUI ES EL MAC
+# ---------------------------
+# El registro solo elige que camino intentar. La autenticacion la hace el MAC,
+# con la misma llamada de siempre. Si el mensaje pertenece a ese ratchet queda
+# demostrado criptograficamente; si no, se sigue por el camino original.
+
+
+def test_HUERFANO_SE_RECUPERA_PORQUE_EL_MAC_LO_DEMUESTRA(alice, bob, patched):
+    """LA REGLA. Sesion viva, registro vacio, y el MAC decide."""
+    from pywhats.messaging.receiver import Receiver
+
+    receiver = make_receiver(bob)
+    session = AliceSession(alice, bob, opk_id=77)
+
+    # Primer mensaje: crea la sesion y consume la OPK.
+    assert Receiver._decrypt_enc(receiver, SENDER, "pkmsg", session.encrypt(b"uno")) == b"uno"
+    assert bob.consumed == [77]
+
+    # Se BORRA el registro, dejando la sesion viva: es el estado exacto que se
+    # midio sobre la base real.
+    patched._registry.record  # el registro existe...
+    patched._registry._conn.execute("DELETE FROM prekey_establishments")
+    patched._registry._conn.commit()
+    assert patched._registry.get(SESSION_ID) is None
+    assert receiver._sessions.load(SESSION_ID) is not None
+
+    # Y el reenvio se recupera igual, porque el MAC cuadra.
+    assert Receiver._decrypt_enc(receiver, SENDER, "pkmsg", session.encrypt(b"dos")) == b"dos"
+    # La OPK NO se vuelve a consumir: no se rehizo X3DH.
+    assert bob.consumed == [77]
+    # Y queda anotado, para no repetir la prueba en cada mensaje.
+    assert patched._registry.get(SESSION_ID) is not None
+
+
+def test_un_ratchet_QUE_NO_ES_no_se_acepta(alice, bob, patched):
+    """El limite: si el MAC no cuadra, no se acepta nada.
+
+    Otra Alice --otra identidad, otro establecimiento-- con la OPK ya
+    consumida. La sesion existe, el registro esta vacio, y aun asi el mensaje
+    se rechaza: es lo que separa esto de un bypass.
+    """
+    from pywhats.messaging.receiver import Receiver
+    from pywhats.signal.experimental import IdentityKeyPair
+    from pywhats.socket.crypto import generate_keypair
+
+    receiver = make_receiver(bob)
+    primera = AliceSession(alice, bob, opk_id=77)
+    assert Receiver._decrypt_enc(receiver, SENDER, "pkmsg", primera.encrypt(b"uno")) == b"uno"
+
+    patched._registry._conn.execute("DELETE FROM prekey_establishments")
+    patched._registry._conn.commit()
+
+    # Una identidad DISTINTA que referencia la misma OPK, ya consumida.
+    priv, pub = generate_keypair()
+    otra = IdentityKeyPair(private=priv, public=pub)
+    bob.add_one_time_pre_key(77)          # para poder construir el bundle
+    impostora = AliceSession(otra, bob, opk_id=77)
+    bob._opks.pop(77, None)               # y se vuelve a consumir: ya no existe
+
+    with pytest.raises(Exception):
+        Receiver._decrypt_enc(receiver, SENDER, "pkmsg", impostora.encrypt(b"no"))
+
+
+def test_sin_sesion_previa_el_huerfano_no_aplica(alice, bob, patched):
+    """Sin sesion no hay ratchet que probar: el camino es el X3DH de siempre."""
+    from pywhats.messaging.receiver import Receiver
+
+    receiver = make_receiver(bob)
+    session = AliceSession(alice, bob, opk_id=77)
+
+    assert receiver._sessions.load(SESSION_ID) is None
+    assert Receiver._decrypt_enc(receiver, SENDER, "pkmsg", session.encrypt(b"hola")) == b"hola"
+    assert bob.consumed == [77], "el primer mensaje SI hace X3DH y consume la OPK"
+
