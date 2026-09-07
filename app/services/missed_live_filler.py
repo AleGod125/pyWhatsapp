@@ -146,8 +146,9 @@ class MissedLiveFiller:
             # nada, en silencio.
             canonico = canonical_chat_jid(sesion, chat_jid) or chat_jid
             chat_id = sesion.execute(
-                select(Chat.id).where(Chat.jid == canonico)
-            ).scalar_one_or_none()
+                select(Chat.id).where(Chat.jid == canonico).limit(2)
+            ).scalars().all()
+            chat_id = chat_id[0] if len(chat_id) == 1 else None
             if chat_id is None:
                 return None
             chat_jid = canonico

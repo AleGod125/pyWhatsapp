@@ -346,7 +346,7 @@ def test_si_aparecen_conversaciones_nuevas_si_se_vuelve_a_intentar(session, monk
     assert len(llamadas) == 2
 
 
-def test_no_hay_un_segundo_camino_de_aplicacion():
+def test_no_hay_un_segundo_camino_de_aplicacion(cuenta):
     """Se llama al MISMO aplicador que el botón manual.
 
     Dos caminos acabarían divergiendo, y uno de los dos escribiría anclas que

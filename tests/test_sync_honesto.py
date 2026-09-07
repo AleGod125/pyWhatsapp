@@ -49,9 +49,9 @@ def a_solas(session):
     session.flush()
 
 
-def _chat(session, estado: str, *, con_ancla: bool, grupo: bool = False):
+def _chat(session, cuenta, estado: str, *, con_ancla: bool, grupo: bool = False):
     jid = f"5730{uuid.uuid4().hex[:8]}@{'g.us' if grupo else 's.whatsapp.net'}"
-    fila = Chat(jid=jid, chat_type="group" if grupo else "individual")
+    fila = Chat(jid=jid, chat_type="group" if grupo else "individual", whatsapp_account_id=cuenta.id)
     session.add(fila)
     session.flush()
     session.add(
@@ -116,7 +116,7 @@ def test_el_almacenamiento_se_revisa_despues_de_traer_mensajes():
 
 
 def test_sin_ninguna_ancla_no_se_envia_una_sola_peticion(
-    session, a_solas, settings, monkeypatch
+    session, cuenta, a_solas, settings, monkeypatch
 ):
     """27 esperando y 0 anclas nuevas: no hay NADA que pedir.
 
@@ -126,7 +126,7 @@ def test_sin_ninguna_ancla_no_se_envia_una_sola_peticion(
     import asyncio
 
     for _ in range(3):
-        _chat(session, "waiting_seed", con_ancla=False)
+        _chat(session, cuenta, "waiting_seed", con_ancla=False)
 
     trabajo = SyncJob(settings, _DatabaseDeSesion(session))
     trabajo.state = SyncState(with_cursor=0, waiting_seed=3)
@@ -177,14 +177,14 @@ def test_con_ancla_si_se_excava(session, a_solas, settings):
 
 
 def test_una_espera_sin_vencer_se_informa_y_NO_se_reintenta(
-    session, a_solas, settings
+    session, cuenta, a_solas, settings
 ):
     """Pulsar el boton no hace que el telefono conteste antes."""
     from datetime import datetime, timedelta, timezone
 
     from app.services.backfill_service import BackfillService
 
-    chat = _chat(session, "timeout", con_ancla=True)
+    chat = _chat(session, cuenta, "timeout", con_ancla=True)
     session.execute(
         update(ChatHistoryState)
         .where(ChatHistoryState.chat_jid == chat.jid)
@@ -200,13 +200,13 @@ def test_una_espera_sin_vencer_se_informa_y_NO_se_reintenta(
 
 
 def test_cumplida_la_espera_vuelve_a_contar_como_excavable(
-    session, a_solas, settings
+    session, cuenta, a_solas, settings
 ):
     from datetime import datetime, timedelta, timezone
 
     from app.services.backfill_service import BackfillService
 
-    chat = _chat(session, "timeout", con_ancla=True)
+    chat = _chat(session, cuenta, "timeout", con_ancla=True)
     session.execute(
         update(ChatHistoryState)
         .where(ChatHistoryState.chat_jid == chat.jid)
@@ -221,7 +221,7 @@ def test_cumplida_la_espera_vuelve_a_contar_como_excavable(
     assert resumen.retry_pending == 0
 
 
-def test_el_ciclo_normal_no_toca_el_temporizador_de_reintento(session, settings):
+def test_el_ciclo_normal_no_toca_el_temporizador_de_reintento(session, cuenta, settings):
     """Pulsar "Sincronizar ahora" no resetea la espera de nadie.
 
     La espera creciente existe para no gastar la unica ranura de peticiones
@@ -234,7 +234,7 @@ def test_el_ciclo_normal_no_toca_el_temporizador_de_reintento(session, settings)
     dos cosas.
     """
     proximo = datetime.now(timezone.utc) + timedelta(minutes=30)
-    chat = _chat(session, "timeout", con_ancla=True)
+    chat = _chat(session, cuenta, "timeout", con_ancla=True)
     session.execute(
         update(ChatHistoryState)
         .where(ChatHistoryState.chat_jid == chat.jid)
@@ -255,9 +255,9 @@ def test_el_ciclo_normal_no_toca_el_temporizador_de_reintento(session, settings)
     assert guardado is not None, "la espera sigue en pie"
 
 
-def test_la_revision_completa_SI_adelanta_la_espera(session, settings):
+def test_la_revision_completa_SI_adelanta_la_espera(session, cuenta, settings):
     """Es lo unico que hace de mas, y es lo que el usuario acaba de pedir."""
-    chat = _chat(session, "timeout", con_ancla=True)
+    chat = _chat(session, cuenta, "timeout", con_ancla=True)
     session.execute(
         update(ChatHistoryState)
         .where(ChatHistoryState.chat_jid == chat.jid)
@@ -277,9 +277,9 @@ def test_la_revision_completa_SI_adelanta_la_espera(session, settings):
     assert guardado is None, "el chat puede reintentarse ya"
 
 
-def test_la_revision_completa_no_toca_los_agotados(session, settings):
+def test_la_revision_completa_no_toca_los_agotados(session, cuenta, settings):
     """"Completo" no significa volver a pedir lo que el telefono dio por cerrado."""
-    chat = _chat(session, "exhausted", con_ancla=True)
+    chat = _chat(session, cuenta, "exhausted", con_ancla=True)
     proximo = datetime.now(timezone.utc) + timedelta(hours=1)
     session.execute(
         update(ChatHistoryState)
@@ -298,11 +298,11 @@ def test_la_revision_completa_no_toca_los_agotados(session, settings):
     assert estado.next_retry_at is not None
 
 
-def test_la_revision_completa_no_borra_nada(session, settings):
+def test_la_revision_completa_no_borra_nada(session, cuenta, settings):
     """Ni mensajes, ni anclas, ni cursores."""
     from app.models import HistorySeed, Message
 
-    chat = _chat(session, "timeout", con_ancla=True)
+    chat = _chat(session, cuenta, "timeout", con_ancla=True)
     antes = (
         session.execute(select(func.count()).select_from(Message)).scalar(),
         session.execute(select(func.count()).select_from(HistorySeed)).scalar(),
@@ -354,7 +354,7 @@ def test_un_mensaje_en_vivo_convierte_un_dormido_en_candidato(
     session.add(cuenta)
     session.flush()
 
-    chat = _chat(session, "waiting_seed", con_ancla=False)
+    chat = _chat(session, cuenta, "waiting_seed", con_ancla=False)
     db = _DatabaseDeSesion(session)
     backfill = BackfillService(settings, db)
 
@@ -458,7 +458,7 @@ def test_sin_conexion_no_se_sincroniza(settings, session):
 # ---------------------------------------------------------------------------
 
 
-def test_sin_candidatos_NO_significa_sin_esperando(session, a_solas, settings):
+def test_sin_candidatos_NO_significa_sin_esperando(session, cuenta, a_solas, settings):
     """El bug exacto que se esta arreglando.
 
     En la misma ejecucion salian estas dos lineas:
@@ -472,7 +472,7 @@ def test_sin_candidatos_NO_significa_sin_esperando(session, a_solas, settings):
     from app.services.backfill_service import BackfillService
 
     for _ in range(26):
-        _chat(session, "waiting_seed", con_ancla=False)
+        _chat(session, cuenta, "waiting_seed", con_ancla=False)
 
     db = _DatabaseDeSesion(session)
     resumen = resumen_de_estado(db, backfill=BackfillService(settings, db))
@@ -481,13 +481,13 @@ def test_sin_candidatos_NO_significa_sin_esperando(session, a_solas, settings):
     assert resumen.waiting_seed == 26, "NO puede salir 0"
 
 
-def test_todas_las_fases_leen_el_mismo_sitio(session, a_solas, settings):
+def test_todas_las_fases_leen_el_mismo_sitio(session, cuenta, a_solas, settings):
     """La fase de excavacion leia un contador que se rellenaba DESPUES.
 
     Por eso decia "0 espera(n)": leia el valor por omision, no la base.
     """
     for _ in range(26):
-        _chat(session, "waiting_seed", con_ancla=False)
+        _chat(session, cuenta, "waiting_seed", con_ancla=False)
 
     db = _DatabaseDeSesion(session)
     trabajo = SyncJob(settings, db)
@@ -508,14 +508,14 @@ def test_el_ciclo_ya_no_cuenta_por_su_cuenta():
 
 
 def test_el_mensaje_de_sin_anclas_usa_el_numero_de_verdad(
-    session, a_solas, settings, caplog
+    session, cuenta, a_solas, settings, caplog
 ):
     """Y lo dice como es: "no hay con que pedir", no "0 esperan"."""
     import asyncio
     import logging
 
     for _ in range(26):
-        _chat(session, "waiting_seed", con_ancla=False)
+        _chat(session, cuenta, "waiting_seed", con_ancla=False)
 
     trabajo = SyncJob(settings, _DatabaseDeSesion(session))
     trabajo.state = SyncState(with_cursor=0, waiting_seed=26)
@@ -532,11 +532,11 @@ def test_el_mensaje_de_sin_anclas_usa_el_numero_de_verdad(
     assert "0 espera" not in texto, "era justo el mensaje falso"
 
 
-def test_el_resumen_final_cuadra_con_la_base(session, a_solas, settings):
+def test_el_resumen_final_cuadra_con_la_base(session, cuenta, a_solas, settings):
     """Los numeros del JSON salen de la misma lectura, no de tres."""
     for _ in range(3):
-        _chat(session, "waiting_seed", con_ancla=False)
-    _chat(session, "exhausted", con_ancla=True)
+        _chat(session, cuenta, "waiting_seed", con_ancla=False)
+    _chat(session, cuenta, "exhausted", con_ancla=True)
 
     db = _DatabaseDeSesion(session)
     trabajo = SyncJob(settings, db)
@@ -548,8 +548,16 @@ def test_el_resumen_final_cuadra_con_la_base(session, a_solas, settings):
     assert resumen["chats_total"] == directo["chats_total"]
 
 
-def test_los_conteos_se_pueden_acotar_a_una_cuenta(session, a_solas, settings, runtime):
-    """Con varias cuentas, el resumen de una no puede contar las de otra."""
+def test_los_conteos_se_pueden_acotar_a_una_cuenta(
+    session, cuenta, a_solas, settings, runtime
+):
+    """Con varias cuentas, el resumen de una no puede contar las de otra.
+
+    Antes esto se comprobaba con un chat SIN cuenta. Ese caso ya no existe:
+    `chats.whatsapp_account_id` es obligatorio, porque un chat sin dueno no
+    colisiona con nada y se duplicaria en silencio. El equivalente real --y
+    mas util-- es el de al lado: la conversacion de OTRA persona.
+    """
     import uuid as _uuid
 
     from app.models import WhatsAppAccount
@@ -557,16 +565,18 @@ def test_los_conteos_se_pueden_acotar_a_una_cuenta(session, a_solas, settings, r
     inicio = runtime.auth.register(
         email=f"rs-{_uuid.uuid4().hex[:10]}@example.com", password="una contrasena larga"
     )
-    cuenta = WhatsAppAccount(
+    otra = WhatsAppAccount(
         user_id=inicio.user_id,
         session_status="linked",
         session_storage_key=f"users/{inicio.user_id}",
     )
-    session.add(cuenta)
+    session.add(otra)
     session.flush()
 
-    _chat(session, "waiting_seed", con_ancla=False)  # sin cuenta
+    # La conversacion es de `cuenta`, no de `otra`.
+    _chat(session, cuenta, "waiting_seed", con_ancla=False)
 
     db = _DatabaseDeSesion(session)
-    assert resumen_de_estado(db, account_id=cuenta.id).chats_total == 0
+    assert resumen_de_estado(db, account_id=otra.id).chats_total == 0
+    assert resumen_de_estado(db, account_id=cuenta.id).chats_total >= 1
     assert resumen_de_estado(db).chats_total >= 1

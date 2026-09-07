@@ -234,7 +234,7 @@ def test_un_envoltorio_sin_destino_no_mueve_nada():
 
 def test_el_texto_saliente_se_guarda_en_el_chat_del_destinatario(
     servicio, session, crudo
-):
+, cuenta):
     crudo(envuelto(ISAAC_LID, texto="OUTGOING_TEST_001"))
     resultado = servicio.handle(evento(id="WAMIDOUT001", text="OUTGOING_TEST_001"))
 
@@ -246,7 +246,7 @@ def test_el_texto_saliente_se_guarda_en_el_chat_del_destinatario(
     assert fila.from_me is True
 
 
-def test_el_entrante_sigue_yendo_a_su_chat(servicio, session, crudo):
+def test_el_entrante_sigue_yendo_a_su_chat(servicio, session, crudo, cuenta):
     """Control: el arreglo no puede mover lo que ya funcionaba."""
     crudo(entrante(texto="INCOMING_TEST_001"))
     resultado = servicio.handle(
@@ -259,7 +259,7 @@ def test_el_entrante_sigue_yendo_a_su_chat(servicio, session, crudo):
     assert fila.from_me is False
 
 
-def test_el_auto_mensaje_se_guarda_en_el_chat_propio(servicio, session, crudo):
+def test_el_auto_mensaje_se_guarda_en_el_chat_propio(servicio, session, crudo, cuenta):
     crudo(envuelto(OWN_LID, imagen=True))
     resultado = servicio.handle(evento(id="WAMIDSELF001"))
 
@@ -278,7 +278,7 @@ def test_el_auto_mensaje_se_guarda_en_el_chat_propio(servicio, session, crudo):
 )
 def test_el_multimedia_saliente_va_al_destinatario(
     servicio, session, crudo, nombre, interno, tipo
-):
+, cuenta):
     crudo(envuelto(ISAAC_LID, **interno))
     wamid = f"WAMIDOUTMEDIA{nombre.upper()}"
     resultado = servicio.handle(evento(id=wamid))
@@ -292,7 +292,7 @@ def test_el_multimedia_saliente_va_al_destinatario(
 
 def test_el_saliente_no_se_duplica_si_luego_llega_por_historial(
     servicio, session, crudo
-):
+, cuenta):
     """History Sync y live se solapan a proposito: se deduplica por WAMID."""
     from sqlalchemy import func, select
 
@@ -312,7 +312,7 @@ def test_el_saliente_no_se_duplica_si_luego_llega_por_historial(
     assert servicio.stats.duplicates >= 1
 
 
-def test_los_contadores_separan_las_dos_direcciones(servicio, session, crudo):
+def test_los_contadores_separan_las_dos_direcciones(servicio, session, crudo, cuenta):
     """Que los salientes se perdieran paso inadvertido porque el total subia."""
     crudo(entrante(texto="hola"))
     servicio.handle(evento(id="WAMIDCNT001", chat=ISAAC, sender=ISAAC, text="hola"))
@@ -330,15 +330,15 @@ def test_los_contadores_separan_las_dos_direcciones(servicio, session, crudo):
 # ---------------------------------------------------------------------------
 
 
-def test_un_destino_por_telefono_resuelve_al_chat_por_lid_ya_existente(session):
+def test_un_destino_por_telefono_resuelve_al_chat_por_lid_ya_existente(session, cuenta):
     """Un contacto NO puede acabar partido en dos conversaciones."""
     from app.models import Chat, Contact
     from app.services.chat_alias import canonical_chat_jid
 
     # Identificadores ficticios: el chat de Isaac existe de verdad en la base
     # y reutilizarlo chocaria con la restriccion de unicidad.
-    session.add(Chat(jid="99900011122@lid", chat_type="individual"))
-    session.add(Contact(jid="34600777888@s.whatsapp.net", lid="99900011122@lid"))
+    session.add(Chat(jid="99900011122@lid", chat_type="individual", whatsapp_account_id=cuenta.id))
+    session.add(Contact(jid="34600777888@s.whatsapp.net", lid="99900011122@lid", whatsapp_account_id=cuenta.id))
     session.flush()
 
     resuelto = canonical_chat_jid(session, "34600777888@s.whatsapp.net")
@@ -372,7 +372,7 @@ def test_el_sufijo_de_dispositivo_se_quita_del_chat(session):
 # ---------------------------------------------------------------------------
 
 
-def test_nunca_se_deduce_la_conversacion_solo_del_remitente(servicio, session, crudo):
+def test_nunca_se_deduce_la_conversacion_solo_del_remitente(servicio, session, crudo, cuenta):
     """La invariante, escrita como prueba.
 
     Si un dia alguien vuelve a enrutar por ``sender_jid``, este test cae: el

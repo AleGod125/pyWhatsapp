@@ -438,7 +438,7 @@ def test_un_lid_se_resuelve_al_chat_canonico(session, cuenta):
     usuario_id, cuenta_id = cuenta
     chats = _esperando(session, cuenta_id)
     lid = f"649401{uuid.uuid4().hex[:8]}@lid"
-    session.add(Contact(jid=chats[0].jid, lid=lid))
+    session.add(Contact(jid=chats[0].jid, lid=lid, whatsapp_account_id=cuenta_id))
     session.flush()
 
     respuesta = _respuesta(chats)

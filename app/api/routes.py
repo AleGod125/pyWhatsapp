@@ -66,7 +66,22 @@ SSE_COMMENT = ": latido" + "\n\n"
 
 
 def runtime() -> Any:
+    """El runtime base del proceso. INFRAESTRUCTURA, no sesion de WhatsApp.
+
+    Sirve para llegar a la base de datos y a la configuracion. Para cualquier
+    cosa que dependa de una sesion de WhatsApp --estado, emparejamiento,
+    codigo QR, chats-- hay que usar `runtime_de_mi_cuenta()`, que resuelve por
+    membresia. Usar este de ahi es como se acaba contestando con la cuenta de
+    otra persona.
+    """
     return current_app.config["RUNTIME"]
+
+
+def runtime_de_mi_cuenta(*, crear: bool = False) -> Any:
+    """El runtime de la cuenta de quien hace la peticion. Puede ser ``None``."""
+    from app.api.account_runtime import runtime_de_mi_cuenta as _resolver
+
+    return _resolver(crear=crear)
 
 
 def _session():
@@ -157,8 +172,33 @@ def session_state():
 
     cuentas = getattr(rt, "whatsapp_accounts", None)
     yo = usuario_actual()
-    dueno = cuentas.dueno_actual() if cuentas is not None else None
-    de_otro = dueno is not None and yo is not None and dueno != yo.id
+
+    # De quien es esta vinculacion se decide por MEMBRESIA, no por el estado
+    # global del proceso.
+    #
+    # EL FALLO, TAL Y COMO SE VIO: usuario A con su WhatsApp conectado; B se
+    # registra, entra, y la pantalla le dice "Cuenta vinculada" -- la de A.
+    # Deducir el acceso de "hay un WhatsApp conectado en este servidor" es
+    # justo lo que no se puede hacer en cuanto hay mas de una persona.
+    #
+    # La membresia es la UNICA fuente. Antes habia detras un respaldo que
+    # preguntaba `dueno_actual()` --"quien tiene una cuenta vinculada en esta
+    # base"--, y esa pregunta no distingue equipos de personas: con A
+    # vinculado, cualquier B recibia el estado de A. Un respaldo que responde
+    # con los datos de otro es peor que no tener respaldo.
+    de_otro = False
+    if yo is not None and rt.database is not None:
+        try:
+            from app.auth.memberships import cuenta_efectiva_de
+
+            with rt.database.transaction() as sesion_db:
+                mia = cuenta_efectiva_de(sesion_db, yo.id)
+            # Sin cuenta propia esta persona no tiene vinculacion, haya lo que
+            # haya conectado en la maquina.
+            de_otro = mia is None
+        except Exception:  # noqa: BLE001 - ante la duda, se pide vincular
+            log.debug("No se pudo resolver la membresia; se pedira vincular")
+            de_otro = True
 
     # No se dice de QUIEN es: ni nombre, ni telefono, ni nada suyo.
     cuerpo["owned_by_another_user"] = de_otro
@@ -186,15 +226,38 @@ def session_pair():
     lanza otra. Dos vinculaciones simultaneas abririan dos conexiones y
     produirian dos QR, de los cuales solo uno serviria.
     """
-    choque = _conflicto_de_sesion()
-    if choque is not None:
-        return choque
+    # AQUI NO HAY NINGUN GUARDA DE DISPOSITIVO, y es deliberado.
+    #
+    # Antes se comprobaba si "la vinculacion de este equipo" era de quien
+    # preguntaba, y si no, se contestaba 409 ACCOUNT_RUNTIME_IN_USE. Eso
+    # convertia el equipo en propiedad del primero que vinculara: con la
+    # cuenta de A conectada, B --que no ha vinculado nada-- no podia ni pedir
+    # su codigo. Se midio: "Este dispositivo tiene una vinculacion de WhatsApp
+    # en marcha de otro usuario", con B mirando una pantalla sin QR.
+    #
+    # El equipo no es de nadie. Cada persona vincula SU cuenta, en SU runtime,
+    # con SU carpeta de sesion. Lo que impide ver lo ajeno no es un guarda de
+    # proceso: es que todo lo de abajo se resuelve por membresia.
 
-    rt = runtime()
-    cuenta = _asegurar_cuenta_de_whatsapp(rt)
+    # El emparejamiento ocurre en el runtime de MI cuenta, creandola si hace
+    # falta. Antes se usaba el runtime unico del proceso, y por eso con la
+    # cuenta de otra persona conectada esto contestaba 409 --su estado-- o
+    # devolvia su codigo QR.
+    cuenta = _asegurar_cuenta_de_whatsapp(runtime())
     if cuenta is None:
         return _error("la base de datos no esta disponible", 503)
-    if not rt.info().whatsapp_enabled:
+    rt = runtime_de_mi_cuenta(crear=True)
+    if rt is None:
+        return _error_code(
+            "ACCOUNT_RUNTIME_UNAVAILABLE",
+            "No se pudo preparar la sesion de WhatsApp de tu cuenta.",
+            503,
+        )
+    # Si este backend soporta WhatsApp o no es una propiedad del PROCESO --el
+    # modo local no lo trae-- y no de una cuenta. Se pregunta al runtime base:
+    # preguntarselo al de la cuenta daria "modo local" en cuanto el suyo aun
+    # no ha arrancado su cliente.
+    if not runtime().info().whatsapp_enabled:
         return _error_code(
             "WHATSAPP_DISABLED",
             "El backend esta en modo local y no puede vincular WhatsApp.",
@@ -262,26 +325,36 @@ def session_qr():
     un dispositivo a la cuenta. Se sirve solo como imagen, no se guarda en
     disco y no se registra en los logs.
     """
-    choque = _conflicto_de_sesion()
-    if choque is not None:
-        return choque
-
-    return jsonify(qr_to_json(runtime()))
+    # EL PUNTO CRITICO. El codigo QR sale del runtime de la cuenta de QUIEN
+    # PREGUNTA, no del que este corriendo. Servir el de otro no es un detalle:
+    # es entregarle a alguien la llave para vincular un dispositivo a una
+    # cuenta que no es suya.
+    rt = runtime_de_mi_cuenta()
+    if rt is None:
+        return _error_code(
+            "PAIRING_REQUIRED",
+            "Todavia no tienes una cuenta de WhatsApp vinculada.",
+            409,
+        )
+    return jsonify(qr_to_json(rt))
 
 
 @api.get("/session/qr/image")
 @requiere_sesion
 def session_qr_image():
     """PNG del QR vigente. Nunca uno caducado."""
-    choque = _conflicto_de_sesion()
-    if choque is not None:
-        return choque
-
     import io
 
     from app.core.qr_render import render_qr
 
-    rt = runtime()
+    # La imagen tambien: es el mismo secreto, dibujado.
+    rt = runtime_de_mi_cuenta()
+    if rt is None:
+        return _error_code(
+            "PAIRING_REQUIRED",
+            "Todavia no tienes una cuenta de WhatsApp vinculada.",
+            409,
+        )
     payload = rt.pairing.payload()
     if payload is None:
         if rt.pairing.expired:
@@ -370,42 +443,20 @@ def _asegurar_cuenta_de_whatsapp(rt):
     return cuentas.asegurar_cuenta(usuario_actual().id)
 
 
-def _conflicto_de_sesion():
-    """``None`` si el usuario puede usar la sesion de WhatsApp de este equipo.
-
-    En esta fase el runtime sostiene UNA vinculacion. Si es de otro usuario,
-    se responde con un conflicto generico en vez de dejarle ver una copia
-    ajena o de arrancarle la sesion al dueno.
-
-    Se comprueban DOS cosas: quien tiene la cuenta marcada como vinculada en
-    la base, y quien tiene el runtime de este proceso. La segunda cubre el
-    hueco entre pedir la vinculacion y completarla: durante ese rato la base
-    todavia no dice ``linked``, pero el QR ya existe y es de alguien.
-    """
-    from app.auth.whatsapp_accounts import ConflictoDeSesion
-
-    rt = runtime()
-    yo = usuario_actual()
-    if yo is None:
-        return None
-
-    if not rt.es_mia_la_sesion(yo.id):
-        return _error_code(
-            "ACCOUNT_RUNTIME_IN_USE",
-            "Este dispositivo tiene una vinculacion de WhatsApp en marcha de "
-            "otro usuario.",
-            409,
-        )
-
-    cuentas = getattr(rt, "whatsapp_accounts", None)
-    if cuentas is None:
-        return None
-    try:
-        cuentas.exigir_propiedad(yo.id)
-    except ConflictoDeSesion as choque:
-        # No se dice de QUIEN es: ni nombre, ni telefono, ni nada suyo.
-        return _error_code(choque.code, str(choque), 409)
-    return None
+# `_conflicto_de_sesion()` ESTUVO AQUI Y SE HA IDO.
+#
+# Preguntaba dos cosas --de quien es el runtime de este proceso, y quien tiene
+# una cuenta marcada como vinculada en toda la base-- y con cualquiera de las
+# dos negaba el emparejamiento. Las dos son preguntas de EQUIPO, no de
+# persona, y por eso el segundo usuario nunca podia vincular: bastaba que
+# alguien hubiera vinculado antes en la misma maquina.
+#
+# Un equipo puede sostener tantas vinculaciones como cuentas haya. Lo que no
+# puede es dejar que una persona vea la de otra, y eso ya no lo sostiene un
+# guarda: lo sostiene que cada ruta resuelva por membresia
+# (`runtime_de_mi_cuenta`, `ownership.cuentas_de`). Un guarda se puede olvidar
+# en una ruta nueva; la resolucion por membresia no, porque sin ella no hay
+# de donde sacar los datos.
 
 
 @api.get("/chats")
@@ -1399,7 +1450,9 @@ def chat_history_retry(chat_id: int):
         if jid is None:
             return _error("chat no encontrado", 404)
         estado = db.execute(
-            select(ChatHistoryState).where(ChatHistoryState.chat_jid == jid)
+            # Por `chat_id`, que es lo que la ruta ya resolvio: el jid deja
+            # de ser unico en cuanto dos cuentas comparten un contacto.
+            select(ChatHistoryState).where(ChatHistoryState.chat_id == chat_id)
         ).scalar_one_or_none()
         if estado is not None and estado.history_status == "exhausted":
             return _error_code(
@@ -1420,7 +1473,7 @@ def chat_history_retry(chat_id: int):
         # Solo este chat. La espera de los demas se queda como estaba.
         db.execute(
             update(ChatHistoryState)
-            .where(ChatHistoryState.chat_jid == jid)
+            .where(ChatHistoryState.chat_id == chat_id)
             .values(next_retry_at=None)
         )
 
@@ -1598,25 +1651,41 @@ def events_stream():
     El QR NUNCA viaja por aqui como payload: se avisa de que hay uno nuevo y
     el cliente lo pide como imagen.
 
-    FILTRADO POR DUENO
-    ------------------
-    El bus es unico para el proceso, asi que sin filtrar aqui un usuario
-    recibiria los avisos de la sesion de otro: cuando llega un mensaje, cuando
-    cambia su estado, cuando hay un QR nuevo. Eso ya es informacion sobre otra
-    persona aunque no lleve su contenido.
+    CADA CUENTA, SU BUS
+    -------------------
+    Se escucha el bus del runtime de **la cuenta de quien se conecta**, que
+    resuelve por membresia. Antes se escuchaba el bus del runtime base --uno
+    para todo el proceso-- y el aislamiento dependia de un filtro que tapaba
+    los eventos ajenos uno a uno.
 
-    Quien no sea el dueno de la sesion activa recibe solo lo suyo: los eventos
-    de almacenamiento de su propia cuenta y los latidos.
+    Tapar no es aislar: basta que un evento nuevo no entre en la lista de los
+    que se filtran para que empiece a llegarle a quien no debe. Escuchando el
+    bus correcto, los eventos de otra cuenta **no existen** en esta conexion.
+
+    El filtro por dueno se conserva como segunda barrera. Con el bus ya
+    separado no deberia hacer falta, y precisamente por eso se queda: si
+    alguna via publicara en el bus equivocado, esto lo para igual.
+
+    Quien todavia no tiene cuenta no tiene runtime, y recibe solo latidos: no
+    hay nada suyo que contar, y contarle lo de otro es justo lo que no puede
+    pasar.
     """
-    rt = runtime()
+    base = runtime()
     yo = usuario_actual()
-    es_dueno = yo is not None and rt.es_mia_la_sesion(yo.id)
+    mio = runtime_de_mi_cuenta()
+    rt = mio or base
+    # Sin cuenta propia no se escucha ningun bus ajeno.
+    sin_cuenta = mio is None
+    # Y ser dueno es, exactamente, tener runtime propio. Preguntarselo al
+    # runtime del proceso --`es_mia_la_sesion`-- daba verdadero para quien
+    # simplemente vinculo primero en esta maquina.
+    es_dueno = yo is not None and not sin_cuenta
 
     def generar():
         # Estado completo de entrada: quien se conecta a mitad tiene que saber
         # donde esta, no esperar al siguiente cambio.
         yield _sse("session.state", state_to_json(rt))
-        if es_dueno:
+        if es_dueno and not sin_cuenta:
             yield _sse("sync.status", sync_to_json(rt))
             if rt.pairing is not None and rt.pairing.available:
                 yield _sse("session.qr", qr_to_json(rt))
@@ -1642,10 +1711,10 @@ def events_stream():
                 continue
 
             for nombre, datos in eventos_para(evento, rt):
-                # Lo que cuenta algo de la sesion de WhatsApp solo va a su
-                # dueno. El bus es unico para el proceso: sin esto, un usuario
-                # sabria cuando le llega un mensaje a otro.
-                if not es_dueno and _es_de_la_sesion(nombre):
+                # Segunda barrera. El bus ya es el de esta cuenta, asi que
+                # esto no deberia descartar nada -- y por eso se queda: si
+                # alguna via publicara en el bus equivocado, aqui se para.
+                if (not es_dueno or sin_cuenta) and _es_de_la_sesion(nombre):
                     continue
                 ultimo_latido = ahora
                 yield _sse(nombre, datos)

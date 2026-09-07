@@ -254,7 +254,7 @@ def test_un_LID_se_resuelve_al_chat_que_ya_existe(session, cuenta):
     telefono = f"5730{uuid.uuid4().hex[:10]}@s.whatsapp.net"
     lid = f"649401{uuid.uuid4().hex[:8]}@lid"
     _existente(session, cuenta_id, telefono, estado="waiting_seed")
-    session.add(Contact(jid=telefono, lid=lid))
+    session.add(Contact(jid=telefono, lid=lid, whatsapp_account_id=cuenta_id))
     session.flush()
 
     rt = _runtime(session, _respuesta([_fila(lid)]), cuenta)
@@ -283,7 +283,7 @@ def test_el_ancla_pasa_por_el_recolector_de_siempre():
     assert "persist_cursor" not in fuente
 
 
-def test_el_cursor_solo_se_LEE_y_solo_para_repartir_la_cuota_de_red():
+def test_el_cursor_solo_se_LEE_y_solo_para_repartir_la_cuota_de_red(cuenta):
     """La regla no es "no mirar el cursor": es no decidir anclas con el.
 
     El indice necesita saber cuales ya tienen con que excavar para no gastar

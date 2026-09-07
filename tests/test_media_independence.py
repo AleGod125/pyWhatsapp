@@ -33,8 +33,13 @@ from app.services.live_service import LiveMessageService
 
 
 @pytest.fixture
-def servicio(session):
-    return LiveMessageService(FakeDatabase(session), own_jid=OWN_PN, own_lid=OWN_LID)
+def servicio(session, cuenta):
+    return LiveMessageService(
+        FakeDatabase(session),
+        own_jid=OWN_PN,
+        own_lid=OWN_LID,
+        whatsapp_account_id=cuenta.id,
+    )
 
 
 @pytest.fixture
@@ -92,7 +97,7 @@ def test_un_fallo_registrando_el_adjunto_no_tumba_la_recepcion(
     assert servicio.handle(evento(id="INDEP002")) is None
 
 
-def test_el_adjunto_nace_en_pending_no_bloquea(servicio, session, crudo):
+def test_el_adjunto_nace_en_pending_no_bloquea(servicio, session, crudo, cuenta):
     """El mensaje se sirve ya; el archivo lo baja el worker por su cuenta."""
     crudo(envuelto(ISAAC_LID, audio_ptt=True))
     servicio.handle(evento(id="INDEP003"))

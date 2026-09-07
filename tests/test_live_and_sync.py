@@ -59,8 +59,13 @@ def runtime(settings, database, session, tmp_path):
 
 
 @pytest.fixture
-def chat_vacio(session):
-    chat_id = repo.upsert_chat(session, jid=CHAT_JID, chat_type="individual")
+def chat_vacio(session, cuenta):
+    # La cuenta va explicita: `upsert_chat` la exige, y el atajo de resolverla
+    # sola solo funcionaba cuando la maquina tenia exactamente un WhatsApp
+    # vinculado de verdad.
+    chat_id = repo.upsert_chat(
+        session, jid=CHAT_JID, chat_type="individual", whatsapp_account_id=cuenta.id
+    )
     session.flush()
     return chat_id
 

@@ -87,7 +87,7 @@ def test_los_reintentos_van_al_final(planificador):
     assert orden == ["normal@lid", "falla@lid"]
 
 
-def test_lo_reciente_va_antes_que_el_fondo(planificador):
+def test_lo_reciente_va_antes_que_el_fondo(planificador, cuenta):
     """El umbral sale de los propios datos, no de un numero de dias fijo.
 
     Una cuenta con conversaciones de hoy y otra cuya ultima es de hace un anio

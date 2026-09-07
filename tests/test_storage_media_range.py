@@ -33,7 +33,7 @@ class DriveContado(DriveFalso):
 
 
 @pytest.fixture
-def video(runtime, session, settings, tmp_path):
+def video(runtime, session, settings, tmp_path, cuenta):
     """Un adjunto de 2,5 MB ya cifrado y 'subido'."""
     import dataclasses
 

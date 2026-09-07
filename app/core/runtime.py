@@ -499,6 +499,23 @@ class AppRuntime:
             return
         log.info("[AUTH] Cuenta de WhatsApp marcada como vinculada")
 
+    def de_quien_soy(self) -> str:
+        """A que cuenta y a que usuario pertenece este runtime.
+
+        Va en los avisos de ciclo de vida de la sesion. Con varias cuentas en
+        la misma maquina, "la sesion se cerro" sin decir cual no sirve de nada:
+        habia que adivinar por la hora a quien le habia pasado.
+
+        Se escriben los identificadores cortos, no el correo: la linea de
+        "Sesion iniciada" ya empareja id con nombre, y repetir la direccion en
+        cada corte de red solo llena el log.
+        """
+        cuenta = getattr(self, "runtime_owner_account_id", None)
+        usuario = getattr(self, "runtime_owner_user_id", None)
+        if cuenta is None and usuario is None:
+            return "sin dueno todavia"
+        return f"cuenta={str(cuenta)[:8]} usuario={str(usuario)[:8]}"
+
     def _marcar_desconectada(self) -> None:
         """El socket cayo. NO es una desvinculacion."""
         cuentas = getattr(self, "whatsapp_accounts", None)
@@ -641,6 +658,10 @@ class AppRuntime:
         elif nombre == "transport_lost":
             # Se cayo la linea. Las peticiones de historial en vuelo esperan
             # algo imposible: se las despierta ya, conservando su cursor.
+            log.warning(
+                "Conexion de WhatsApp perdida (%s); se intentara reconectar",
+                self.de_quien_soy(),
+            )
             if self.backfill is not None:
                 try:
                     cortadas = self.backfill.abort_pending("conexion perdida")
@@ -672,6 +693,11 @@ class AppRuntime:
                 # cada corte de red desvinculara, el usuario acabaria en la
                 # pantalla del codigo QR cada vez que se va el wifi.
                 self._marcar_desconectada()
+                log.warning(
+                    "Sesion de WhatsApp cerrada (%s). La cuenta SIGUE "
+                    "vinculada: se cayo el socket, no la vinculacion",
+                    self.de_quien_soy(),
+                )
                 self.state.set(AppState.DISCONNECTED, reason="conexion perdida")
         elif nombre == "decrypt_error":
             # Se CUENTAN, no se tocan. "mac check failed", "no sender-key" y
@@ -1122,7 +1148,9 @@ class AppRuntime:
         self.client.sinks["message"] = recibir
 
         # -- Nombres de la agenda --
-        contactos = ContactService(self.database)
+        contactos = ContactService(
+            self.database, whatsapp_account_id=self.runtime_owner_account_id
+        )
         self.client.sinks["contact"] = contactos.handle_contact
         self.client.sinks["pushname"] = contactos.handle_pushname
 
@@ -1139,7 +1167,11 @@ class AppRuntime:
             log.info("Historial inicial ya confirmado para esta sesion")
 
         # -- Backfill historico --
-        self.backfill = BackfillService(self.settings, self.database)
+        self.backfill = BackfillService(
+            self.settings,
+            self.database,
+            whatsapp_account_id=self.runtime_owner_account_id,
+        )
         # Que la pantalla se entere de los cambios de estado sin recargar.
         self.backfill.publish = self.bus.publish
         if self.seed_collector is not None:
@@ -1357,7 +1389,20 @@ class AppRuntime:
 
         # Se agrupan por MOTIVO: cien fallos iguales son un problema que
         # ocurre cien veces, no cien problemas. El primero se ve siempre.
-        self._avisos_signal.warning(
+        #
+        # El PRIMER intento no es una averia y no se pinta como tal. Tras
+        # vincular no existe sesion Signal con nadie, asi que el primer mensaje
+        # de cada interlocutor NO se puede descifrar: hay que acusar el fallo
+        # para que lo reenvien como `pkmsg` y ahi nace la sesion. Es X3DH
+        # funcionando, y suele resolverse en menos de medio segundo.
+        #
+        # A partir del segundo intento si es un aviso: el reintento no basto.
+        escribir = (
+            self._avisos_signal.info
+            if intentos <= 1
+            else self._avisos_signal.warning
+        )
+        escribir(
             f"decrypt:{motivo[:40]}",
             "[LIVE] mensaje no descifrado (motivo=%s, intento=%d, %d en esta "
             "sesion); el reintento por receipt sigue su curso",

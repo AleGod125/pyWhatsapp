@@ -112,7 +112,7 @@ def test_volver_a_aparecer_quita_la_duda(escenario):
     assert (recuperado.raw_metadata or {}).get(AUSENCIAS) == 0
 
 
-def test_una_foto_vacia_no_castiga_a_nadie(escenario):
+def test_una_foto_vacia_no_castiga_a_nadie(escenario, cuenta):
     """Si la pasada no trajo nada, lo que fallo fue la pasada.
 
     Castigar a las 41 conversaciones por eso es exactamente el error que esta
@@ -129,7 +129,7 @@ def test_una_foto_vacia_no_castiga_a_nadie(escenario):
         assert (_chat(escenario, jid).raw_metadata or {}).get(AUSENCIAS) in (None, 0)
 
 
-def test_las_que_aparecen_se_anotan_como_vistas(escenario):
+def test_las_que_aparecen_se_anotan_como_vistas(escenario, cuenta):
     jids = escenario["jids"]
     resultado = anotar_snapshot(
         escenario["session"], jids, account_id=escenario["cuenta"].id
@@ -139,7 +139,7 @@ def test_las_que_aparecen_se_anotan_como_vistas(escenario):
     assert resultado.ausentes == 0
 
 
-def test_el_recuento_cuadra(escenario):
+def test_el_recuento_cuadra(escenario, cuenta):
     jids = escenario["jids"]
     _anotar(escenario, jids[:2], veces=AUSENCIAS_PARA_DUDOSA)
     resultado = anotar_snapshot(
@@ -156,7 +156,7 @@ def test_el_recuento_cuadra(escenario):
 # ---------------------------------------------------------------------------
 
 
-def test_NADIE_BORRA_UNA_CONVERSACION(escenario):
+def test_NADIE_BORRA_UNA_CONVERSACION(escenario, cuenta):
     """La prueba que mas importa.
 
     Diez fotos seguidas sin una conversacion: sigue ahi, con su historial.

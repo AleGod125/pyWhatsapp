@@ -200,7 +200,7 @@ def test_la_revision_NO_reingiere_los_blobs(settings, database):
 
 
 def test_la_revision_automatica_sale_sin_tocar_disco_si_no_hay_nada(
-    session, settings, monkeypatch
+    session, cuenta, settings, monkeypatch
 ):
     """El panel llama a esto al abrirse y en cada refresco."""
     from app.services.pending_recheck import PendingRecheckService
@@ -241,7 +241,7 @@ def test_la_revision_automatica_sale_sin_tocar_disco_si_no_hay_nada(
         seed_collector = None
 
     # Un pendiente cualquiera, para que la lista no salga vacia por otro motivo.
-    chat = Chat(jid=f"5730{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual")
+    chat = Chat(jid=f"5730{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(

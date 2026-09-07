@@ -50,14 +50,14 @@ def test_no_hay_sqlite_como_base_de_la_app(settings):
 # ---------------------------------------------------------------------------
 
 
-def test_upsert_chat_es_idempotente(session):
+def test_upsert_chat_es_idempotente(session, cuenta):
     first = _chat(session)
     second = repo.upsert_chat(session, jid=CHAT_JID, chat_type="individual")
     assert first == second
     assert session.execute(select(Chat).where(Chat.jid == CHAT_JID)).scalar_one().name == "Contacto"
 
 
-def test_upsert_chat_no_degrada_datos_conocidos(session):
+def test_upsert_chat_no_degrada_datos_conocidos(session, cuenta):
     """Un update parcial no debe borrar el nombre ya resuelto."""
     _chat(session)
     repo.upsert_chat(session, jid=CHAT_JID, last_message="hola", last_message_timestamp=100)
@@ -66,7 +66,7 @@ def test_upsert_chat_no_degrada_datos_conocidos(session):
     assert chat.chat_type == "individual", "'unknown' no debe pisar un tipo conocido"
 
 
-def test_last_message_timestamp_solo_avanza(session):
+def test_last_message_timestamp_solo_avanza(session, cuenta):
     _chat(session)
     repo.upsert_chat(session, jid=CHAT_JID, last_message_timestamp=200)
     repo.upsert_chat(session, jid=CHAT_JID, last_message_timestamp=100)  # llega tarde
@@ -74,7 +74,7 @@ def test_last_message_timestamp_solo_avanza(session):
     assert chat.last_message_timestamp == 200
 
 
-def test_upsert_contact_conserva_pushname(session):
+def test_upsert_contact_conserva_pushname(session, cuenta):
     repo.upsert_contact(session, jid=CHAT_JID, push_name="Ana")
     repo.upsert_contact(session, jid=CHAT_JID, lid="123@lid")
     contact = session.execute(
@@ -89,7 +89,7 @@ def test_upsert_contact_conserva_pushname(session):
 # ---------------------------------------------------------------------------
 
 
-def test_insercion_en_lote(session):
+def test_insercion_en_lote(session, cuenta):
     chat_id = _chat(session)
     ids = {CHAT_JID: chat_id}
     batch = [
@@ -99,7 +99,7 @@ def test_insercion_en_lote(session):
     assert repo.count_messages(session, CHAT_JID) == 50
 
 
-def test_deduplicacion_por_id_real(session):
+def test_deduplicacion_por_id_real(session, cuenta):
     """History Sync y live pueden traer el mismo mensaje: no debe duplicarse."""
     chat_id = _chat(session)
     ids = {CHAT_JID: chat_id}
@@ -116,7 +116,7 @@ def test_deduplicacion_por_id_real(session):
     assert repo.count_messages(session, CHAT_JID) == 1
 
 
-def test_upsert_rellena_huecos_sin_pisar_lo_existente(session):
+def test_upsert_rellena_huecos_sin_pisar_lo_existente(session, cuenta):
     chat_id = _chat(session)
     ids = {CHAT_JID: chat_id}
 
@@ -143,7 +143,7 @@ def test_upsert_rellena_huecos_sin_pisar_lo_existente(session):
     assert message.raw_proto == b"\x01\x02\x03", "se rellena el hueco que faltaba"
 
 
-def test_mensajes_sin_id_no_colisionan_entre_si(session):
+def test_mensajes_sin_id_no_colisionan_entre_si(session, cuenta):
     """El indice es PARCIAL: los mensajes sin ID real no se deduplican.
 
     Su identidad es la PK de PostgreSQL. Inventarles una clave falsearia el
@@ -159,7 +159,7 @@ def test_mensajes_sin_id_no_colisionan_entre_si(session):
     assert repo.count_messages(session, CHAT_JID) == 2
 
 
-def test_id_vacio_es_rechazado_por_la_base(session):
+def test_id_vacio_es_rechazado_por_la_base(session, cuenta):
     """Un ID vacio es un error de ingesta: para 'sin ID' esta NULL."""
     chat_id = _chat(session)
     with pytest.raises(IntegrityError):
@@ -177,7 +177,7 @@ def test_id_vacio_es_rechazado_por_la_base(session):
 # ---------------------------------------------------------------------------
 
 
-def test_raw_proto_y_jsonb_se_conservan(session):
+def test_raw_proto_y_jsonb_se_conservan(session, cuenta):
     chat_id = _chat(session)
     blob = bytes(range(256))  # incluye 0x00 y 0xff
     metadata = {"tipo": "imagen", "anidado": {"width": 640}, "lista": [1, 2, 3]}
@@ -201,7 +201,7 @@ def test_raw_proto_y_jsonb_se_conservan(session):
     assert message.raw_metadata == metadata
 
 
-def test_borrar_chat_arrastra_sus_mensajes(session):
+def test_borrar_chat_arrastra_sus_mensajes(session, cuenta):
     chat_id = _chat(session)
     repo.bulk_upsert_messages(
         session, {CHAT_JID: chat_id}, [_msg(whatsapp_message_id="AC1", timestamp=100)]
@@ -216,7 +216,7 @@ def test_borrar_chat_arrastra_sus_mensajes(session):
 # ---------------------------------------------------------------------------
 
 
-def test_cursor_historico_ignora_ids_sinteticos(session):
+def test_cursor_historico_ignora_ids_sinteticos(session, cuenta):
     """Dataset exacto del brief.
 
         timestamp=100  id=AC100
@@ -252,7 +252,7 @@ def test_cursor_historico_ignora_ids_sinteticos(session):
     assert cursor.timestamp == 95
 
 
-def test_cursor_rechaza_prefijos_sinteticos_almacenados(session):
+def test_cursor_rechaza_prefijos_sinteticos_almacenados(session, cuenta):
     """Defensa en profundidad: aunque un 'opaque-' se colara en la columna."""
     chat_id = _chat(session)
     repo.bulk_upsert_messages(
@@ -267,7 +267,7 @@ def test_cursor_rechaza_prefijos_sinteticos_almacenados(session):
     assert cursor is not None and cursor.message_id == "AC095"
 
 
-def test_chat_sin_cursor_valido(session):
+def test_chat_sin_cursor_valido(session, cuenta):
     """Un chat sin ningun ID real es 'no_valid_cursor', no un error."""
     chat_id = _chat(session)
     repo.bulk_upsert_messages(
@@ -301,7 +301,7 @@ def test_validacion_de_id_de_cursor(message_id, expected):
 # ---------------------------------------------------------------------------
 
 
-def test_estado_de_historial_se_recalcula(session):
+def test_estado_de_historial_se_recalcula(session, cuenta):
     chat_id = _chat(session)
     repo.get_or_create_history_state(session, chat_id=chat_id, chat_jid=CHAT_JID)
     repo.bulk_upsert_messages(
@@ -341,7 +341,7 @@ def test_app_state_persiste_flags(session):
 # ---------------------------------------------------------------------------
 
 
-def test_paginacion_hacia_atras(session):
+def test_paginacion_hacia_atras(session, cuenta):
     chat_id = _chat(session)
     repo.bulk_upsert_messages(
         session,
@@ -367,7 +367,7 @@ def test_paginacion_hacia_atras(session):
     assert len(oldest) == 100, "quedaban 100"
 
 
-def test_paginacion_desempata_timestamps_iguales(session):
+def test_paginacion_desempata_timestamps_iguales(session, cuenta):
     """History Sync entrega muchos mensajes con el mismo timestamp."""
     chat_id = _chat(session)
     repo.bulk_upsert_messages(

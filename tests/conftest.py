@@ -40,6 +40,43 @@ def database(settings: Settings) -> Iterator[Database]:
     db.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _sin_clientes_de_whatsapp_de_verdad(monkeypatch):
+    """Los runtimes por cuenta se crean, pero NO se arrancan en la suite.
+
+    En produccion la fabrica del registro llama a ``start(connect=True)``, y
+    tiene que hacerlo: sin arrancar no hay ``client``, y sin ``client`` no se
+    genera ningun codigo QR. Pero ``start()`` pasa por ``prepare_pywhats()``,
+    que hace dos cosas incompatibles con una suite:
+
+    * resuelve la version de WhatsApp Web por RED, y
+    * parchea ``pywhats`` a nivel de PROCESO, sin deshacerlo.
+
+    Lo segundo se midio: al vincular en una prueba quedaba parcheado
+    ``pairing._device_props``, y `test_sin_el_parche_no_se_pide_historial_completo`
+    --que comprueba justamente la linea base SIN parche-- fallaba despues,
+    segun el orden de ejecucion.
+
+    Que la fabrica de verdad arranque lo que crea lo fija
+    `test_vinculacion_por_usuario.py::test_la_fabrica_arranca_el_runtime_que_crea`,
+    que lee el codigo real en vez de ejecutarlo.
+    """
+    from app.core import runtime_registry
+
+    def _sin_arrancar(settings, database, account_id):
+        from app.core.runtime import AppRuntime
+
+        rt = AppRuntime(
+            settings, owner=f"account:{account_id}", configure_logging=False
+        )
+        rt.database = database
+        rt.runtime_owner_account_id = account_id
+        rt.runtime_owner_user_id = runtime_registry._usuario_de(database, account_id)
+        return rt
+
+    monkeypatch.setattr(runtime_registry, "_crear_runtime", _sin_arrancar)
+
+
 @pytest.fixture
 def session(database: Database):
     """Sesion aislada: todo lo que escriba el test se revierte al terminar."""
@@ -48,6 +85,33 @@ def session(database: Database):
     connection = database.engine.connect()
     transaction = connection.begin()
     db_session = Session(bind=connection, expire_on_commit=False)
+
+    # LA SUITE NO PUEDE DEPENDER DE LO QUE HAYA VINCULADO QUIEN LA EJECUTA.
+    #
+    # Comparte base con la instalacion real, y `account_scope.cuenta_unica()`
+    # --de la que tiran los `upsert_*` que todavia no reciben la cuenta por
+    # parametro-- responde `None` en cuanto ve DOS cuentas. Con un WhatsApp
+    # vinculado de verdad, la cuenta que crea una prueba era la segunda y todo
+    # lo que se apoyara en ella se quedaba sin cuenta.
+    #
+    # Se midio en los dos sentidos: con la base llena, 66 pruebas pasaban
+    # apoyadas en datos ajenos; con la base vacia y una cuenta recien
+    # vinculada, esas mismas pruebas fallaban.
+    #
+    # Se vacian AQUI y no en una fixture posterior: esto corre antes que
+    # cualquier otra --todas dependen de `session`--, asi que las cuentas que
+    # creen las fixturas siguen en pie. Vaciarlo en `cuenta` se llevaba por
+    # delante las que acababa de crear `dos_usuarios`.
+    #
+    # Vive DENTRO de la transaccion de la prueba, que siempre se deshace: no
+    # toca nada de la instalacion.
+    from sqlalchemy import delete as _delete
+
+    from app.models import WhatsAppAccount
+
+    db_session.execute(_delete(WhatsAppAccount))
+    db_session.flush()
+
     try:
         yield db_session
     finally:
@@ -154,7 +218,66 @@ def runtime(settings, database, session, tmp_path):
     rt = AppRuntime(aislado, owner="pytest", configure_logging=False)
     rt.database = _DatabaseShim(database, session)
     rt._montar_cuentas()
+
     return rt
+
+
+@pytest.fixture
+def cuenta_del_cliente(session):
+    """La cuenta de WhatsApp del usuario que usa la fixture ``cliente``.
+
+    POR QUE NO VALE UNA CUENTA CUALQUIERA
+    -------------------------------------
+    Las pruebas que van por HTTP se autentican como un usuario concreto, y la
+    API le ensena SOLO lo suyo. Un chat creado bajo otra cuenta no aparece en
+    su listado -- y eso no es un fallo de la prueba, es el aislamiento
+    funcionando. Para comprobar que un chat SE VE hay que crearlo donde el
+    usuario pueda verlo.
+    """
+    from sqlalchemy import select
+
+    from app.models import WhatsAppAccount
+
+    fila = session.execute(select(WhatsAppAccount)).scalars().first()
+    assert fila is not None, "la fixture `cliente` deja una cuenta vinculada"
+    return fila
+
+
+@pytest.fixture
+def cuenta(session):
+    """Una cuenta de WhatsApp REAL a la que atribuir lo que cree la prueba.
+
+    POR QUE TODO CHAT NECESITA UNA
+    ------------------------------
+    ``chats.whatsapp_account_id`` pasa a ser obligatorio, y no por gusto: la
+    unicidad es ``(whatsapp_account_id, jid)`` y PostgreSQL trata los NULL como
+    distintos entre si. Un chat sin cuenta no colisiona con nada, asi que dos
+    filas del mismo contacto se colarian sin que nadie se entere.
+
+    Se crea una fila de verdad --con su usuario-- en vez de un identificador
+    inventado: una clave ajena que no apunta a ninguna parte no prueba nada, y
+    ademas la base la rechaza.
+    """
+    import uuid as _uuid
+
+    from app.models import User, WhatsAppAccount
+
+    usuario = User(
+        email=f"fixture-{_uuid.uuid4().hex[:10]}@example.com",
+        password_hash="x",
+    )
+    session.add(usuario)
+    session.flush()
+    id_cuenta = _uuid.uuid4()
+    fila = WhatsAppAccount(
+        id=id_cuenta,
+        user_id=usuario.id,
+        session_status="linked",
+        session_storage_key=f"accounts/{id_cuenta}",
+    )
+    session.add(fila)
+    session.flush()
+    return fila
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +387,14 @@ def _vincular_whatsapp(session, user_id):
     session.execute(sa_delete(WhatsAppAccount).where(WhatsAppAccount.user_id != user_id))
     session.flush()
 
+    import uuid as _uuid_v
+
+    id_cuenta = _uuid_v.uuid4()
     cuenta = WhatsAppAccount(
+        id=id_cuenta,
         user_id=user_id,
         session_status="linked",
-        session_storage_key=f"users/{user_id}",
+        session_storage_key=f"accounts/{id_cuenta}",
     )
     session.add(cuenta)
     session.flush()

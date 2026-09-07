@@ -169,19 +169,46 @@ def test_cada_usuario_ve_los_suyos_y_solo_los_suyos(session, dos_usuarios):
     assert not (de_a & de_b), "no puede haber ni uno compartido"
 
 
-def test_un_chat_sin_dueno_no_lo_ve_nadie(session, dos_usuarios):
-    """Era la causa del panel vacio, y sigue siendo lo correcto.
+def test_un_chat_DE_OTRA_CUENTA_no_lo_ve_nadie(session, dos_usuarios):
+    """Ninguno de los dos ve la conversacion de un tercero.
 
-    Se arregla dandoles dueno en la ingesta, no relajando el filtro: sin dueno
-    no se puede saber a quien mostrarselos.
+    Antes se comprobaba con un chat SIN dueno. Ese caso desaparecio al hacer
+    `whatsapp_account_id` obligatorio -- un chat sin dueno no colisiona con
+    nada y se duplicaria en silencio. El caso que queda, y que importa, es el
+    de la cuenta ajena.
     """
-    huerfano = Chat(jid="99900011122@lid", chat_type="individual", name="Sin dueno")
-    session.add(huerfano)
+    # La tercera cuenta se crea DESPUES de `dos_usuarios`: esa fixture limpia
+    # las cuentas de otros usuarios, y una creada antes se la llevaria por
+    # delante -- dejando la clave ajena apuntando a una fila que ya no existe.
+    import uuid as _uuid
+
+    from app.models import User, WhatsAppAccount
+
+    tercero = User(
+        email=f"tercero-{_uuid.uuid4().hex[:8]}@example.com", password_hash="x"
+    )
+    session.add(tercero)
+    session.flush()
+    ajena = WhatsAppAccount(
+        user_id=tercero.id,
+        session_status="linked",
+        session_storage_key=f"accounts/{_uuid.uuid4().hex}",
+    )
+    session.add(ajena)
+    session.flush()
+
+    ajeno = Chat(
+        jid="99900011122@lid",
+        chat_type="individual",
+        name="De otra persona",
+        whatsapp_account_id=ajena.id,
+    )
+    session.add(ajeno)
     session.flush()
 
     for etiqueta in ("A", "B"):
         jids = {r.jid for r in _listar(session, dos_usuarios[etiqueta]["user_id"])}
-        assert huerfano.jid not in jids
+        assert ajeno.jid not in jids
 
 
 # ---------------------------------------------------------------------------

@@ -136,10 +136,10 @@ def test_el_margen_es_moderado():
 # ---------------------------------------------------------------------------
 
 
-def _chat(session, jid, *, mensajes=5):
+def _chat(session, cuenta, jid, *, mensajes=5):
     from app.models import Chat, Message
 
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     for i in range(mensajes):
@@ -171,7 +171,7 @@ def _peticion(session, jid, estado):
     session.flush()
 
 
-def test_se_prueba_con_quien_YA_contesto(backfill, session, monkeypatch):
+def test_se_prueba_con_quien_YA_contesto(backfill, session, monkeypatch, cuenta):
     """La causa exacta del SUSPECT medido.
 
     La prueba eligió un chat que ya había agotado dos esperas. Es el peor
@@ -180,8 +180,8 @@ def test_se_prueba_con_quien_YA_contesto(backfill, session, monkeypatch):
     """
     bueno = "573001110000@s.whatsapp.net"
     malo = "573002220000@s.whatsapp.net"
-    chat_bueno = _chat(session, bueno, mensajes=3)
-    chat_malo = _chat(session, malo, mensajes=40)  # más mensajes: antes ganaba
+    chat_bueno = _chat(session, cuenta, bueno, mensajes=3)
+    chat_malo = _chat(session, cuenta, malo, mensajes=40)  # más mensajes: antes ganaba
     _peticion(session, bueno, "received")
     for _ in range(2):
         _peticion(session, malo, "timeout")
@@ -201,12 +201,12 @@ def test_se_prueba_con_quien_YA_contesto(backfill, session, monkeypatch):
 
 
 def test_entre_desconocidos_se_prefiere_al_que_menos_ha_fallado(
-    backfill, session, monkeypatch
+    backfill, session, cuenta, monkeypatch
 ):
     uno = "573003330000@s.whatsapp.net"
     otro = "573004440000@s.whatsapp.net"
-    chat_uno = _chat(session, uno)
-    chat_otro = _chat(session, otro)
+    chat_uno = _chat(session, cuenta, uno)
+    chat_otro = _chat(session, cuenta, otro)
     for _ in range(3):
         _peticion(session, uno, "timeout")
 
@@ -220,11 +220,11 @@ def test_entre_desconocidos_se_prefiere_al_que_menos_ha_fallado(
 
 
 def test_sin_historial_de_peticiones_se_elige_como_siempre(
-    backfill, session, monkeypatch
+    backfill, session, cuenta, monkeypatch
 ):
     """Una base recién creada no puede quedarse sin objetivo."""
     jid = "573005550000@s.whatsapp.net"
-    chat = _chat(session, jid)
+    chat = _chat(session, cuenta, jid)
     monkeypatch.setattr(
         backfill, "chats_with_cursor", lambda limit=500: [(chat.id, jid, object())]
     )

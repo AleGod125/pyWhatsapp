@@ -54,9 +54,9 @@ class _BackfillFalso:
 
 
 @pytest.fixture
-def chats(session):
+def chats(session, cuenta):
     for jid in (DORMIDO, OTRO):
-        chat = Chat(jid=jid, chat_type="individual")
+        chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
         session.add(chat)
         session.flush()
         session.add(

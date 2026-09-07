@@ -254,12 +254,12 @@ def test_se_elige_el_ancla_mas_ANTIGUA(escenario, session):
 # ---------------------------------------------------------------------------
 
 
-def test_un_ancla_por_LID_encuentra_el_chat_existente(escenario, session):
+def test_un_ancla_por_LID_encuentra_el_chat_existente(escenario, session, cuenta):
     """Telefono y LID son el mismo contacto: no puede crearse otro chat."""
     from app.models import Contact
 
     lid = "99988877766@lid"
-    session.add(Contact(jid=escenario["chat"].jid, lid=lid))
+    session.add(Contact(jid=escenario["chat"].jid, lid=lid, whatsapp_account_id=cuenta.id))
     session.flush()
 
     resultado = escenario["colector"].observe(
@@ -276,7 +276,7 @@ def test_un_ancla_de_un_chat_desconocido_se_rechaza(escenario):
     assert not resultado.aceptada
 
 
-def test_el_ancla_de_un_grupo_es_del_grupo(escenario, session):
+def test_el_ancla_de_un_grupo_es_del_grupo(escenario, session, cuenta):
     """El participante no es una conversacion."""
     grupo = Chat(
         jid="120363000000000000@g.us",

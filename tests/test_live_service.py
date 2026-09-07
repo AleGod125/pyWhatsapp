@@ -84,7 +84,7 @@ def test_tipo_de_mensaje():
 # ---------------------------------------------------------------------------
 
 
-def test_mensaje_live_se_guarda(session):
+def test_mensaje_live_se_guarda(session, cuenta):
     service = LiveMessageService(FakeDatabase(session))
     result = service.handle(make_message(text="mensaje nuevo"))
 
@@ -99,7 +99,7 @@ def test_mensaje_live_se_guarda(session):
     assert row.raw_proto is None
 
 
-def test_el_chat_se_crea_y_se_actualiza(session):
+def test_el_chat_se_crea_y_se_actualiza(session, cuenta):
     service = LiveMessageService(FakeDatabase(session))
     service.handle(make_message(text="primero", timestamp=1_700_000_000))
     service.handle(
@@ -113,7 +113,7 @@ def test_el_chat_se_crea_y_se_actualiza(session):
     assert chat.last_message_timestamp == 1_700_000_500
 
 
-def test_no_duplica_lo_que_ya_llego_por_historial(session):
+def test_no_duplica_lo_que_ya_llego_por_historial(session, cuenta):
     """History Sync y live se solapan a proposito: no debe duplicarse."""
     chat_id = repo.upsert_chat(session, jid=CHAT_JID, chat_type="individual")
     repo.bulk_upsert_messages(
@@ -145,7 +145,7 @@ def test_no_duplica_lo_que_ya_llego_por_historial(session):
     assert row.raw_proto == b"\x01\x02", "el raw_proto del historial se conserva"
 
 
-def test_el_lid_va_a_su_columna(session):
+def test_el_lid_va_a_su_columna(session, cuenta):
     """Un emisor @lid no debe acabar en sender_jid."""
     service = LiveMessageService(FakeDatabase(session))
     service.handle(make_message(chat=LID_CHAT, sender=LID_CHAT, id="LIDMSG"))
@@ -157,7 +157,7 @@ def test_el_lid_va_a_su_columna(session):
     assert row.sender_jid is None
 
 
-def test_el_adjunto_queda_pendiente_de_descarga(session):
+def test_el_adjunto_queda_pendiente_de_descarga(session, cuenta):
     media = MediaAttachment(
         kind="image", direct_path="/v/t62.abc", media_key=b"k" * 32,
         file_sha256=b"s" * 32, file_enc_sha256=b"e" * 32,
@@ -182,7 +182,7 @@ def test_el_adjunto_queda_pendiente_de_descarga(session):
     assert attachment.file_size == 45678
 
 
-def test_un_mensaje_roto_no_tumba_el_receptor(session):
+def test_un_mensaje_roto_no_tumba_el_receptor(session, cuenta):
     """El receptor es lo prioritario: un fallo se registra y se sigue."""
     service = LiveMessageService(FakeDatabase(session))
 
@@ -202,7 +202,7 @@ def test_un_mensaje_roto_no_tumba_el_receptor(session):
     assert service.handle(make_message(id="DESPUES")) is not None  # sigue vivo
 
 
-def test_marca_el_emisor_propio(session):
+def test_marca_el_emisor_propio(session, cuenta):
     service = LiveMessageService(FakeDatabase(session), own_jid="34699000111@s.whatsapp.net")
     service.handle(make_message(id="MIO", from_me=True))
 
@@ -216,7 +216,7 @@ def test_marca_el_emisor_propio(session):
 @pytest.mark.parametrize(
     "count,expected", [(50, 50), (100, 100), (500, 500), (5000, 500), (1, 1)]
 )
-def test_tope_de_mensajes_por_peticion(monkeypatch, count, expected):
+def test_tope_de_mensajes_por_peticion(monkeypatch, count, expected, cuenta):
     """Un valor desmedido se acota en vez de romper la extraccion.
 
     El techo es 500. El servidor acota la respuesta por su cuenta de todos

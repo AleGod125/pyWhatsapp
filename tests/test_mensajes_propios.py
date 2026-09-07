@@ -67,7 +67,7 @@ def test_el_telefono_es_el_dispositivo_cero():
     assert _clasificar(_Remitente(MI_LID, device=0)) == PRIMARY_PHONE
 
 
-def test_un_vinculado_no_es_el_telefono():
+def test_un_vinculado_no_es_el_telefono(cuenta):
     """Se midio el 92 en la cuenta real: es WhatsApp Web."""
     assert _clasificar(_Remitente(MI_LID, device=92)) == LINKED_WEB
 
@@ -91,7 +91,7 @@ def test_sin_dispositivo_no_se_afirma_cual_es():
     assert _clasificar(_SinDispositivo()) == LINKED_UNKNOWN
 
 
-def test_no_se_clasifica_solo_por_el_identificador():
+def test_no_se_clasifica_solo_por_el_identificador(cuenta):
     """El telefono y el vinculado llevan el MISMO identificador de cuenta."""
     telefono = _clasificar(_Remitente(MI_LID, device=0))
     vinculado = _clasificar(_Remitente(MI_LID, device=92))
@@ -114,7 +114,7 @@ def test_la_direccion_registrada_va_truncada():
     assert enmascarada.endswith(":0@lid")
 
 
-def test_se_detecta_el_mismo_aparato_con_dos_sesiones(tmp_path):
+def test_se_detecta_el_mismo_aparato_con_dos_sesiones(tmp_path, cuenta):
     """La causa medida de que alguna copia del telefono no cuadre.
 
     ``PN:0`` y ``LID:0`` son el mismo aparato con dos estados de ratchet

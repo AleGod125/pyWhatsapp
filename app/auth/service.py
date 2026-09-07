@@ -23,7 +23,7 @@ from sqlalchemy import select, update
 
 from app.auth.crypto import hash_de_token, nuevo_token_de_sesion
 from app.auth.passwords import PasswordHasherService, validar_password
-from app.core.logging_setup import get_logger
+from app.core.logging_setup import RateLimitedLogger, get_logger
 from app.models import User, UserSession
 
 log = get_logger("AUTH")
@@ -78,6 +78,10 @@ class AuthService:
         self._database = database
         self._settings = settings
         self._hasher = PasswordHasherService()
+        # Los avisos de sesion rechazada se agrupan: `resolver` corre en CADA
+        # peticion, y una cookie caducada que nadie borra escribiria una linea
+        # por sondeo del frontend.
+        self._avisos = RateLimitedLogger(log, ventana=60.0)
 
     # -- Registro ------------------------------------------------------------
 
@@ -169,6 +173,12 @@ class AuthService:
         )
         usuario.last_login_at = _ahora()
         session.flush()
+        # Aqui y en ningun otro sitio: `register`, `login` y la vuelta de
+        # Google pasan todos por este metodo, asi que un solo aviso cubre las
+        # tres puertas. Antes el arranque solo decia "cookie de sesion
+        # emitida", sin nombre ni identificador, y con dos usuarios en la misma
+        # maquina no habia forma de saber quien habia entrado.
+        log.info("Sesion iniciada: %s (caduca %s)", quien_es(usuario), caduca)
         return SesionIniciada(user_id=usuario.id, token=token, expires_at=caduca)
 
     def abrir_sesion_para(self, user_id: Any) -> SesionIniciada:
@@ -203,13 +213,48 @@ class AuthService:
                     UserSession.token_hash == hash_de_token(token)
                 )
             ).scalar_one_or_none()
-            if sesion is None or sesion.revoked_at is not None:
+            # Una sesion tambien se cierra SOLA: caduca, o alguien la revoca
+            # desde otro sitio. Eso no pasa por `logout`, asi que sin este
+            # aviso el log se quedaba mudo y el usuario aparecia de pronto en
+            # la pantalla de entrar sin que nada lo explicara.
+            #
+            # Se detecta en la siguiente peticion, que con el frontend
+            # sondeando llega en segundos.
+            #
+            # Va agrupado porque esto corre en CADA peticion: una cookie
+            # caducada que nadie borra escribiria una linea por sondeo.
+            if sesion is None:
+                # Cookie de otra instalacion o de una base que se reinicio. No
+                # se nombra a nadie porque no hay a quien nombrar.
+                self._avisos.info(
+                    "sesion:desconocida",
+                    "Sesion no reconocida: la cookie no corresponde a ninguna "
+                    "sesion de esta instalacion",
+                )
+                return None
+            if sesion.revoked_at is not None:
+                self._avisos.info(
+                    f"sesion:revocada:{sesion.user_id}",
+                    "Sesion cerrada (revocada): %s",
+                    quien_es(session.get(User, sesion.user_id)),
+                )
                 return None
             if _con_zona(sesion.expires_at) <= _ahora():
+                self._avisos.info(
+                    f"sesion:caducada:{sesion.user_id}",
+                    "Sesion caducada: %s (caduco el %s)",
+                    quien_es(session.get(User, sesion.user_id)),
+                    sesion.expires_at,
+                )
                 return None
 
             usuario = session.get(User, sesion.user_id)
             if usuario is None or not usuario.is_active:
+                self._avisos.info(
+                    f"sesion:inactiva:{sesion.user_id}",
+                    "Sesion rechazada: la cuenta %s ya no esta activa",
+                    quien_es(usuario),
+                )
                 return None
 
             sesion.last_seen_at = _ahora()
@@ -223,20 +268,32 @@ class AuthService:
         if not token:
             return False
         with self._database.transaction() as session:
+            # Se mira PRIMERO de quien era. Despues de revocarla ya no se puede
+            # decir quien se fue, y "una sesion se cerro" sin nombre no sirve
+            # de nada en una maquina con varios usuarios.
+            huella = hash_de_token(token)
+            duena = session.execute(
+                select(UserSession.user_id).where(UserSession.token_hash == huella)
+            ).scalar_one_or_none()
             filas = session.execute(
                 update(UserSession)
                 .where(
-                    UserSession.token_hash == hash_de_token(token),
+                    UserSession.token_hash == huella,
                     UserSession.revoked_at.is_(None),
                 )
                 .values(revoked_at=_ahora())
             ).rowcount
+            if filas:
+                log.info(
+                    "Sesion cerrada: %s",
+                    quien_es(session.get(User, duena) if duena else None),
+                )
         return bool(filas)
 
     def revocar_todas(self, user_id: Any) -> int:
         """Cierra todas las sesiones de un usuario. Para cambios de credencial."""
         with self._database.transaction() as session:
-            return (
+            cerradas = (
                 session.execute(
                     update(UserSession)
                     .where(
@@ -247,6 +304,13 @@ class AuthService:
                 ).rowcount
                 or 0
             )
+            if cerradas:
+                log.info(
+                    "%d sesion(es) cerradas de golpe: %s",
+                    cerradas,
+                    quien_es(session.get(User, user_id)),
+                )
+            return cerradas
 
     def limpiar_caducadas(self) -> int:
         """Borra sesiones muertas. Mantenimiento, no seguridad."""
@@ -272,3 +336,22 @@ def _correo_corto(email: str) -> str:
     """Para los logs: identifica sin escribir la direccion entera."""
     local, _, dominio = email.partition("@")
     return f"{local[:2]}***@{dominio}"
+
+
+def quien_es(usuario: Any) -> str:
+    """Como se nombra a una persona en el log. UN solo formato.
+
+    Lleva las dos cosas a proposito: el nombre --o el correo recortado, que es
+    lo que siempre hay-- para leerlo de un vistazo, y el identificador para
+    poder cruzarlo con la base y con los runtimes, que van por id.
+
+    El correo se recorta como en el resto del modulo: en multiusuario el log
+    de la maquina lo ve quien la administra, no hace falta la direccion entera
+    para saber quien entro.
+    """
+    if usuario is None:
+        return "desconocido"
+    nombre = (getattr(usuario, "display_name", None) or "").strip()
+    if not nombre:
+        nombre = _correo_corto(getattr(usuario, "email", "") or "")
+    return f"{nombre} id={str(getattr(usuario, 'id', '?'))[:8]}"

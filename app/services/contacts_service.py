@@ -38,9 +38,29 @@ CONTACT_COLLECTIONS = ("critical_unblock_low", "regular_high")
 class ContactService:
     """Guarda los nombres que llegan por app-state."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, whatsapp_account_id: Any = None) -> None:
         self._database = database
         self.resolved = 0
+        # DE QUIEN son los contactos que guarda este servicio.
+        #
+        # La agenda es privada: el nombre que una persona le pone a un numero
+        # no puede acabar en la de otra. Se guarda aqui en vez de deducirlo en
+        # cada evento porque el servicio ya pertenece a una cuenta -- lo crea
+        # el runtime de esa cuenta.
+        self.whatsapp_account_id = whatsapp_account_id
+
+    def _cuenta(self, sesion: Any) -> Any:
+        """La cuenta de este servicio; si no la recibio, la unica que haya.
+
+        El respaldo es de transicion y se cae solo: en cuanto existan dos
+        cuentas devuelve ``None``, que es preferible a atribuirle la agenda de
+        alguien a quien no es.
+        """
+        if self.whatsapp_account_id is not None:
+            return self.whatsapp_account_id
+        from app.services.account_scope import cuenta_unica
+
+        return cuenta_unica(sesion)
 
     # -- Sinks de eventos ----------------------------------------------------
 
@@ -59,7 +79,12 @@ class ContactService:
         from app.services import repository as repo
 
         with self._database.transaction() as session:
-            repo.upsert_contact(session, jid=jid, display_name=display)
+            repo.upsert_contact(
+                session,
+                whatsapp_account_id=self._cuenta(session),
+                jid=jid,
+                display_name=display,
+            )
         self.resolved += 1
         # El NOMBRE de un contacto no va a INFO: es un dato personal y ademas
         # una linea por contacto llena la consola. El resumen lo publica
@@ -77,7 +102,12 @@ class ContactService:
         from app.services import repository as repo
 
         with self._database.transaction() as session:
-            repo.upsert_contact(session, jid=jid, push_name=name)
+            repo.upsert_contact(
+                session,
+                whatsapp_account_id=self._cuenta(session),
+                jid=jid,
+                push_name=name,
+            )
         self.resolved += 1
         return {"jid": jid, "name": name}
 

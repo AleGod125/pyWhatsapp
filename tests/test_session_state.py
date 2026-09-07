@@ -142,7 +142,7 @@ def test_D_generacion_descarta_resultados_viejos(state):
 # ---------------------------------------------------------------------------
 
 
-def test_invalidar_sesion_no_borra_datos(session, state):
+def test_invalidar_sesion_no_borra_datos(session, cuenta, state):
     """PostgreSQL es el backup: desvincularse no puede costar mensajes."""
     from app.services import repository as repo
     from app.services.repository import IncomingMessage

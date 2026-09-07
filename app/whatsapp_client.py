@@ -230,17 +230,24 @@ class WhatsAppClient:
             requested = asyncio.create_task(
                 self._shutdown_requested.wait(), name="shutdown-requested"
             )
+            # Tercer vigilante: el socket muerto que NUNCA avisa. Ver
+            # `_esperar_transporte_muerto`.
+            muerto = asyncio.create_task(
+                self._esperar_transporte_muerto(), name="transporte-muerto"
+            )
             try:
                 done, _pending = await asyncio.wait(
-                    {closed, requested}, return_when=asyncio.FIRST_COMPLETED
+                    {closed, requested, muerto}, return_when=asyncio.FIRST_COMPLETED
                 )
             finally:
-                for task in (closed, requested):
+                for task in (closed, requested, muerto):
                     if not task.done():
                         task.cancel()
                 # CancelledError propia del cierre: se absorbe a proposito.
                 # Una cancelacion inesperada seguiria propagandose.
-                await asyncio.gather(closed, requested, return_exceptions=True)
+                await asyncio.gather(
+                    closed, requested, muerto, return_exceptions=True
+                )
 
             if requested in done:
                 log.info("Parada solicitada: cerrando la sesion")
@@ -274,6 +281,73 @@ class WhatsAppClient:
                 return
             if not await self._reconectar():
                 return
+
+    #: Cada cuanto se comprueba que el socket sigue vivo, en segundos.
+    LATIDO_DEL_TRANSPORTE = 5.0
+
+    async def _esperar_transporte_muerto(self) -> None:
+        """Vuelve cuando el socket esta muerto pero nadie lo ha anunciado.
+
+        EL FALLO QUE CIERRA, MEDIDO
+        ---------------------------
+        La reconexion colgaba entera de ``wait_closed()``, que solo despierta
+        cuando el cliente activa su evento ``_closed``. Y eso pasa en dos
+        sitios: cuando termina el grupo de tareas del receptor, o dentro de
+        ``Client.disconnect()``. Hay una muerte en la que no ocurre ninguno de
+        los dos::
+
+            12:23:33  el socket deja de contestar
+            12:24:03  app ping failed (1/3)  -> TimeoutError
+            12:24:33  app ping failed (2/3)  -> NotConnected: ya estaba muerto
+            12:25:03  peer presumed dead; closing connection
+                      ... y NO aparece "client: session closed"
+                      ... y NO aparece "Conexion perdida. Reintento 1"
+
+        El manejador del keepalive llama a ``sock.disconnect()`` sobre un
+        socket que llevaba noventa segundos cerrado, y ese camino ya no
+        despierta a nadie. El proceso se quedaba vivo, en estado CONNECTED, y
+        SORDO: ni un mensaje entrante mas, sin un solo error que lo dijera.
+
+        Asi que no se pregunta solo "¿te has cerrado?" sino tambien "¿sigues
+        vivo?". Es una pregunta distinta y no depende de que nadie avise.
+        """
+        while True:
+            await asyncio.sleep(self.LATIDO_DEL_TRANSPORTE)
+            if self._transporte_vivo():
+                continue
+            log.warning(
+                "El socket esta muerto y nadie lo anuncio. Se fuerza el "
+                "cierre para poder reconectar."
+            )
+            # Se cierra a mano para que el cliente quede coherente. Si el
+            # cierre se atasca --la cola de entrada llena bloquea el
+            # `put` del centinela-- NO se espera: el objetivo es reconectar,
+            # y para eso basta con dejar de usar este cliente.
+            try:
+                await asyncio.wait_for(self._client.disconnect(), timeout=5.0)
+            except Exception:  # noqa: BLE001 - incluido el timeout
+                log.debug("El cierre forzado no termino; se reconecta igual")
+            return
+
+    def _transporte_vivo(self) -> bool:
+        """Si el socket del cliente sigue en pie.
+
+        Mira el estado real del transporte, no el que creamos tener. Ante la
+        duda contesta que SI: un falso "muerto" reconectaria una sesion sana,
+        y eso cuesta un corte de verdad. Un falso "vivo" solo retrasa la
+        deteccion hasta el siguiente latido.
+        """
+        cliente = self._client
+        if cliente is None:
+            return True
+        sock = getattr(cliente, "_sock", None)
+        if sock is None:
+            # Todavia no hay socket (arrancando), o ya se limpio. En ninguno de
+            # los dos casos toca decidir aqui.
+            return True
+        if getattr(sock, "_closed", False):
+            return False
+        return getattr(sock, "_ws", True) is not None
 
     # Espera entre intentos de reconexion. Escala corta al principio (un
     # corte de WiFi de dos segundos no debe costar un minuto de silencio) y

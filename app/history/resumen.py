@@ -86,8 +86,13 @@ def resumen_de_estado(
 
         por_estado = select(ChatHistoryState.history_status, func.count())
         if account_id is not None:
+            # El join va por `chat_id`, NO por `jid`.
+            #
+            # Con el jid, dos cuentas que comparten un contacto se cruzan: se
+            # provoco el caso y el resumen de una contaba el estado de la otra.
+            # `chat_id` es la clave ajena de verdad.
             por_estado = por_estado.join(
-                Chat, Chat.jid == ChatHistoryState.chat_jid
+                Chat, Chat.id == ChatHistoryState.chat_id
             ).where(Chat.whatsapp_account_id == account_id)
         resumen.por_estado = dict(
             sesion.execute(por_estado.group_by(ChatHistoryState.history_status)).all()
@@ -100,7 +105,7 @@ def resumen_de_estado(
             ChatHistoryState.history_status.in_(("timeout", "pending"))
         )
         if account_id is not None:
-            esperas = esperas.join(Chat, Chat.jid == ChatHistoryState.chat_jid).where(
+            esperas = esperas.join(Chat, Chat.id == ChatHistoryState.chat_id).where(
                 Chat.whatsapp_account_id == account_id
             )
         resumen.retry_pending = sum(

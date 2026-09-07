@@ -267,7 +267,7 @@ class HistoryRecoveryService:
             if chat_id not in encontradas and progreso.state == "recovering_seed":
                 progreso.state = "no_seed"
                 trabajo.no_seed += 1
-                self._anotar_intento(chat["chat_jid"], "no_seed")
+                self._anotar_intento(chat["chat_jid"], "no_seed", chat_id=chat_id)
                 self._emitir(
                     "history.seed.not_found",
                     {"chat_id": chat_id, "job_id": trabajo.job_id},
@@ -350,7 +350,10 @@ class HistoryRecoveryService:
                     return False
                 actualizadas = sesion.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid == chat_jid)
+                    # Por `chat_id`: el jid deja de ser unico en cuanto dos
+                    # cuentas comparten un contacto, y este UPDATE alcanzaria
+                    # la fila de la otra persona.
+                    .where(ChatHistoryState.chat_id == chat_id)
                     .values(
                         history_status="pending",
                         oldest_message_id=semilla.message_id,
@@ -373,7 +376,9 @@ class HistoryRecoveryService:
             cola.enqueue([chat_jid])
         return True
 
-    def _anotar_intento(self, chat_jid: str, resultado: str) -> None:
+    def _anotar_intento(
+        self, chat_jid: str, resultado: str, *, chat_id: int | None = None
+    ) -> None:
         """Deja constancia del intento SIN cambiar el estado del chat.
 
         Sigue esperando referencia: lo unico que se guarda es cuando se probo
@@ -385,9 +390,11 @@ class HistoryRecoveryService:
 
         try:
             with self._database.transaction() as sesion:
+                from app.services.account_scope import estado_de_esta_conversacion
+
                 sesion.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid == chat_jid)
+                    .where(estado_de_esta_conversacion(chat_jid, chat_id=chat_id))
                     .values(
                         last_seed_attempt_at=_ahora(),
                         last_seed_attempt_result=resultado,

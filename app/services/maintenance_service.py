@@ -179,29 +179,42 @@ class MaintenanceService:
         aplicacion.
         """
         with self._database.transaction() as session:
+            # Se busca por CHAT, no por identificador de conversacion.
+            #
+            # `chat_jid` no es unico entre cuentas --dos personas pueden tener
+            # la misma conversacion-- asi que con `NOT IN (chat_jid)` el chat
+            # de la segunda cuenta se daria por atendido porque la primera ya
+            # tiene su estado, y se quedaria sin fila para siempre.
             faltantes = session.execute(
                 select(Chat.id, Chat.jid).where(
-                    ~Chat.jid.in_(select(ChatHistoryState.chat_jid))
+                    ~Chat.id.in_(select(ChatHistoryState.chat_id))
                 )
             ).all()
             for chat_id, chat_jid in faltantes:
                 session.execute(
                     insert(ChatHistoryState)
                     .values(chat_id=chat_id, chat_jid=chat_jid, history_status="pending")
-                    .on_conflict_do_nothing(index_elements=[ChatHistoryState.chat_jid])
+                    # `chat_id` es unico y lo seguira siendo: la migracion
+                    # retira la unicidad de `chat_jid`, no esta.
+                    .on_conflict_do_nothing(index_elements=[ChatHistoryState.chat_id])
                 )
             report.history_states_created += len(faltantes)
 
             # Conteo real por chat, en una sola pasada agregada.
+            #
+            # Se agrupa por `chat_id` y NO por `chat_jid`: el jid deja de ser
+            # unico en cuanto dos cuentas comparten un contacto, y entonces el
+            # agregado sumaria los mensajes de las dos y el UPDATE tocaria las
+            # dos filas de estado.
             counts = (
-                select(Message.chat_jid, func.count().label("total"))
-                .group_by(Message.chat_jid)
+                select(Message.chat_id, func.count().label("total"))
+                .group_by(Message.chat_id)
                 .subquery()
             )
             cambiados = session.execute(
                 update(ChatHistoryState)
                 .where(
-                    ChatHistoryState.chat_jid == counts.c.chat_jid,
+                    ChatHistoryState.chat_id == counts.c.chat_id,
                     ChatHistoryState.message_count.is_distinct_from(counts.c.total),
                 )
                 .values(message_count=counts.c.total)
@@ -223,19 +236,19 @@ class MaintenanceService:
         with self._database.transaction() as session:
             anclas = (
                 select(
-                    Message.chat_jid,
+                    Message.chat_id,
                     Message.whatsapp_message_id.label("wamid"),
                     Message.timestamp.label("ts"),
                 )
                 .where(_real_wamid_filter())
-                .distinct(Message.chat_jid)
-                .order_by(Message.chat_jid, Message.timestamp.asc(), Message.id.asc())
+                .distinct(Message.chat_id)
+                .order_by(Message.chat_id, Message.timestamp.asc(), Message.id.asc())
                 .subquery()
             )
             actualizados = session.execute(
                 update(ChatHistoryState)
                 .where(
-                    ChatHistoryState.chat_jid == anclas.c.chat_jid,
+                    ChatHistoryState.chat_id == anclas.c.chat_id,
                     or_(
                         ChatHistoryState.oldest_message_id.is_distinct_from(
                             anclas.c.wamid
@@ -254,16 +267,16 @@ class MaintenanceService:
 
             extremos = (
                 select(
-                    Message.chat_jid,
+                    Message.chat_id,
                     func.max(Message.timestamp).label("newest"),
                 )
-                .group_by(Message.chat_jid)
+                .group_by(Message.chat_id)
                 .subquery()
             )
             session.execute(
                 update(ChatHistoryState)
                 .where(
-                    ChatHistoryState.chat_jid == extremos.c.chat_jid,
+                    ChatHistoryState.chat_id == extremos.c.chat_id,
                     ChatHistoryState.newest_message_timestamp.is_distinct_from(
                         extremos.c.newest
                     ),
@@ -601,20 +614,31 @@ class MaintenanceService:
         from app.models import ChatHistoryState
 
         with self._database.transaction() as session:
+            # Se lleva el `chat_id`, no solo el jid.
+            #
+            # El jid dejo de ser unico en cuanto dos cuentas tienen el mismo
+            # contacto, y eso rompia esto por los dos lados: al preguntar,
+            # `get_valid_history_cursor` reventaba con "Multiple rows were
+            # found"; y al escribir, un `UPDATE ... WHERE chat_jid IN (...)`
+            # habria tocado las filas de LAS DOS cuentas -- el progreso de una
+            # persona modificado por lo que hizo otra, sin error y sin traza.
+            #
+            # `chat_id` es NOT NULL y UNIQUE en esta tabla: no hay ambiguedad.
             candidatos = session.execute(
-                select(ChatHistoryState.chat_jid).where(
+                select(ChatHistoryState.chat_jid, ChatHistoryState.chat_id).where(
                     ChatHistoryState.history_status.in_(("pending", "timeout"))
                 )
-            ).scalars().all()
+            ).all()
             sin_ancla = [
-                jid
-                for jid in candidatos
-                if get_valid_history_cursor(session, chat_jid=jid) is None
+                cid
+                for jid, cid in candidatos
+                if get_valid_history_cursor(session, chat_jid=jid, chat_id=cid)
+                is None
             ]
             if sin_ancla:
                 session.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid.in_(sin_ancla))
+                    .where(ChatHistoryState.chat_id.in_(sin_ancla))
                     .values(
                         history_status="waiting_seed",
                         last_error="sin ancla real; vuelve a esperar una semilla",

@@ -60,10 +60,10 @@ class _RuntimeFalso:
 
 
 @pytest.fixture
-def fantasmas(session):
+def fantasmas(session, cuenta):
     creados = []
     for jid, nombre in ((FANTASMA_A, "Chat fantasma A"), (FANTASMA_B, "Chat fantasma B")):
-        chat = Chat(jid=jid, chat_type="individual", name=nombre)
+        chat = Chat(jid=jid, chat_type="individual", name=nombre, whatsapp_account_id=cuenta.id)
         session.add(chat)
         session.flush()
         session.add(
@@ -124,11 +124,11 @@ def test_se_puede_pedir_uno_solo(servicio, session, fantasmas):
     assert pendientes[0]["chat_jid"] == FANTASMA_A
 
 
-def test_se_llevan_todos_los_alias(servicio, session, fantasmas):
+def test_se_llevan_todos_los_alias(servicio, session, fantasmas, cuenta):
     """Un contacto aparece por telefono y por LID: los dos identifican el chat."""
     from app.models import Contact
 
-    session.add(Contact(jid="34600123456@s.whatsapp.net", lid=FANTASMA_A))
+    session.add(Contact(jid="34600123456@s.whatsapp.net", lid=FANTASMA_A, whatsapp_account_id=cuenta.id))
     session.flush()
 
     pendientes = servicio._pendientes(fantasmas[0].id)

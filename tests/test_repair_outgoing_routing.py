@@ -37,10 +37,10 @@ MIS_IDS = frozenset({YO, "34600000001@s.whatsapp.net"})
 
 
 @pytest.fixture
-def escenario(session):
+def escenario(session, cuenta):
     """Chat propio y chat del contacto, ambos vacios y ficticios."""
-    session.add(Chat(jid=YO, chat_type="individual"))
-    session.add(Chat(jid=OTRO, chat_type="individual"))
+    session.add(Chat(jid=YO, chat_type="individual", whatsapp_account_id=cuenta.id))
+    session.add(Chat(jid=OTRO, chat_type="individual", whatsapp_account_id=cuenta.id))
     session.flush()
     return session
 

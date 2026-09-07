@@ -108,7 +108,7 @@ def test_el_estado_refleja_la_maquina_de_estados(cliente, runtime):
     assert cuerpo["connected"] is True
 
 
-def test_pair_avisa_cuando_la_instancia_es_solo_lectura(cliente):
+def test_pair_avisa_cuando_la_instancia_es_solo_lectura(cliente, cuenta):
     respuesta = cliente.post("/api/v1/session/pair")
     assert respuesta.status_code == 409
     assert respuesta.get_json()["error"]["code"] == "WHATSAPP_DISABLED"
@@ -565,7 +565,7 @@ def test_la_configuracion_de_la_api_tiene_valores_por_defecto(settings):
 # ---------------------------------------------------------------------------
 
 
-def test_la_revision_manual_responde_sin_ancla(cliente, session):
+def test_la_revision_manual_responde_sin_ancla(cliente, session, cuenta_del_cliente):
     """El boton "reintentar historial" sobre un chat que no puede excavarse.
 
     Tiene que responder 200 y decir la verdad: sigue esperando semilla. Un
@@ -575,7 +575,7 @@ def test_la_revision_manual_responde_sin_ancla(cliente, session):
     from app.models import Chat, ChatHistoryState
 
     jid = "99977766655@lid"
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta_del_cliente.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -600,12 +600,19 @@ def test_la_revision_de_un_chat_inexistente_da_404(cliente):
     assert cliente.post("/api/v1/chats/999999/history/recheck").status_code == 404
 
 
-def test_un_chat_sin_mensajes_no_desaparece_del_listado(cliente, session):
+def test_un_chat_sin_mensajes_no_desaparece_del_listado(cliente, session, cuenta_del_cliente):
     """Ocultarlo seria mentir por omision: el chat existe y tiene historial."""
     from app.models import Chat
 
     jid = "99966655544@lid"
-    session.add(Chat(jid=jid, chat_type="individual", name="Sin mensajes"))
+    session.add(
+        Chat(
+            jid=jid,
+            chat_type="individual",
+            name="Sin mensajes",
+            whatsapp_account_id=cuenta_del_cliente.id,
+        )
+    )
     session.flush()
 
     cuerpo = cliente.get("/api/v1/chats?limit=1000").get_json()

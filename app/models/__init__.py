@@ -17,6 +17,7 @@ from app.models.accounts import (  # noqa: F401
     GoogleCredential,
     User,
     UserSession,
+    UserWhatsAppMembership,
     WhatsAppAccount,
 )
 from app.models.seeds import (  # noqa: F401

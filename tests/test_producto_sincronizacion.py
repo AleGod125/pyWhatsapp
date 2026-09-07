@@ -50,9 +50,9 @@ class _Database:
         return scope()
 
 
-def _chat(session, estado: str, *, ancla: bool = False, proximo=None):
+def _chat(session, cuenta, estado: str, *, ancla: bool = False, proximo=None):
     jid = f"5730{uuid.uuid4().hex[:10]}@s.whatsapp.net"
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -186,7 +186,7 @@ def test_un_ciclo_en_marcha_no_lanza_otro(session, settings):
     assert fallo.type.__name__ in ("SyncAlreadyRunningError", "SyncUnavailableError")
 
 
-def test_una_excavacion_en_marcha_tampoco(session, settings):
+def test_una_excavacion_en_marcha_tampoco(session, cuenta, settings):
     """El backfill automatico cuenta: el telefono atiende de una en una."""
     from app.services.sync_job import SyncAlreadyRunningError
 
@@ -213,25 +213,25 @@ def test_el_modo_queda_registrado(session, settings):
 # ---------------------------------------------------------------------------
 
 
-def test_adelanta_la_espera_de_los_que_esperaban_turno(session, settings):
+def test_adelanta_la_espera_de_los_que_esperaban_turno(session, cuenta, settings):
     proximo = datetime.now(timezone.utc) + timedelta(hours=1)
-    chat = _chat(session, "timeout", ancla=True, proximo=proximo)
+    chat = _chat(session, cuenta, "timeout", ancla=True, proximo=proximo)
 
     SyncJob(settings, _Database(session))._adelantar_reintentos()
 
     assert _estado(session, chat).next_retry_at is None
 
 
-def test_no_toca_a_los_que_ya_pueden_reintentar(session, settings):
-    chat = _chat(session, "pending", ancla=True)
+def test_no_toca_a_los_que_ya_pueden_reintentar(session, cuenta, settings):
+    chat = _chat(session, cuenta, "pending", ancla=True)
     SyncJob(settings, _Database(session))._adelantar_reintentos()
     assert _estado(session, chat).next_retry_at is None
 
 
-def test_no_reabre_lo_que_el_telefono_dio_por_terminado(session, settings):
+def test_no_reabre_lo_que_el_telefono_dio_por_terminado(session, cuenta, settings):
     """"Completo" no significa volver a pedir lo que ya se cerro."""
     proximo = datetime.now(timezone.utc) + timedelta(hours=1)
-    chat = _chat(session, "exhausted", ancla=True, proximo=proximo)
+    chat = _chat(session, cuenta, "exhausted", ancla=True, proximo=proximo)
 
     SyncJob(settings, _Database(session))._adelantar_reintentos()
 
@@ -240,8 +240,8 @@ def test_no_reabre_lo_que_el_telefono_dio_por_terminado(session, settings):
     assert estado.next_retry_at is not None
 
 
-def test_no_borra_mensajes_ni_anclas_ni_cursores(session, settings):
-    chat = _chat(session, "timeout", ancla=True)
+def test_no_borra_mensajes_ni_anclas_ni_cursores(session, cuenta, settings):
+    chat = _chat(session, cuenta, "timeout", ancla=True)
     antes = (
         session.execute(select(func.count()).select_from(Message)).scalar(),
         session.execute(select(func.count()).select_from(HistorySeed)).scalar(),
@@ -257,9 +257,9 @@ def test_no_borra_mensajes_ni_anclas_ni_cursores(session, settings):
     assert _estado(session, chat).oldest_message_id == cursor_antes
 
 
-def test_no_toca_los_que_esperan_ancla_mas_alla_del_temporizador(session, settings):
+def test_no_toca_los_que_esperan_ancla_mas_alla_del_temporizador(session, cuenta, settings):
     """Sin ancla no hay nada que reintentar: adelantar su espera no ayuda."""
-    chat = _chat(session, "waiting_seed")
+    chat = _chat(session, cuenta, "waiting_seed")
     SyncJob(settings, _Database(session))._adelantar_reintentos()
     estado = _estado(session, chat)
     assert estado.history_status == "waiting_seed"
@@ -339,8 +339,19 @@ def test_el_reintento_por_chat_solo_adelanta_ese_chat():
     from app.api.routes import chat_history_retry
 
     codigo = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(chat_history_retry))))
-    # El UPDATE va filtrado por el jid del chat, no a toda la tabla.
-    assert "ChatHistoryState.chat_jid == jid" in codigo
+    # El UPDATE va filtrado por ESE chat, no a toda la tabla.
+    #
+    # Se acepta `chat_id` ademas de `chat_jid`, y de hecho es mejor: el jid
+    # deja de ser unico en cuanto dos cuentas comparten un contacto, y
+    # entonces filtrar por el adelantaria tambien el reintento de la otra
+    # persona. `chat_id` identifica LA fila.
+    assert (
+        "ChatHistoryState.chat_id == chat_id" in codigo
+        or "ChatHistoryState.chat_jid == jid" in codigo
+    )
+    # Y lo que de verdad no puede pasar: un UPDATE sin filtro ninguno.
+    assert "update(ChatHistoryState)" in codigo
+    assert ".where(" in codigo
     assert "next_retry_at=None" in codigo
 
 
@@ -385,7 +396,7 @@ def test_el_reintento_por_chat_pasa_por_la_cola_de_siempre():
 # ---------------------------------------------------------------------------
 
 
-def test_un_cambio_de_estado_se_publica(session, settings):
+def test_un_cambio_de_estado_se_publica(session, cuenta, settings):
     """Antes solo se escribia en la base.
 
     La pantalla se enteraba al recargar, y mientras tanto ensenaba el estado
@@ -399,7 +410,7 @@ def test_un_cambio_de_estado_se_publica(session, settings):
     servicio = BackfillService(settings, _Database(session))
     servicio.publish = lambda nombre, datos: avisos.append((nombre, datos))
 
-    chat = _chat(session, "pending", ancla=True)
+    chat = _chat(session, cuenta, "pending", ancla=True)
     servicio._set_status(chat.jid, "fetching", None)
 
     # Y con el identificador dentro: la pantalla indexa por `id`, y una
@@ -424,25 +435,25 @@ def test_un_cambio_de_estado_se_publica(session, settings):
     assert porNombre["history_chat_started"]["state"] == "fetching"
 
 
-def test_avisar_no_puede_cortar_la_excavacion(session, settings):
+def test_avisar_no_puede_cortar_la_excavacion(session, cuenta, settings):
     from app.services.backfill_service import BackfillService
 
     servicio = BackfillService(settings, _Database(session))
     servicio.publish = lambda *a: (_ for _ in ()).throw(RuntimeError("bus roto"))
 
-    chat = _chat(session, "pending", ancla=True)
+    chat = _chat(session, cuenta, "pending", ancla=True)
     servicio._set_status(chat.jid, "exhausted", None)  # no lanza
 
     session.expire_all()
     assert _estado(session, chat).history_status == "exhausted"
 
 
-def test_sin_publicador_todo_sigue_funcionando(session, settings):
+def test_sin_publicador_todo_sigue_funcionando(session, cuenta, settings):
     """El aviso es opcional: sin el, se recarga a mano como antes."""
     from app.services.backfill_service import BackfillService
 
     servicio = BackfillService(settings, _Database(session))
-    chat = _chat(session, "waiting_seed")
+    chat = _chat(session, cuenta, "waiting_seed")
     servicio._set_status(chat.jid, "pending", None)
     session.expire_all()
     assert _estado(session, chat).history_status == "pending"

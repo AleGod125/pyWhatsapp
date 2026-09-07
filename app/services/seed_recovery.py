@@ -110,7 +110,11 @@ class SeedRecovery:
                 .subquery()
             )
             filas = session.execute(
-                select(ChatHistoryState.chat_jid, func.coalesce(anclas.c.total, 0))
+                select(
+                    ChatHistoryState.chat_jid,
+                    func.coalesce(anclas.c.total, 0),
+                    ChatHistoryState.chat_id,
+                )
                 .outerjoin(anclas, anclas.c.chat_jid == ChatHistoryState.chat_jid)
                 .where(
                     # 'pending' entra tambien: un chat recien creado que nunca
@@ -139,15 +143,20 @@ class SeedRecovery:
             # canonica.
             from app.history.cursor import get_valid_history_cursor
 
+            # Por `chat_id`, no por jid. Con dos cuentas sobre el mismo
+            # contacto el jid se repite: preguntar por el reventaba, y escribir
+            # por el habria degradado a 'waiting_seed' la conversacion de las
+            # DOS personas por lo que le faltara a una.
             esperando = [
-                jid
-                for jid, _ in filas
-                if get_valid_history_cursor(session, chat_jid=jid) is None
+                cid
+                for jid, _, cid in filas
+                if get_valid_history_cursor(session, chat_jid=jid, chat_id=cid)
+                is None
             ]
             if esperando:
                 session.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid.in_(esperando))
+                    .where(ChatHistoryState.chat_id.in_(esperando))
                     .values(history_status="waiting_seed")
                 )
                 informe.marcados_waiting = len(esperando)
@@ -176,15 +185,17 @@ class SeedRecovery:
 
         with self._database.transaction() as session:
             dormidos = session.execute(
-                select(ChatHistoryState.chat_jid).where(
+                select(ChatHistoryState.chat_id, ChatHistoryState.chat_jid).where(
                     ChatHistoryState.chat_jid.in_(deseados),
                     ChatHistoryState.history_status.in_(DESPIERTAN),
                 )
-            ).scalars().all()
+            ).all()
             informe.revisados = len(dormidos)
 
-            for chat_jid in dormidos:
-                cursor = get_valid_history_cursor(session, chat_jid=chat_jid)
+            for chat_id, chat_jid in dormidos:
+                cursor = get_valid_history_cursor(
+                    session, chat_id=chat_id, chat_jid=chat_jid
+                )
                 if cursor is None:
                     # Llego un mensaje, pero sin ID real de WhatsApp no sirve
                     # de ancla. Se queda esperando: es la verdad.
@@ -192,10 +203,11 @@ class SeedRecovery:
                 # Primero el cursor, despues el estado: si el proceso muere
                 # entre las dos cosas, el chat sigue esperando pero ya con su
                 # ancla guardada.
-                persist_cursor(session, chat_jid, cursor)
+                persist_cursor(session, chat_jid, cursor, chat_id=chat_id)
                 session.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid == chat_jid)
+                    # Por `chat_id`, que identifica LA fila sin ambiguedad.
+                    .where(ChatHistoryState.chat_id == chat_id)
                     .values(
                         history_status="pending",
                         consecutive_no_progress=0,

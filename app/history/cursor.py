@@ -104,17 +104,39 @@ def aliases_de(session: Any, chat_jid: str) -> list[str]:
     return sorted(encontrados)
 
 
-def _de_mensajes(session: Any, jids: list[str]) -> CursorInfo | None:
+def _de_mensajes(
+    session: Any, jids: list[str], account_id: Any = None
+) -> CursorInfo | None:
     """El mensaje mas antiguo con ID REAL de WhatsApp, entre todos los alias.
 
     Ojo con la distincion, que causo un bug historico: "mensaje mas antiguo
     almacenado" y "ancla mas antigua utilizable" no son lo mismo. Si el del 13
     de agosto no trae ID real y el del 14 si, el ancla es la del 14.
     """
+    # SE ACOTA POR CUENTA, no por conversacion.
+    #
+    # Buscar solo por jid cruzaba cuentas: se provoco el caso y la segunda
+    # conversacion --que no tenia ni un mensaje propio-- heredaba el ancla de
+    # la primera, y habria pedido historial desde un mensaje que nunca
+    # recibio.
+    #
+    # Pero acotar por `chat_id` seria pasarse de estrecho: el mismo contacto
+    # aparece por telefono y por LID en DOS filas de chat de la MISMA cuenta, y
+    # el ancla puede estar en cualquiera de las dos. Esa busqueda entre alias
+    # tiene que seguir funcionando; lo unico que no puede es salir de la
+    # cuenta.
+    alcance = [Message.chat_jid.in_(jids)]
+    if account_id is not None:
+        alcance.append(
+            Message.chat_id.in_(
+                select(Chat.id).where(Chat.whatsapp_account_id == account_id)
+            )
+        )
+
     filas = session.execute(
         select(Message.whatsapp_message_id, Message.timestamp, Message.from_me)
         .where(
-            Message.chat_jid.in_(jids),
+            *alcance,
             Message.whatsapp_message_id.is_not(None),
             Message.whatsapp_message_id != "",
         )
@@ -126,6 +148,18 @@ def _de_mensajes(session: Any, jids: list[str]) -> CursorInfo | None:
         if is_valid_history_cursor_id(wamid) and ts:
             return CursorInfo(wamid, int(ts), bool(from_me), source="message")
     return None
+
+
+def _cuenta(session: Any, chat_id: int | None) -> Any:
+    """La cuenta de esa conversacion. Acota la busqueda sin estrecharla."""
+    if chat_id is None:
+        return None
+    try:
+        return session.execute(
+            select(Chat.whatsapp_account_id).where(Chat.id == chat_id)
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 - no saberlo deja la busqueda como estaba
+        return None
 
 
 def _de_semillas(session: Any, chat_id: int | None) -> CursorInfo | None:
@@ -186,18 +220,35 @@ def get_valid_history_cursor(
         if chat_jid is None:
             return None
     if chat_id is None:
-        chat_id = session.execute(
-            select(Chat.id).where(Chat.jid == chat_jid)
-        ).scalar_one_or_none()
+        # Por CUENTA, no por JID a secas: el mismo JID existe en tantas filas
+        # como cuentas hablen con ese contacto, y `scalar_one_or_none()`
+        # reventaba ahi con "Multiple rows were found". Se midio en el
+        # mantenimiento en cuanto existieron dos cuentas.
+        from app.services.account_scope import chat_id_de
 
-    estado = session.execute(
-        select(ChatHistoryState).where(ChatHistoryState.chat_jid == chat_jid)
-    ).scalar_one_or_none()
+        chat_id = chat_id_de(session, chat_jid)
+
+    # `limit(2)` y no `scalar_one_or_none()`: sin `chat_id` el criterio cae al
+    # jid, y el jid se repite en cuanto dos cuentas tienen el mismo contacto.
+    # Ahi `scalar_one_or_none` reventaba con "Multiple rows were found" y se
+    # llevaba por delante toda la reconciliacion. Con dos filas no hay estado
+    # que devolver --son de conversaciones distintas-- asi que se devuelve
+    # ninguno y el resto de fuentes deciden.
+    estados = (
+        session.execute(
+            select(ChatHistoryState)
+            .where(_de_esta_conversacion(chat_jid, chat_id))
+            .limit(2)
+        )
+        .scalars()
+        .all()
+    )
+    estado = estados[0] if len(estados) == 1 else None
 
     candidatos = [
         c
         for c in (
-            _de_mensajes(session, aliases_de(session, chat_jid)),
+            _de_mensajes(session, aliases_de(session, chat_jid), _cuenta(session, chat_id)),
             _de_semillas(session, chat_id),
             _del_estado(estado),
         )
@@ -210,7 +261,26 @@ def get_valid_history_cursor(
     return min(candidatos, key=lambda c: c.timestamp)
 
 
-def persist_cursor(session: Any, chat_jid: str, cursor: CursorInfo) -> bool:
+def _de_esta_conversacion(chat_jid: str, chat_id: int | None):
+    """El criterio para dar con LA fila de estado de una conversacion.
+
+    Prefiere ``chat_id`` siempre que se sepa, y no por gusto: ``chat_jid`` deja
+    de ser unico en cuanto dos cuentas tienen el mismo contacto, y un
+    ``UPDATE ... WHERE chat_jid`` tocaria entonces las filas de LAS DOS. Sin
+    error y sin aviso: el progreso de historial de una persona modificado por
+    lo que hizo otra.
+
+    ``chat_id`` es unico y apunta a un chat que ya tiene cuenta, asi que
+    identifica la fila sin ambiguedad posible.
+    """
+    if chat_id is not None:
+        return ChatHistoryState.chat_id == chat_id
+    return ChatHistoryState.chat_jid == chat_jid
+
+
+def persist_cursor(
+    session: Any, chat_jid: str, cursor: CursorInfo, *, chat_id: int | None = None
+) -> bool:
     """Escribe el cursor activo en ``chat_history_state``.
 
     Se persiste ANTES de cambiar de estado. Si el proceso muere entre las dos
@@ -220,7 +290,7 @@ def persist_cursor(session: Any, chat_jid: str, cursor: CursorInfo) -> bool:
     return bool(
         session.execute(
             update(ChatHistoryState)
-            .where(ChatHistoryState.chat_jid == chat_jid)
+            .where(_de_esta_conversacion(chat_jid, chat_id))
             .values(
                 oldest_message_id=cursor.wa_msg_id,
                 oldest_message_timestamp=cursor.timestamp,
@@ -244,7 +314,9 @@ def proxima_espera(intento: int) -> int:
     return RETRY_BACKOFF_SECONDS[indice]
 
 
-def anotar_intento_fallido(session: Any, chat_jid: str) -> tuple[int, Any]:
+def anotar_intento_fallido(
+    session: Any, chat_jid: str, *, chat_id: int | None = None
+) -> tuple[int, Any]:
     """Suma un intento y calcula cuando se puede volver a probar.
 
     NO toca el cursor. Un timeout no dice nada malo del ancla: dice que el
@@ -252,7 +324,7 @@ def anotar_intento_fallido(session: Any, chat_jid: str) -> tuple[int, Any]:
     vuelve a esperar una semilla que ya tiene.
     """
     estado = session.execute(
-        select(ChatHistoryState).where(ChatHistoryState.chat_jid == chat_jid)
+        select(ChatHistoryState).where(_de_esta_conversacion(chat_jid, chat_id))
     ).scalar_one_or_none()
     ahora = datetime.now(timezone.utc)
     if estado is None:
@@ -266,11 +338,13 @@ def anotar_intento_fallido(session: Any, chat_jid: str) -> tuple[int, Any]:
     return intento, proximo
 
 
-def limpiar_reintentos(session: Any, chat_jid: str) -> None:
+def limpiar_reintentos(
+    session: Any, chat_jid: str, *, chat_id: int | None = None
+) -> None:
     """La peticion funciono: el contador de intentos vuelve a cero."""
     session.execute(
         update(ChatHistoryState)
-        .where(ChatHistoryState.chat_jid == chat_jid)
+        .where(_de_esta_conversacion(chat_jid, chat_id))
         .values(attempt_count=0, next_retry_at=None)
     )
 

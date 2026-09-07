@@ -222,13 +222,13 @@ def test_el_diagnostico_no_escribe_en_history_requests(servicio, session):
     assert antes == despues
 
 
-def test_el_diagnostico_no_toca_el_estado_del_chat(servicio, session):
+def test_el_diagnostico_no_toca_el_estado_del_chat(servicio, session, cuenta):
     """Ni cursor, ni history_status, ni intentos, ni waiting_seed."""
     from sqlalchemy import select
 
     from app.models import Chat, ChatHistoryState
 
-    chat = Chat(jid="206566000000000@lid", chat_type="individual")
+    chat = Chat(jid="206566000000000@lid", chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(

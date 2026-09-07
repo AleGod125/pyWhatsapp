@@ -124,13 +124,19 @@ def ingest_history_sync(
     # -- 4. Contactos y pushnames -------------------------------------------
     for jid, push_name in sync.pushnames:
         if jid and push_name:
-            repo.upsert_contact(session, jid=jid, push_name=push_name)
+            repo.upsert_contact(
+                session,
+                whatsapp_account_id=whatsapp_account_id,
+                jid=jid,
+                push_name=push_name,
+            )
             result.pushnames += 1
     for message in parsed:
         sender = message.sender_jid or message.sender_lid
         if sender and message.push_name:
             repo.upsert_contact(
                 session,
+                whatsapp_account_id=whatsapp_account_id,
                 jid=sender,
                 push_name=message.push_name,
                 lid=message.sender_lid,

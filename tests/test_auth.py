@@ -426,3 +426,51 @@ def _csrf_de(respuesta) -> str:
         if cabecera.startswith("whatsapp_backup_csrf="):
             return cabecera.split("=", 1)[1].split(";")[0]
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Volver a entrar: la vinculacion sobrevive al logout
+# ---------------------------------------------------------------------------
+#
+# Es la promesa de producto entera en una prueba: cerrar sesion NO desvincula
+# WhatsApp, asi que la proxima vez que ese usuario entre --si su vinculacion
+# sigue siendo valida-- va directo al panel sin escanear otro codigo QR.
+
+
+def test_TRAS_LOGOUT_Y_LOGIN_NO_SE_PIDE_OTRO_QR(anonimo, runtime, session):
+    """LA REGLA. Google puesto + WhatsApp vinculada -> dashboard."""
+    from tests.conftest import _conceder_drive, _vincular_whatsapp
+
+    correo = _correo()
+    inicio = runtime.auth.register(email=correo, password=CLAVE)
+    _conceder_drive(session, inicio.user_id)
+    _vincular_whatsapp(session, inicio.user_id)
+    session.flush()
+
+    entrada = anonimo.post(
+        "/api/v1/auth/login", json={"email": correo, "password": CLAVE}
+    )
+    assert entrada.status_code == 200
+    antes = anonimo.get("/api/v1/onboarding/status").get_json()
+    assert antes["next_step"] == "dashboard"
+
+    anonimo.post("/api/v1/auth/logout", headers={"X-CSRF-Token": _csrf_de(entrada)})
+    assert anonimo.get("/api/v1/auth/me").status_code == 401
+
+    # Y al volver a entrar, el mismo destino: sin pasar por el codigo QR.
+    devuelta = anonimo.post(
+        "/api/v1/auth/login", json={"email": correo, "password": CLAVE}
+    )
+    assert devuelta.status_code == 200
+    despues = anonimo.get("/api/v1/onboarding/status").get_json()
+    assert despues["next_step"] == "dashboard"
+    assert despues["whatsapp_linked"] is True
+
+
+def test_sin_autenticar_no_se_llega_al_estado_de_onboarding(anonimo):
+    """Escribir la URL a mano despues de salir no devuelve nada util."""
+    assert anonimo.get("/api/v1/auth/me").status_code == 401
+    cuerpo = anonimo.get("/api/v1/onboarding/status").get_json()
+    assert cuerpo.get("authenticated") is False
+    assert cuerpo.get("next_step") == "login"
+

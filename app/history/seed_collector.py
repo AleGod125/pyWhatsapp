@@ -260,10 +260,13 @@ class RecentSeedCollector:
         """
         from app.services.chat_alias import canonical_chat_jid
 
+        from app.services.account_scope import chat_id_de
+
         canonico = canonical_chat_jid(sesion, jid) or jid
-        return sesion.execute(
-            select(Chat.id).where(Chat.jid == canonico)
-        ).scalar_one_or_none()
+        # Por CUENTA. El mismo JID existe en tantas filas como cuentas hablen
+# con ese contacto: `scalar_one_or_none()` reventaba ahi, y `.first()`
+# habria devuelto la conversacion de otra persona sin avisar.
+        return chat_id_de(sesion, canonico, account_id=self.account_id)
 
     # -- Promocion -----------------------------------------------------------
 
@@ -338,10 +341,13 @@ class RecentSeedCollector:
         try:
             from app.models import Chat
 
+            from app.services.account_scope import chat_id_de
+
             with self._database.transaction() as sesion:
-                return sesion.execute(
-                    select(Chat.id).where(Chat.jid == chat_jid)
-                ).scalar_one_or_none()
+                # Por CUENTA. El mismo JID existe en tantas filas como cuentas hablen
+# con ese contacto: `scalar_one_or_none()` reventaba ahi, y `.first()`
+# habria devuelto la conversacion de otra persona sin avisar.
+                return chat_id_de(sesion, chat_jid, account_id=self.account_id)
         except Exception:  # noqa: BLE001 - no saberlo no invalida el aviso
             return None
 

@@ -179,7 +179,7 @@ def test_A_pn_y_lid_propios_se_reconocen(settings, database):
     assert service.is_backfill_candidate("34600111222@s.whatsapp.net")
 
 
-def test_G_el_canary_nunca_elige_el_chat_propio(settings, database):
+def test_G_el_canary_nunca_elige_el_chat_propio(settings, database, cuenta):
     """El ultimo canary eligio nuestra cuenta y acabo en ACK + timeout."""
     from app.services.backfill_service import BackfillService
 
@@ -200,7 +200,7 @@ def test_G_el_canary_nunca_elige_el_chat_propio(settings, database):
 # ---------------------------------------------------------------------------
 
 
-def test_H_filas_desordenadas_se_ordenan(session):
+def test_H_filas_desordenadas_se_ordenan(session, cuenta):
     """Insertadas en desorden, deben leerse cronologicamente."""
     from app.services import repository as repo
     from app.services.repository import IncomingMessage
@@ -235,7 +235,7 @@ def test_H_filas_desordenadas_se_ordenan(session):
     assert stamps == sorted(momentos)
 
 
-def test_M_mismo_timestamp_orden_estable_por_id(session):
+def test_M_mismo_timestamp_orden_estable_por_id(session, cuenta):
     from app.services import repository as repo
     from app.services.repository import IncomingMessage
 
@@ -260,7 +260,7 @@ def test_M_mismo_timestamp_orden_estable_por_id(session):
     assert primera == sorted(primera), "con igual timestamp desempata el id"
 
 
-def test_I_separadores_en_orden_al_insertar_arriba(session):
+def test_I_separadores_en_orden_al_insertar_arriba(session, cuenta):
     """El bug real: al cargar anteriores las fechas salian intercaladas.
 
     Se comprueba sobre el modelo de datos, que es lo que decide el orden:
@@ -301,7 +301,7 @@ def test_I_separadores_en_orden_al_insertar_arriba(session):
 # ---------------------------------------------------------------------------
 
 
-def test_K_L_paginacion_completa_sin_duplicados(session):
+def test_K_L_paginacion_completa_sin_duplicados(session, cuenta):
     from app.services import repository as repo
     from app.services.repository import IncomingMessage
 

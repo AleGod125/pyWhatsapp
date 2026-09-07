@@ -218,10 +218,13 @@ class HistoryRecheck:
                 if estado_anterior in DESPIERTAN or estado_anterior is None:
                     # El cursor primero, el estado despues: es el mismo
                     # orden que en el resto del sistema.
-                    persist_cursor(session, chat_jid, cursor)
+                    persist_cursor(session, chat_jid, cursor, chat_id=chat_id)
                     session.execute(
                         update(ChatHistoryState)
-                        .where(ChatHistoryState.chat_jid == chat_jid)
+                        # Por `chat_id`: el jid deja de ser unico en cuanto dos
+                        # cuentas comparten contacto, y este UPDATE tocaria las
+                        # filas de las dos.
+                        .where(ChatHistoryState.chat_id == chat_id)
                         .values(
                             history_status="pending",
                             consecutive_no_progress=0,
@@ -242,7 +245,10 @@ class HistoryRecheck:
                 if estado_anterior in (None, "pending", "no_valid_cursor"):
                     session.execute(
                         update(ChatHistoryState)
-                        .where(ChatHistoryState.chat_jid == chat_jid)
+                        # Por `chat_id`: el jid deja de ser unico en cuanto dos
+                        # cuentas comparten contacto, y este UPDATE tocaria las
+                        # filas de las dos.
+                        .where(ChatHistoryState.chat_id == chat_id)
                         .values(history_status="waiting_seed")
                     )
                     resultado.estado = "waiting_seed"

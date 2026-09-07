@@ -50,6 +50,13 @@ def create_app(runtime: Any, *, cors_origin: str | None = None) -> Flask:
     """
     app = Flask(__name__)
     app.config["RUNTIME"] = runtime
+    # Y el registro de runtimes POR CUENTA, que es la fuente de verdad para
+    # todo lo que dependa de una sesion de WhatsApp. El runtime que llega se
+    # adopta tal cual: es el de la cuenta que ya existia, con su sesion
+    # abierta, y rehacerlo seria dejarla sin poder abrir su Signal Store.
+    from app.api.account_runtime import montar_registro
+
+    montar_registro(app, runtime)
     # El JSON sale con acentos de verdad, no escapados: los nombres de los
     # contactos y los mensajes son texto humano.
     app.json.ensure_ascii = False

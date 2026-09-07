@@ -118,9 +118,31 @@ def upsert_chat(
     base y no lo ve nadie. Es lo que dejaba el panel vacio con 40 chats
     dentro.
     """
-    values: dict[str, Any] = {"jid": jid, "chat_type": chat_type or "unknown"}
-    if whatsapp_account_id is not None:
-        values["whatsapp_account_id"] = whatsapp_account_id
+    # LA CUENTA ES OBLIGATORIA.
+    #
+    # Un chat sin dueno no colisiona con nada --PostgreSQL trata los NULL como
+    # distintos-- asi que se duplicaria en silencio, y ademas el filtro de
+    # propiedad lo excluiria del listado: existiria en la base sin que lo viera
+    # nadie. Es lo que dejaba el panel vacio con cuarenta chats dentro.
+    #
+    # Si quien llama no la sabe, se usa la unica que haya. Ese respaldo es de
+    # transicion y se cae solo: con dos cuentas devuelve `None` y entonces hay
+    # que pasarla, que es exactamente lo que debe ocurrir.
+    from app.services.account_scope import cuenta_unica, destino_de_conflicto
+
+    if whatsapp_account_id is None:
+        whatsapp_account_id = cuenta_unica(session)
+    if whatsapp_account_id is None:
+        raise ValueError(
+            "upsert_chat necesita whatsapp_account_id: un chat sin cuenta no "
+            "lo ve nadie y se duplica en silencio"
+        )
+
+    values: dict[str, Any] = {
+        "jid": jid,
+        "chat_type": chat_type or "unknown",
+        "whatsapp_account_id": whatsapp_account_id,
+    }
     for column, value in (
         ("name", name),
         ("last_message", last_message),
@@ -154,15 +176,17 @@ def upsert_chat(
             stmt.excluded.last_message_timestamp,
         )
 
-    stmt = stmt.on_conflict_do_update(index_elements=[Chat.jid], set_=updates).returning(
-        Chat.id
-    )
+    # El destino del conflicto sale de un solo sitio.
+    stmt = stmt.on_conflict_do_update(
+        index_elements=destino_de_conflicto(Chat, "jid"), set_=updates
+    ).returning(Chat.id)
     return session.execute(stmt).scalar_one()
 
 
 def upsert_contact(
     session: Session,
     *,
+    whatsapp_account_id: Any = None,
     jid: str,
     lid: str | None = None,
     phone_number: str | None = None,
@@ -184,20 +208,52 @@ def upsert_contact(
         if value is not None:
             values[column] = value
 
+    # DE QUIEN es este contacto. La agenda es privada: el nombre que una
+    # persona le pone a un numero no puede aparecer en la de otra.
+    #
+    # Se acepta ya, aunque la columna todavia no exista en el esquema: asi los
+    # llamantes se adaptan ahora y el dia que la migracion la anada empieza a
+    # guardarse sola, sin volver a tocar ni una llamada.
+    from app.services.account_scope import (
+        cuenta_unica,
+        destino_de_conflicto,
+        tiene_columna,
+    )
+
+    if whatsapp_account_id is None:
+        whatsapp_account_id = cuenta_unica(session)
+    if whatsapp_account_id is None and tiene_columna(Contact, "whatsapp_account_id"):
+        raise ValueError(
+            "upsert_contact necesita whatsapp_account_id: la agenda es privada "
+            "de cada cuenta"
+        )
+
+    if whatsapp_account_id is not None and tiene_columna(
+        Contact, "whatsapp_account_id"
+    ):
+        values["whatsapp_account_id"] = whatsapp_account_id
+
+    conflicto = destino_de_conflicto(Contact, "jid")
+    alcance = [Contact.jid == jid]
+    if whatsapp_account_id is not None and tiene_columna(
+        Contact, "whatsapp_account_id"
+    ):
+        alcance.append(Contact.whatsapp_account_id == whatsapp_account_id)
+
     stmt = insert(Contact).values(**values)
     updates = {
         column: func.coalesce(stmt.excluded[column], Contact.__table__.c[column])
         for column in values
-        if column != "jid"
+        if column not in ("jid", "whatsapp_account_id")
     }
     if not updates:
-        stmt = stmt.on_conflict_do_nothing(index_elements=[Contact.jid])
+        stmt = stmt.on_conflict_do_nothing(index_elements=conflicto)
         session.execute(stmt)
-        return session.execute(select(Contact.id).where(Contact.jid == jid)).scalar_one()
+        return session.execute(select(Contact.id).where(*alcance)).scalar_one()
 
-    stmt = stmt.on_conflict_do_update(index_elements=[Contact.jid], set_=updates).returning(
-        Contact.id
-    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=conflicto, set_=updates
+    ).returning(Contact.id)
     return session.execute(stmt).scalar_one()
 
 
@@ -252,8 +308,15 @@ def bulk_upsert_messages(
         stmt = insert(Message).values(rows)
         # El primer origen que trajo el mensaje se conserva; solo se rellenan
         # los huecos que aquella vez quedaron vacios.
+        # Se deduplica por CONVERSACION, no por identificador de WhatsApp
+        # global. Un mensaje de grupo lleva el mismo id para todos los que lo
+        # reciben, asi que por `chat_jid` el que le llega a la segunda persona
+        # se descartaria como duplicado del de la primera -- sin error y sin
+        # aviso. `chat_id` apunta a un chat que ya tiene cuenta.
+        from app.services.account_scope import destino_de_dedupe_de_mensaje
+
         stmt = stmt.on_conflict_do_update(
-            index_elements=[Message.chat_jid, Message.whatsapp_message_id],
+            index_elements=destino_de_dedupe_de_mensaje(),
             index_where=Message.whatsapp_message_id.is_not(None),
             set_={
                 "text": func.coalesce(Message.__table__.c.text, stmt.excluded.text),

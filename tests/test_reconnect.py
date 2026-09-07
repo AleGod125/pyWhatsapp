@@ -423,3 +423,147 @@ def test_el_runtime_corta_las_esperas_al_perder_el_transporte(settings, tmp_path
 
     assert rt.backfill.cortes == 1
     assert rt.counters["transport_aborted_requests"] == 2
+
+
+# ---------------------------------------------------------------------------
+# El socket que muere SIN anunciarlo
+# ---------------------------------------------------------------------------
+#
+# Se creia cubierto y no lo estaba. La reconexion colgaba entera de
+# `wait_closed()`, que solo despierta cuando el cliente activa su evento
+# `_closed`, y eso pasa en dos sitios: cuando termina el grupo de tareas del
+# receptor, o dentro de `Client.disconnect()`. Hay una muerte en la que no
+# ocurre ninguno de los dos, y se midio entera::
+#
+#     12:23:33  el socket deja de contestar
+#     12:24:03  app ping failed (1/3)  -> TimeoutError
+#     12:24:33  app ping failed (2/3)  -> NotConnected: ya estaba muerto
+#     12:25:03  peer presumed dead; closing connection
+#               ... y NO aparece "client: session closed"
+#               ... y NO aparece "Conexion perdida. Reintento 1"
+#
+# El manejador del keepalive llama a `sock.disconnect()` sobre un socket que
+# llevaba noventa segundos cerrado, y ese camino ya no despierta a nadie. El
+# proceso se quedaba vivo, en CONNECTED, y sordo: ni un mensaje entrante mas,
+# sin un solo error que lo dijera.
+
+
+class _SocketDePrueba:
+    def __init__(self, *, cerrado=False, ws=object()):
+        self._closed = cerrado
+        self._ws = ws
+
+
+class _ClienteConSocket:
+    def __init__(self, sock):
+        self._sock = sock
+
+
+def _cliente_de_prueba():
+    """Un ``WhatsAppClient`` sin arrancar, para preguntarle por el transporte."""
+    import queue
+
+    from app.core.config import load_settings
+    from app.whatsapp_client import WhatsAppClient
+
+    return WhatsAppClient(load_settings(), queue.Queue())
+
+
+def test_un_socket_marcado_cerrado_esta_muerto():
+    wa = _cliente_de_prueba()
+    wa._client = _ClienteConSocket(_SocketDePrueba(cerrado=True))
+
+    assert wa._transporte_vivo() is False
+
+
+def test_un_socket_sin_websocket_esta_muerto():
+    """`send_frame` levanta NotConnected justo con esta condicion."""
+    wa = _cliente_de_prueba()
+    wa._client = _ClienteConSocket(_SocketDePrueba(ws=None))
+
+    assert wa._transporte_vivo() is False
+
+
+def test_un_socket_normal_esta_vivo():
+    wa = _cliente_de_prueba()
+    wa._client = _ClienteConSocket(_SocketDePrueba())
+
+    assert wa._transporte_vivo() is True
+
+
+@pytest.mark.parametrize(
+    "cliente", [None, _ClienteConSocket(None)], ids=["sin_cliente", "sin_socket"]
+)
+def test_ante_la_duda_se_contesta_que_esta_vivo(cliente):
+    """Un falso "muerto" reconectaria una sesion sana, y eso corta de verdad.
+
+    Un falso "vivo" solo retrasa la deteccion hasta el siguiente latido.
+    """
+    wa = _cliente_de_prueba()
+    wa._client = cliente
+
+    assert wa._transporte_vivo() is True
+
+
+def test_el_vigilante_vuelve_cuando_el_socket_muere():
+    """Y devuelve el control a `_main`, que es quien reconecta."""
+
+    class _ClienteQueMuere:
+        def __init__(self):
+            self._sock = _SocketDePrueba()
+            self.cerrado = False
+
+        async def disconnect(self):
+            self.cerrado = True
+
+    wa = _cliente_de_prueba()
+    cliente = _ClienteQueMuere()
+    wa._client = cliente
+    wa.LATIDO_DEL_TRANSPORTE = 0.01
+
+    async def escenario():
+        vigilante = asyncio.create_task(wa._esperar_transporte_muerto())
+        await asyncio.sleep(0.05)
+        assert not vigilante.done(), "con el socket sano no debe volver"
+
+        cliente._sock._closed = True  # el socket se muere sin avisar
+        await asyncio.wait_for(vigilante, timeout=2.0)
+
+    asyncio.run(escenario())
+    assert cliente.cerrado, "se fuerza el cierre para que el cliente quede coherente"
+
+
+def test_un_cierre_atascado_no_impide_reconectar():
+    """El centinela se pone con `await put` en una cola acotada de 256.
+
+    Si esta llena, ese `put` no vuelve nunca. Esperarlo sin limite dejaria el
+    proceso sordo para siempre, que es justo lo que se quiere evitar.
+    """
+
+    class _ClienteQueNoCierra:
+        def __init__(self):
+            self._sock = _SocketDePrueba(cerrado=True)
+
+        async def disconnect(self):
+            await asyncio.sleep(3600)
+
+    wa = _cliente_de_prueba()
+    wa._client = _ClienteQueNoCierra()
+    wa.LATIDO_DEL_TRANSPORTE = 0.01
+
+    async def escenario():
+        await asyncio.wait_for(wa._esperar_transporte_muerto(), timeout=10.0)
+
+    asyncio.run(escenario())
+
+
+def test_main_vigila_las_TRES_cosas():
+    """Cierre anunciado, parada pedida y socket muerto sin anunciar."""
+    import inspect
+
+    from app.whatsapp_client import WhatsAppClient
+
+    fuente = inspect.getsource(WhatsAppClient._main)
+    assert "wait_closed" in fuente
+    assert "_shutdown_requested" in fuente
+    assert "_esperar_transporte_muerto" in fuente

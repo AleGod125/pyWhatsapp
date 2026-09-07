@@ -53,21 +53,19 @@ class _DatabaseDeSesion:
 
 
 @pytest.fixture
-def dueno(session, runtime):
-    """Un usuario real con su cuenta. Las anclas pertenecen a alguien."""
-    from app.models import WhatsAppAccount
+def dueno(cuenta):
+    """El usuario y la cuenta a los que pertenecen estas anclas.
 
-    inicio = runtime.auth.register(
-        email=f"cur-{uuid.uuid4().hex[:10]}@example.com", password="una contrasena larga"
-    )
-    cuenta = WhatsAppAccount(
-        user_id=inicio.user_id,
-        session_status="linked",
-        session_storage_key=f"users/{inicio.user_id}",
-    )
-    session.add(cuenta)
-    session.flush()
-    return inicio.user_id, cuenta.id
+    LA MISMA cuenta que la del `chat`, y ese es el arreglo.
+
+    Antes esta fixture registraba un usuario NUEVO con una cuenta NUEVA, y las
+    pruebas ataban un colector de la cuenta X a una conversacion de la cuenta
+    Y. Funcionaba solo porque la busqueda `jid -> chat_id` ignoraba la cuenta:
+    en cuanto empezo a respetarla, el colector dejo de encontrar un chat que
+    nunca fue suyo. La prueba estaba fijando justamente la fuga que el
+    aislamiento evita.
+    """
+    return cuenta.user_id, cuenta.id
 
 
 @pytest.fixture
@@ -87,9 +85,9 @@ def a_solas(session):
 
 
 @pytest.fixture
-def chat(session):
+def chat(session, cuenta):
     jid = f"5730{uuid.uuid4().hex[:8]}@s.whatsapp.net"
-    fila = Chat(jid=jid, chat_type="individual")
+    fila = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(fila)
     session.flush()
     session.add(
@@ -153,7 +151,7 @@ def test_un_mensaje_real_es_cursor(session, chat):
     assert cursor.wa_msg_id == ANCLA and cursor.source == "message"
 
 
-def test_una_semilla_SIN_mensaje_tambien_es_cursor(session, chat, dueno):
+def test_una_semilla_SIN_mensaje_tambien_es_cursor(session, cuenta, chat, dueno):
     """El catalogo del Plan E cuenta.
 
     Antes el motor solo miraba ``messages``, asi que un ancla que existiera
@@ -185,10 +183,10 @@ def test_un_id_fabricado_no_es_cursor(session, chat):
     assert get_valid_history_cursor(session, chat_jid=chat.jid) is None
 
 
-def test_el_ancla_puede_estar_bajo_el_OTRO_identificador(session, chat):
+def test_el_ancla_puede_estar_bajo_el_OTRO_identificador(session, cuenta, chat):
     """Telefono y LID son el mismo contacto y la misma conversacion."""
     lid = f"9998{uuid.uuid4().hex[:8]}@lid"
-    session.add(Contact(jid=chat.jid, lid=lid))
+    session.add(Contact(jid=chat.jid, lid=lid, whatsapp_account_id=cuenta.id))
     session.add(
         Message(
             chat_id=chat.id,
@@ -237,12 +235,12 @@ def test_canary_y_backfill_ven_EXACTAMENTE_lo_mismo(session, a_solas, chat, sett
     assert del_canary.timestamp == del_backfill.timestamp
 
 
-def test_el_canary_prefiere_el_chat_mas_facil_de_verificar(session, a_solas, settings):
+def test_el_canary_prefiere_el_chat_mas_facil_de_verificar(session, cuenta, a_solas, settings):
     """Individual y con varios mensajes. Preferencia, NO requisito."""
     from app.services.backfill_service import BackfillService
 
-    grande = Chat(jid=f"5731{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual")
-    pequeno = Chat(jid=f"5732{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual")
+    grande = Chat(jid=f"5731{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual", whatsapp_account_id=cuenta.id)
+    pequeno = Chat(jid=f"5732{uuid.uuid4().hex[:8]}@s.whatsapp.net", chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add_all([grande, pequeno])
     session.flush()
     for fila in (grande, pequeno):
@@ -473,7 +471,7 @@ def test_un_pending_CON_ancla_no_se_toca(session, chat, settings):
     assert _estado(session, chat).history_status == "pending"
 
 
-def test_un_chat_con_semilla_no_se_degrada_a_waiting_seed(session, chat, dueno, settings):
+def test_un_chat_con_semilla_no_se_degrada_a_waiting_seed(session, cuenta, chat, dueno, settings):
     """Tiene cero mensajes y aun asi tiene ancla: el catalogo cuenta.
 
     Degradarlo le quitaria lo unico con lo que se puede pedir su historial.

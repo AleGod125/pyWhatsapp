@@ -111,7 +111,7 @@ def _estado(session, chat) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_la_repesca_rescata_a_las_que_YA_tenian_referencia(session, a_solas, settings):
+def test_la_repesca_rescata_a_las_que_YA_tenian_referencia(session, cuenta, a_solas, settings):
     """El escenario de §28, con numeros.
 
     Diez conversaciones esperando. Cuatro tienen una referencia real guardada
@@ -139,7 +139,7 @@ def test_la_repesca_rescata_a_las_que_YA_tenian_referencia(session, a_solas, set
     assert colector.metricas.despertados == 4
 
 
-def test_LAS_QUE_NO_TIENEN_REFERENCIA_SIGUEN_ESPERANDO(session, a_solas, settings):
+def test_LAS_QUE_NO_TIENEN_REFERENCIA_SIGUEN_ESPERANDO(session, cuenta, a_solas, settings):
     """La regla dura: sin referencia real no se promueve nada.
 
     Es lo que separa esto de inventarse un identificador. Un ancla fabricada
@@ -171,7 +171,7 @@ def test_repescar_sin_nadie_esperando_no_hace_nada(session, a_solas, settings):
     assert colector.metricas.despertados == 0
 
 
-def test_una_conversacion_que_falla_no_para_a_las_demas(session, a_solas, settings):
+def test_una_conversacion_que_falla_no_para_a_las_demas(session, cuenta, a_solas, settings):
     """Una sola conversacion problematica no puede tumbar la pasada entera."""
     from app.models import WhatsAppAccount
 

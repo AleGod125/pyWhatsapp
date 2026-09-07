@@ -195,7 +195,7 @@ def test_el_registro_va_en_cuatro_bytes_big_endian():
 # ---------------------------------------------------------------------------
 
 
-def test_EL_ACUSE_CONSERVA_RECIPIENT():
+def test_EL_ACUSE_CONSERVA_RECIPIENT(cuenta):
     """LA HIPOTESIS DE ESTE PARCHE.
 
     Cuando el mensaje lo escribes tu, la stanza va de tu cuenta a tu cuenta y

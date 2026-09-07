@@ -142,7 +142,7 @@ def test_sembrar_no_borra_lo_que_pywhats_habia_aprendido(store, identidad, setti
     assert store.lid_map.get_pn("86531142340710") == "573002389304"
 
 
-def test_el_dispositivo_es_lo_que_decide_la_migracion(store, identidad, settings):
+def test_el_dispositivo_es_lo_que_decide_la_migracion(store, identidad, settings, cuenta):
     """La pieza que la verificacion del mapa NO cubria.
 
     ``_migrate_known_lid_sender`` construye el JID de telefono con el MISMO

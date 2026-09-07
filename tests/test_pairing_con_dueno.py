@@ -117,7 +117,7 @@ def test_el_arranque_sin_sesion_no_vincula_solo():
     assert "renew" not in llamadas
 
 
-def test_arrancar_sin_sesion_es_un_estado_normal(app_y_runtime):
+def test_arrancar_sin_sesion_es_un_estado_normal(app_y_runtime, cuenta):
     """No es un error: es una instalacion recien puesta."""
     aplicacion, runtime = app_y_runtime
     assert runtime.runtime_owner_user_id is None
@@ -173,7 +173,10 @@ def test_con_sesion_y_drive_se_crea_la_cuenta_y_se_fija_el_dueno(
     cuenta = session.execute(
         select(WhatsAppAccount).where(WhatsAppAccount.user_id == inicio.user_id)
     ).scalar_one()
-    assert cuenta.session_storage_key == f"users/{inicio.user_id}"
+    # Por id de CUENTA, no de usuario: varias personas pueden compartir una
+    # cuenta de WhatsApp, y con la clave por usuario saldrian dos carpetas
+    # para una sola identidad.
+    assert cuenta.session_storage_key == f"accounts/{cuenta.id}"
     assert runtime.runtime_owner_user_id == inicio.user_id
     assert runtime.runtime_owner_account_id == cuenta.id
 
@@ -232,15 +235,53 @@ def dos_con_drive(app_y_runtime, session):
     return aplicacion, runtime, a, b
 
 
-def test_B_no_puede_usar_la_vinculacion_de_A(dos_con_drive):
+def test_B_PUEDE_VINCULAR_AUNQUE_A_YA_LO_HAYA_HECHO(dos_con_drive):
+    """EL FALLO EXACTO, INVERTIDO.
+
+    Esta prueba exigia antes un 409 ``ACCOUNT_RUNTIME_IN_USE``, y estaba
+    fijando el error: convertia el equipo en propiedad del primero que
+    vinculara. Se midio en la aplicacion real, con B mirando "Este dispositivo
+    tiene una vinculacion de WhatsApp en marcha de otro usuario" y sin ningun
+    codigo QR que escanear.
+
+    Un equipo sostiene tantas vinculaciones como cuentas haya. Que A haya
+    vinculado no le quita a B el derecho a vincular lo suyo.
+    """
     aplicacion, runtime, a, b = dos_con_drive
     respuesta = _cliente(aplicacion, runtime, b.token).post("/api/v1/session/pair")
 
-    assert respuesta.status_code == 409
-    assert respuesta.get_json()["error"]["code"] == "ACCOUNT_RUNTIME_IN_USE"
+    cuerpo = respuesta.get_json()
+    assert respuesta.status_code in (200, 202), (
+        f"B tiene que poder pedir SU vinculacion aunque A ya tenga la suya: {cuerpo}"
+    )
+    assert cuerpo.get("status", "").startswith("pairing"), cuerpo
 
 
-def test_el_conflicto_no_revela_nada_de_A(dos_con_drive):
+def test_B_recibe_una_cuenta_DISTINTA_de_la_de_A(dos_con_drive, session):
+    """Y no la de A: dos personas, dos cuentas, dos carpetas de sesion."""
+    from sqlalchemy import select
+
+    from app.models import WhatsAppAccount
+
+    aplicacion, runtime, a, b = dos_con_drive
+    _cliente(aplicacion, runtime, b.token).post("/api/v1/session/pair")
+
+    de_a = session.execute(
+        select(WhatsAppAccount).where(WhatsAppAccount.user_id == a.user_id)
+    ).scalars().first()
+    de_b = session.execute(
+        select(WhatsAppAccount).where(WhatsAppAccount.user_id == b.user_id)
+    ).scalars().first()
+
+    assert de_a is not None and de_b is not None, "cada uno con la suya"
+    assert de_a.id != de_b.id
+    assert de_a.session_storage_key != de_b.session_storage_key, (
+        "dos identidades NO pueden compartir carpeta: el Signal Store es "
+        "indivisible y mezclarlos produce un dispositivo que no descifra nada"
+    )
+
+
+def test_lo_que_B_recibe_no_revela_nada_de_A(dos_con_drive):
     """Ni nombre, ni telefono, ni identificador."""
     aplicacion, runtime, a, b = dos_con_drive
     cuerpo = str(
@@ -307,7 +348,11 @@ def test_el_sse_comprueba_quien_pregunta():
     from app.api import routes
 
     fuente = inspect.getsource(routes.events_stream)
-    assert "es_mia_la_sesion" in fuente
+    # Ser dueno es tener runtime PROPIO. Antes se preguntaba
+    # `es_mia_la_sesion` al runtime del proceso, que daba verdadero para quien
+    # simplemente hubiera vinculado primero en esta maquina.
+    assert "runtime_de_mi_cuenta" in fuente
+    assert "rt.es_mia_la_sesion" not in fuente, "ya no se pregunta al proceso"
     assert "_es_de_la_sesion" in fuente
 
 
@@ -317,6 +362,12 @@ def test_el_sse_comprueba_quien_pregunta():
 
 
 def test_cerrar_sesion_no_reasigna_la_cuenta_a_otro(dos_con_drive, session):
+    """Cerrar sesion NO libera la cuenta para el siguiente que entre.
+
+    (La fixture `cuenta` estaba en la firma sin usarse. Ahora vacia las
+    cuentas para no depender de las que haya en la maquina, asi que se
+    llevaba por delante justo la de A que esta prueba comprueba.)
+    """
     from sqlalchemy import select
 
     from app.models import WhatsAppAccount
@@ -324,14 +375,17 @@ def test_cerrar_sesion_no_reasigna_la_cuenta_a_otro(dos_con_drive, session):
     aplicacion, runtime, a, b = dos_con_drive
     _cliente(aplicacion, runtime, a.token).post("/api/v1/auth/logout")
 
-    cuenta = session.execute(
+    de_a = session.execute(
         select(WhatsAppAccount).where(WhatsAppAccount.user_id == a.user_id)
     ).scalar_one()
-    assert cuenta.user_id == a.user_id, "la cuenta sigue siendo de A"
+    assert de_a.user_id == a.user_id, "la cuenta sigue siendo de A"
 
-    # Y B sigue sin poder usar el runtime de A.
-    respuesta = _cliente(aplicacion, runtime, b.token).post("/api/v1/session/pair")
-    assert respuesta.status_code == 409
+    # Y B, al vincular, recibe LA SUYA -- nunca la de A.
+    _cliente(aplicacion, runtime, b.token).post("/api/v1/session/pair")
+    de_b = session.execute(
+        select(WhatsAppAccount).where(WhatsAppAccount.user_id == b.user_id)
+    ).scalars().first()
+    assert de_b is None or de_b.id != de_a.id
 
 
 # ---------------------------------------------------------------------------

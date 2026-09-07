@@ -339,6 +339,24 @@ def main(argv: list[str] | None = None) -> int:
 
     flask_app = build_service_app(runtime)
 
+    # ARRANQUE MULTICUENTA.
+    #
+    # Va DESPUES de construir la aplicacion, que es donde se monta el registro
+    # y donde se adopta el runtime que ya esta corriendo. Al reves le
+    # construiria un segundo runtime a la cuenta que ya funciona: dos clientes
+    # sobre el mismo Signal Store, y el segundo sin poder ni abrirlo.
+    #
+    # Las cuentas que ya tienen runtime se dejan como estan; solo nacen las que
+    # faltan. Y si una falla, se anota y el servicio sigue atendiendo al resto.
+    from app.api.account_runtime import levantar_las_demas
+
+    levantados = levantar_las_demas(flask_app)
+    if len(levantados) > 1:
+        log.info(
+            "%d cuenta(s) de WhatsApp con su propio runtime y su propia sesion",
+            len(levantados),
+        )
+
     host = args.host or settings.api_host
     port = args.port or settings.api_port
 

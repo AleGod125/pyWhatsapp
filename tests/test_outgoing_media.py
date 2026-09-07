@@ -69,7 +69,7 @@ def _media(session, wamid: str):
 # ---------------------------------------------------------------------------
 
 
-def test_la_imagen_saliente_deja_fila_de_adjunto(servicio, session, crudo):
+def test_la_imagen_saliente_deja_fila_de_adjunto(servicio, session, crudo, cuenta):
     """Esto es lo que faltaba: sin fila no hay descarga y sale "no disponible"."""
     crudo(envuelto(ISAAC_LID, imagen=True))
     resultado = servicio.handle(evento(id="MEDIAOUT001"))
@@ -84,7 +84,7 @@ def test_la_imagen_saliente_deja_fila_de_adjunto(servicio, session, crudo):
     )
 
 
-def test_la_nota_de_voz_saliente_deja_fila_de_adjunto(servicio, session, crudo):
+def test_la_nota_de_voz_saliente_deja_fila_de_adjunto(servicio, session, crudo, cuenta):
     crudo(envuelto(ISAAC_LID, audio_ptt=True))
     servicio.handle(evento(id="MEDIAOUT002"))
     session.flush()
@@ -97,7 +97,7 @@ def test_la_nota_de_voz_saliente_deja_fila_de_adjunto(servicio, session, crudo):
     )
 
 
-def test_el_adjunto_cuelga_del_mensaje_correcto(servicio, session, crudo):
+def test_el_adjunto_cuelga_del_mensaje_correcto(servicio, session, crudo, cuenta):
     """La busqueda iba por ``message.chat``, que somos nosotros: no casaba."""
     crudo(envuelto(ISAAC_LID, imagen=True))
     servicio.handle(evento(id="MEDIAOUT003"))
@@ -108,7 +108,7 @@ def test_el_adjunto_cuelga_del_mensaje_correcto(servicio, session, crudo):
     assert adjunto.message_id == mensaje.id
 
 
-def test_no_se_pierden_los_datos_de_descarga(servicio, session, crudo):
+def test_no_se_pierden_los_datos_de_descarga(servicio, session, crudo, cuenta):
     """media_key, direct_path y los hashes son lo que permite bajar el archivo.
 
     Se comprueba su PRESENCIA, nunca su valor: son material sensible y no
@@ -141,7 +141,7 @@ def test_no_se_pierden_los_datos_de_descarga(servicio, session, crudo):
     assert fila.mime_type == "image/jpeg"
 
 
-def test_la_duracion_de_la_nota_de_voz_se_conserva(servicio, session, crudo):
+def test_la_duracion_de_la_nota_de_voz_se_conserva(servicio, session, crudo, cuenta):
     from pywhats.proto import Message as WAMessage
 
     interno = WAMessage()
@@ -168,7 +168,7 @@ def test_la_duracion_de_la_nota_de_voz_se_conserva(servicio, session, crudo):
 # ---------------------------------------------------------------------------
 
 
-def test_el_multimedia_entrante_sigue_igual(servicio, session, crudo):
+def test_el_multimedia_entrante_sigue_igual(servicio, session, crudo, cuenta):
     """Control: pywhats SI sabe extraer el adjunto de un mensaje entrante."""
     crudo(entrante(imagen=True))
     servicio.handle(
@@ -200,7 +200,7 @@ def test_un_texto_no_registra_ningun_adjunto(servicio, session, crudo):
 # ---------------------------------------------------------------------------
 
 
-def test_el_reparador_encuentra_los_adjuntos_sin_fila(session, servicio, crudo, monkeypatch):
+def test_el_reparador_encuentra_los_adjuntos_sin_fila(session, cuenta, servicio, crudo, monkeypatch):
     """Los que se perdieron antes del arreglo se recuperan del protobuf."""
     import app.services.live_service as live_service
     from scripts.repair_missing_media import aplicar, auditar
@@ -241,7 +241,7 @@ def test_el_reparador_no_inventa_adjuntos_para_los_textos(session, servicio, cru
     ]
 
 
-def test_el_reparador_no_toca_los_que_ya_tienen_fila(session, servicio, crudo):
+def test_el_reparador_no_toca_los_que_ya_tienen_fila(session, cuenta, servicio, crudo):
     from scripts.repair_missing_media import auditar
 
     crudo(envuelto(ISAAC_LID, imagen=True))

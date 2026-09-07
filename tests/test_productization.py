@@ -511,7 +511,7 @@ def test_repair_db_no_se_ejecuta_automaticamente():
         )
 
 
-def test_el_mantenimiento_conserva_los_mensajes(database, settings, session):
+def test_el_mantenimiento_conserva_los_mensajes(database, settings, session, cuenta):
     """Contar antes y despues: la reconciliacion no puede perder filas."""
     from sqlalchemy import func, select
 
@@ -633,13 +633,25 @@ def test_la_huella_de_disco_coincide_con_la_del_dispositivo_vivo(settings):
     import json
     import types
 
-    if not settings.session_file.exists():
-        pytest.skip("no hay sesion guardada en este equipo")
+    # La sesion ya no vive suelta en `session/`: cada cuenta tiene la suya en
+    # `session/accounts/<id>/`. Se busca donde este.
+    import dataclasses
+
+    from app.core.session_paths import CARPETA_DE_CUENTAS
+
+    fichero = settings.session_file
+    if not fichero.exists():
+        cuentas = settings.session_dir / CARPETA_DE_CUENTAS
+        candidatos = sorted(cuentas.glob("*/device.json")) if cuentas.is_dir() else []
+        if not candidatos:
+            pytest.skip("no hay sesion guardada en este equipo")
+        fichero = candidatos[0]
+        settings = dataclasses.replace(settings, session_dir=fichero.parent)
 
     from app.core.identity import session_fingerprint
     from app.services.backfill_service import BackfillService
 
-    datos = json.loads(settings.session_file.read_text(encoding="utf-8"))
+    datos = json.loads(fichero.read_text(encoding="utf-8"))
     jid = datos.get("jid") or {}
     if not jid.get("user"):
         pytest.skip("la sesion guardada no tiene JID")

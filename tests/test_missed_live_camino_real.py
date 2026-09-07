@@ -59,10 +59,10 @@ AHORA = 1_788_700_000
 
 
 @pytest.fixture
-def conversacion(session):
+def conversacion(session, cuenta):
     """Una conversacion con mensajes REALES, con su identificador de WhatsApp."""
     jid = f"{uuid.uuid4().int % 10**15}@lid"
-    chat = Chat(jid=jid, chat_type="individual", name="Contacto")
+    chat = Chat(jid=jid, chat_type="individual", name="Contacto", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     wamids = []
@@ -153,12 +153,12 @@ def test_sin_conversacion_no_hay_ancla(conversacion, settings):
     assert filler._ancla_del_borde("no-existe@lid") is None
 
 
-def test_UNA_CONVERSACION_SIN_MENSAJES_REALES_NO_INVENTA_ANCLA(session, settings):
+def test_UNA_CONVERSACION_SIN_MENSAJES_REALES_NO_INVENTA_ANCLA(session, cuenta, settings):
     """Sin una referencia real no se pide nada. No se fabrica ninguna."""
     from app.services.missed_live_filler import MissedLiveFiller
 
     jid = f"{uuid.uuid4().int % 10**15}@lid"
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     # Un mensaje SIN identificador de WhatsApp: no sirve como ancla.
@@ -362,7 +362,7 @@ def test_el_modelo_esta_importado_donde_se_usa():
 # ---------------------------------------------------------------------------
 
 
-def test_UN_REMITENTE_POR_TELEFONO_ENCUENTRA_SU_CHAT_POR_LID(session, settings):
+def test_UN_REMITENTE_POR_TELEFONO_ENCUENTRA_SU_CHAT_POR_LID(session, cuenta, settings):
     """Medido sobre la base local, y fallaba en silencio.
 
     `573002389304@s.whatsapp.net` no tiene fila de chat propia; su
@@ -379,7 +379,7 @@ def test_UN_REMITENTE_POR_TELEFONO_ENCUENTRA_SU_CHAT_POR_LID(session, settings):
     lid = f"{sufijo}@lid"
 
     # La conversacion existe SOLO por LID.
-    chat = Chat(jid=lid, chat_type="individual", name="Mismo contacto")
+    chat = Chat(jid=lid, chat_type="individual", name="Mismo contacto", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -394,7 +394,7 @@ def test_UN_REMITENTE_POR_TELEFONO_ENCUENTRA_SU_CHAT_POR_LID(session, settings):
         )
     )
     # Y el alias que los une, que es el que ya usa el colector de anclas.
-    session.add(Contact(jid=telefono, lid=lid))
+    session.add(Contact(jid=telefono, lid=lid, whatsapp_account_id=cuenta.id))
     session.flush()
 
     filler = MissedLiveFiller(

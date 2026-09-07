@@ -274,3 +274,77 @@ class WhatsAppAccount(Base):
         UniqueConstraint("session_storage_key", name="uq_whatsapp_accounts_storage"),
         Index("ix_whatsapp_accounts_user", "user_id"),
     )
+
+
+class UserWhatsAppMembership(Base):
+    """Quien puede entrar a que cuenta de WhatsApp. Asociacion EXPLICITA.
+
+    POR QUE HACE FALTA UNA TABLA Y NO BASTA ``whatsapp_accounts.user_id``
+    --------------------------------------------------------------------
+    La columna ``user_id`` dice quien CREO la vinculacion. Eso no es lo mismo
+    que quien puede usarla: una cuenta compartida --socios, una pareja, un
+    equipo-- necesita varias personas con acceso a la MISMA sesion de
+    WhatsApp, sin duplicar ni la sesion, ni el Signal Store, ni los mensajes.
+
+    Con una sola columna eso obliga a elegir entre dos cosas malas: duplicar
+    la cuenta (dos sesiones para un mismo telefono) o mirar el estado global
+    del proceso, que es exactamente el fallo que se midio -- un usuario nuevo
+    veia "cuenta vinculada" porque habia OTRO WhatsApp conectado en el
+    servidor.
+
+    LAS DOS REGLAS, Y POR QUE SON ASIMETRICAS
+    -----------------------------------------
+    ``UNIQUE(user_id)``: una persona tiene como mucho UNA cuenta de WhatsApp.
+    Es la regla de producto de hoy, y la base la hace cumplir en vez de
+    confiar en que nadie se salte una comprobacion.
+
+    **No** hay ``UNIQUE(whatsapp_account_id)``, y es a proposito: varias
+    personas SI pueden compartir una cuenta. Poner ahi otra unicidad seria
+    cerrar la puerta que esta tabla existe para abrir.
+
+    LO QUE NO SE HACE
+    -----------------
+    Una membresia no se crea nunca por coincidencia. Que alguien escanee un
+    telefono que ya esta registrado NO le da acceso: hace falta un acto
+    explicito. Compartir por reconocer un numero seria entregar el historial
+    de otra persona a quien tenga su movil un minuto.
+    """
+
+    __tablename__ = "user_whatsapp_memberships"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), primary_key=True, default=_uuid
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    whatsapp_account_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: ``owner`` la creo; ``member`` recibio acceso. Sin permisos finos
+    #: todavia: hoy los dos ven lo mismo, y anadir matices antes de que hagan
+    #: falta seria inventarse un modelo de permisos sin un caso que lo pida.
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="owner")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('owner','member')", name="ck_memberships_role"
+        ),
+        # UNA cuenta de WhatsApp por persona. La regla de producto, en la base.
+        UniqueConstraint("user_id", name="uq_memberships_user"),
+        # Y la misma pareja no se puede anotar dos veces.
+        UniqueConstraint(
+            "user_id", "whatsapp_account_id", name="uq_memberships_user_account"
+        ),
+        Index("ix_memberships_account", "whatsapp_account_id"),
+    )
+

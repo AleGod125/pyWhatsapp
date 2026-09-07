@@ -320,7 +320,7 @@ def test_el_resumen_calla_si_no_hubo_mutaciones(caplog):
     assert not [r for r in caplog.records if "app-state" in r.getMessage()]
 
 
-def test_esta_apagada_por_defecto():
+def test_esta_apagada_por_defecto(cuenta):
     """Se midio contra la cuenta real y no aparecio ni una clave de mensaje.
 
     No se retira porque repetir la medicion tiene valor, pero no puede formar

@@ -165,7 +165,7 @@ def test_no_se_espera_a_conocer_el_telefono(montaje, session):
 # ---------------------------------------------------------------------------
 
 
-def test_una_sesion_huerfana_no_se_adjudica_a_nadie(montaje, session):
+def test_una_sesion_huerfana_no_se_adjudica_a_nadie(montaje, session, cuenta):
     """Adoptarla entregaria la cuenta de alguien al primero que entrara."""
     montaje["runtime"].runtime_owner_user_id = None
     montaje["runtime"]._persistir_vinculacion()

@@ -120,7 +120,7 @@ def test_tras_el_pair_success_no_se_reinicia_la_vinculacion(runtime):
     assert not reinicios
 
 
-def test_un_401_no_destruye_la_sesion(runtime):
+def test_un_401_no_destruye_la_sesion(runtime, cuenta):
     """El bucle NO se corta archivando la sesion, sino dejando de intentar.
 
     Esta prueba comprobaba lo contrario: que un 401 archivara el
@@ -194,7 +194,7 @@ def test_la_generacion_sube_al_reiniciar(runtime):
 # ---------------------------------------------------------------------------
 
 
-def test_un_mensaje_live_se_persiste_mientras_el_backfill_corre(session, runtime):
+def test_un_mensaje_live_se_persiste_mientras_el_backfill_corre(session, cuenta, runtime):
     """Concurrencia real: el receptor NO espera a que acabe el backfill.
 
     Se ejecuta un backfill simulado que cede el control (``await``) y, en
@@ -335,7 +335,7 @@ def test_media_updated_se_traduce_una_sola_vez(session, runtime):
 # ---------------------------------------------------------------------------
 
 
-def test_un_chat_sin_mensajes_no_esta_completo(session, runtime):
+def test_un_chat_sin_mensajes_no_esta_completo(session, cuenta, runtime):
     """``message_count=0`` NO puede presentarse como historial sincronizado."""
     from app.api.serializers import historia_to_json
     from app.services.seed_recovery import SeedRecovery
@@ -354,7 +354,7 @@ def test_un_chat_sin_mensajes_no_esta_completo(session, runtime):
     assert cuerpo["waiting_seed"] is True
 
 
-def test_un_mensaje_real_convierte_el_chat_en_excavable(session, runtime):
+def test_un_mensaje_real_convierte_el_chat_en_excavable(session, cuenta, runtime):
     """WAITING_SEED -> PENDING en cuanto aparece un ancla de verdad."""
     from app.services.seed_recovery import SeedRecovery
 
@@ -387,7 +387,7 @@ def test_un_mensaje_real_convierte_el_chat_en_excavable(session, runtime):
     assert estado[1] == "SEED0001", "el ancla es el ID REAL, no uno fabricado"
 
 
-def test_un_mensaje_sin_id_real_no_sirve_de_ancla(session, runtime):
+def test_un_mensaje_sin_id_real_no_sirve_de_ancla(session, cuenta, runtime):
     """Nunca se fabrica un cursor: el servidor no lo reconoceria."""
     from app.services.seed_recovery import SeedRecovery
 
@@ -576,7 +576,7 @@ def test_no_se_registra_el_contenido_de_un_mensaje_fallido():
 # ---------------------------------------------------------------------------
 
 
-def test_los_reintentos_de_vinculacion_tienen_freno(runtime):
+def test_los_reintentos_de_vinculacion_tienen_freno(runtime, cuenta):
     """Se midieron 74 intentos de login y 61 QR en segundos. Inaceptable.
 
     Un bucle asi no solo es inutil: golpea un servicio ajeno y arriesga que

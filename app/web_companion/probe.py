@@ -262,9 +262,13 @@ class WebCompanionProbe:
             canonico = canonical_chat_jid(sesion, candidato.chat_jid) or candidato.chat_jid
             if canonico in por_jid:
                 return None
-            existe = sesion.execute(
-                select(Chat.id).where(Chat.jid == canonico)
-            ).scalar_one_or_none()
+            # Por CUENTA. El mismo JID existe en tantas filas como cuentas
+            # hablen con ese contacto: `scalar_one_or_none()` reventaba ahi, y
+            # `.first()` habria devuelto la conversacion de otra persona sin
+            # avisar.
+            from app.services.account_scope import chat_id_de
+
+            existe = chat_id_de(sesion, canonico)
         if existe is None:
             return "la conversacion no existe en esta cuenta"
         return "la conversacion no estaba esperando ancla"

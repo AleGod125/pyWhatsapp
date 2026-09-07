@@ -233,10 +233,20 @@ def aplicar(session, candidatos: list[Candidato]) -> dict[str, int]:
             eliminados += 1
             continue
 
+        # La cuenta es la del chat DE ORIGEN: el mensaje ya vive ahi, y
+        # moverlo a su destinatario no lo saca de la cuenta a la que pertenece.
+        # Sin esto el chat destino nacia sin dueno y no lo veia nadie.
+        from app.models import Chat as _Chat
+
+        cuenta_del_mensaje = session.execute(
+            select(_Chat.whatsapp_account_id).where(_Chat.id == c.chat_actual_id)
+        ).scalar_one_or_none()
+
         chat_destino_id = repo.upsert_chat(
             session,
             jid=c.chat_destino,
             chat_type=_tipo_de_chat(c.chat_destino),
+            whatsapp_account_id=cuenta_del_mensaje,
         )
         session.execute(
             update(Message)

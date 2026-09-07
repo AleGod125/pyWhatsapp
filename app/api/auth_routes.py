@@ -439,7 +439,20 @@ def onboarding_status():
 
     estado = rt.google.estado(usuario.id) if rt.google else None
     drive = bool(estado and estado.drive_authorized)
-    vinculado = _whatsapp_vinculado(rt, usuario)
+
+    # El estado VIVO se le pregunta al runtime de ESTA persona, no al del
+    # proceso. Con el del proceso, a quien no fuera su dueno no se le podia
+    # decir nada del suyo: las comprobaciones de propiedad --correctas-- se
+    # callaban, y una sesion revocada de B nunca se reflejaba porque el
+    # runtime consultado era el de A. La base sigue siendo la fuente de la
+    # propiedad; esto solo mira el socket correcto.
+    from app.api.account_runtime import runtime_de_mi_cuenta
+
+    try:
+        mio = runtime_de_mi_cuenta()
+    except Exception:  # noqa: BLE001 - sin registro montado se usa el de siempre
+        mio = None
+    vinculado = _whatsapp_vinculado(mio or rt, usuario)
 
     if not drive:
         siguiente = "connect_google"
@@ -502,7 +515,21 @@ def _whatsapp_vinculado(rt: Any, usuario: Any) -> bool:
     if _sin_vinculacion_utilizable(rt, usuario):
         return False
 
+    # La cuenta se resuelve por MEMBRESIA. `whatsapp_accounts.user_id` dice
+    # quien CREO la vinculacion; la membresia dice quien puede usarla, y son
+    # cosas distintas en cuanto una cuenta se comparte entre varias personas.
+    #
+    # Se conserva la lectura por `user_id` como respaldo: mientras una
+    # vinculacion se esta completando puede existir la fila de cuenta y aun no
+    # la de membresia, y perder el acceso en ese hueco mandaria al usuario a
+    # escanear otra vez algo que acaba de escanear.
+    from app.auth.memberships import cuenta_efectiva_de
+
     with rt.database.transaction() as session_db:
+        mia = cuenta_efectiva_de(session_db, usuario.id)
+        if mia is not None:
+            return mia.session_status in LINKED_STATUSES
+
         estados = session_db.execute(
             select(WhatsAppAccount.session_status).where(
                 WhatsAppAccount.user_id == usuario.id

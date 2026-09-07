@@ -395,9 +395,12 @@ class WebInventoryService:
             canonico = canonical_chat_jid(sesion, jid) or jid
             hubo_alias = canonico != jid
 
-            chat_id = sesion.execute(
-                select(Chat.id).where(Chat.jid == canonico)
-            ).scalar_one_or_none()
+            from app.services.account_scope import chat_id_de
+
+            # Por CUENTA. El mismo JID existe en tantas filas como cuentas hablen
+# con ese contacto: `scalar_one_or_none()` reventaba ahi, y `.first()`
+# habria devuelto la conversacion de otra persona sin avisar.
+            chat_id = chat_id_de(sesion, canonico, account_id=cuenta)
             if chat_id is not None:
                 self._actualizar(sesion, chat_id, fila)
                 return chat_id, False, hubo_alias

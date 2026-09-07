@@ -173,7 +173,7 @@ def test_el_componente_node_no_guarda_historial():
     assert "sendMessage" not in fuente
 
 
-def test_el_auxiliar_no_marca_nada_como_leido():
+def test_el_auxiliar_no_marca_nada_como_leido(cuenta):
     """Se conecta a la cuenta real del usuario: no puede alterar sus chats."""
     from pathlib import Path
 

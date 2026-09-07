@@ -175,7 +175,24 @@ def build_on_demand_message(
 class BackfillService:
     """Recorre los chats pidiendo historial antiguo, por tandas."""
 
-    def __init__(self, settings: Settings, database: Database) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        *,
+        whatsapp_account_id: Any = None,
+    ) -> None:
+        #: DE QUE CUENTA es este motor.
+        #:
+        #: Se usa para separar el estado que guarda en `app_state` --si la
+        #: capacidad ON_DEMAND esta confirmada, la huella de la sesion-- que
+        #: hasta ahora vivia bajo una clave global. Con dos cuentas, la segunda
+        #: leeria el veredicto de la primera y actuaria con el.
+        #:
+        #: Con `None` las claves quedan exactamente como estaban: durante la
+        #: transicion hay quien todavia no la sabe, y perder ese estado costaria
+        #: una reconfirmacion de capacidad en cada arranque.
+        self.whatsapp_account_id = whatsapp_account_id
         # Lo que ha insertado la INGESTA mientras hay una peticion en vuelo.
         # ``None`` cuando no se esta esperando ninguna respuesta.
         self._ingest_watch: dict[str, int] | None = None
@@ -1141,7 +1158,7 @@ class BackfillService:
                     # Se guarda ANTES de pedir: si el proceso muere a mitad,
                     # el ancla sigue ahi y el chat se retoma sin volver a
                     # buscarla.
-                    persist_cursor(session, chat_jid, cursor)
+                    persist_cursor(session, chat_jid, cursor, chat_id=chat_id)
 
             if cursor is None:
                 self._set_status(chat_jid, "no_valid_cursor", None)
@@ -1719,7 +1736,7 @@ class BackfillService:
         with self._database.transaction() as session:
             session.execute(
                 update(ChatHistoryState)
-                .where(ChatHistoryState.chat_jid == chat_jid)
+                .where(self._esta_conversacion(chat_jid))
                 .values(history_status=status, last_error=error)
             )
         self._avisar_estado(chat_jid, status)
@@ -1815,10 +1832,16 @@ class BackfillService:
         try:
             from app.models import Chat
 
+            from app.services.account_scope import chat_id_de
+
             with self._database.transaction() as sesion:
-                return sesion.execute(
-                    select(Chat.id).where(Chat.jid == chat_jid)
-                ).scalar_one_or_none()
+                # Por CUENTA. El mismo JID existe en tantas filas como cuentas
+                # hablen con ese contacto: `scalar_one_or_none()` reventaba
+                # ahi, y `.first()` habria devuelto la conversacion de otra
+                # persona sin avisar.
+                return chat_id_de(
+                    sesion, chat_jid, account_id=self.whatsapp_account_id
+                )
         except Exception:  # noqa: BLE001 - no saberlo no invalida el aviso
             return None
 
@@ -1867,7 +1890,7 @@ class BackfillService:
         with self._database.transaction() as session:
             session.execute(
                 update(ChatHistoryState)
-                .where(ChatHistoryState.chat_jid == chat_jid)
+                .where(self._esta_conversacion(chat_jid))
                 .values(consecutive_no_progress=0, history_status="pending")
             )
         self._avisar_estado(chat_jid, "pending")
@@ -1908,6 +1931,29 @@ class BackfillService:
                 update(HistoryRequest).where(HistoryRequest.id == request_id).values(**values)
             )
 
+    def _esta_conversacion(self, chat_jid: str, chat_id: int | None = None):
+        """El criterio para tocar LA fila de estado de esa conversacion.
+
+        Con la cuenta de este motor puesta, el jid ya no basta ni hace falta:
+        se resuelve dentro de la cuenta y un UPDATE nunca puede alcanzar la
+        fila de otra persona.
+        """
+        from app.services.account_scope import estado_de_esta_conversacion
+
+        return estado_de_esta_conversacion(
+            chat_jid, chat_id=chat_id, account_id=self.whatsapp_account_id
+        )
+
+    def _clave(self, base: str) -> str:
+        """La clave de `app_state` de ESTE motor.
+
+        Sin cuenta devuelve la de siempre, asi que con una sola cuenta no
+        cambia ni un byte de lo ya guardado.
+        """
+        from app.services.account_scope import clave_de_cuenta
+
+        return clave_de_cuenta(base, self.whatsapp_account_id)
+
     def session_fingerprint(self) -> str | None:
         """Identificador NO sensible de la sesion actual.
 
@@ -1944,7 +1990,7 @@ class BackfillService:
         if fingerprint is None:
             return False
         with self._database.transaction() as session:
-            stored = repo.get_app_state(session, CAPABILITY_KEY)
+            stored = repo.get_app_state(session, self._clave(CAPABILITY_KEY))
         if not isinstance(stored, dict) or not stored.get("confirmed"):
             return False
         if stored.get("state") == "SUSPECT":
@@ -1994,7 +2040,7 @@ class BackfillService:
             return 0
 
         with self._database.transaction() as session:
-            previous = repo.get_app_state(session, SESSION_KEY)
+            previous = repo.get_app_state(session, self._clave(SESSION_KEY))
             saved = previous.get("fingerprint") if isinstance(previous, dict) else None
             if saved == fingerprint:
                 log.debug("Misma sesion de extraccion; no hace falta revalidar")
@@ -2010,7 +2056,9 @@ class BackfillService:
                 )
             ).rowcount or 0
             repo.set_app_state(
-                session, SESSION_KEY, {"fingerprint": fingerprint, "at": int(time.time())}
+                session,
+                self._clave(SESSION_KEY),
+                {"fingerprint": fingerprint, "at": int(time.time())},
             )
 
         if reopened:
@@ -2098,7 +2146,7 @@ class BackfillService:
         if fingerprint is None:
             return "UNKNOWN"
         with self._database.transaction() as session:
-            stored = repo.get_app_state(session, CAPABILITY_KEY)
+            stored = repo.get_app_state(session, self._clave(CAPABILITY_KEY))
         if not isinstance(stored, dict) or stored.get("session") != fingerprint:
             return "UNKNOWN"
         if stored.get("state") == "SUSPECT":
@@ -2109,11 +2157,11 @@ class BackfillService:
         """Marca el estado SIN borrar la confirmacion original."""
         fingerprint = self.session_fingerprint()
         with self._database.transaction() as session:
-            stored = repo.get_app_state(session, CAPABILITY_KEY)
+            stored = repo.get_app_state(session, self._clave(CAPABILITY_KEY))
             datos = dict(stored) if isinstance(stored, dict) else {}
             datos["session"] = fingerprint
             datos["state"] = estado
-            repo.set_app_state(session, CAPABILITY_KEY, datos)
+            repo.set_app_state(session, self._clave(CAPABILITY_KEY), datos)
 
     def _confirm_capability(self) -> None:
         """ON_DEMAND respondio: se deja constancia y se levanta la sospecha.
@@ -2132,7 +2180,7 @@ class BackfillService:
         # Ha respondido: la racha de timeouts deja de contar.
         self._timeouts_seguidos = 0
         with self._database.transaction() as session:
-            stored = repo.get_app_state(session, CAPABILITY_KEY)
+            stored = repo.get_app_state(session, self._clave(CAPABILITY_KEY))
             previo = dict(stored) if isinstance(stored, dict) else {}
             ya_confirmada = (
                 previo.get("session") == fingerprint
@@ -2148,7 +2196,7 @@ class BackfillService:
                 # Huella de la vinculacion, no material sensible.
                 "session": fingerprint,
             }
-            repo.set_app_state(session, CAPABILITY_KEY, datos)
+            repo.set_app_state(session, self._clave(CAPABILITY_KEY), datos)
 
         if previo.get("state") == "SUSPECT":
             log.info(

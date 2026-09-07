@@ -2,21 +2,33 @@
 
 AISLAMIENTO EN DISCO
 --------------------
-Cada usuario tiene su propia carpeta::
+Cada CUENTA tiene su propia carpeta::
 
-    session/users/<user_id>/device.json
-    session/users/<user_id>/device.json.signal.db
-    session/users/<user_id>/compat_prekey.db
+    session/accounts/<account_id>/device.json
+    session/accounts/<account_id>/device.json.signal.db
+    session/accounts/<account_id>/compat_prekey.db
 
-Identidad y Signal Store siguen siendo INDIVISIBLES: van juntos o no va
-ninguno. Y nunca se copia estado criptografico entre carpetas: dos usuarios
-son dos identidades, y mezclarlas produce un dispositivo que no descifra nada.
+Por cuenta y no por usuario: varias personas pueden compartir una cuenta de
+WhatsApp, y entonces comparten identidad y Signal Store. Nombrar la carpeta
+por el usuario daria dos carpetas para una sola identidad.
 
-EN ESTA FASE
-------------
-El runtime sostiene UNA sesion de WhatsApp a la vez. Lo que cambia es que esa
-sesion tiene dueno explicito: si otro usuario intenta usarla, se responde con
-un conflicto claro en vez de dejarle ver una copia que no es suya.
+Identidad y Signal Store son INDIVISIBLES: van juntos o no va ninguno. Y
+nunca se copia estado criptografico entre carpetas: dos cuentas son dos
+identidades, y mezclarlas produce un dispositivo que no descifra nada.
+
+EL EQUIPO NO ES DE NADIE
+------------------------
+Una maquina sostiene tantas vinculaciones como cuentas haya. Antes habia aqui
+un modelo de "la sesion de este equipo" con un dueno unico, y con el, el
+segundo usuario que entrara no podia ni pedir su codigo QR: se le contestaba
+que el dispositivo estaba ocupado.
+
+Las reglas son estas, y son de PERSONA, no de equipo:
+
+* una cuenta de Google sostiene como mucho UNA cuenta de WhatsApp;
+* una cuenta de WhatsApp puede estar en varias cuentas de Google, siempre de
+  forma explicita (`app.auth.memberships`);
+* lo que impide ver lo ajeno es la membresia, no un guarda de proceso.
 """
 
 from __future__ import annotations
@@ -82,6 +94,20 @@ def rutas_de(settings: Any, user_id: Any) -> RutasDeSesion:
     )
 
 
+def _clave_de_almacenamiento(account_id: Any) -> str:
+    """Donde vive la sesion de esa cuenta, relativo a ``session/``.
+
+    Por id de CUENTA, nunca de usuario. Varias personas pueden compartir una
+    cuenta de WhatsApp --y entonces comparten identidad y Signal Store, que
+    son indivisibles--, asi que nombrar la carpeta por el usuario produciria
+    dos carpetas para una sola identidad.
+
+    Tiene que coincidir con `app.core.session_paths.carpeta_de_cuenta`, que es
+    quien construye la ruta de verdad.
+    """
+    return f"accounts/{account_id}"
+
+
 class WhatsAppAccountService:
     """Alta, consulta y propiedad de las vinculaciones."""
 
@@ -110,38 +136,73 @@ class WhatsAppAccountService:
                 select(WhatsAppAccount).where(WhatsAppAccount.user_id == user_id)
             ).scalars().first()
             if fila is None:
+                # El id se genera AQUI, no en el flush: la carpeta se nombra
+                # por el id de la cuenta y `session_storage_key` es NOT NULL,
+                # asi que tiene que existir antes de insertar la fila.
+                import uuid as _uuid
+
+                nuevo_id = _uuid.uuid4()
                 fila = WhatsAppAccount(
+                    id=nuevo_id,
                     user_id=user_id,
                     session_status="never_linked",
-                    session_storage_key=f"users/{user_id}",
+                    session_storage_key=_clave_de_almacenamiento(nuevo_id),
                 )
                 session.add(fila)
                 session.flush()
                 log.info("Cuenta de WhatsApp creada para el usuario")
+            elif fila.session_storage_key != _clave_de_almacenamiento(fila.id):
+                # Fila antigua con la clave por USUARIO. Se normaliza para que
+                # la base diga donde vive la sesion de verdad. Es solo la
+                # etiqueta: quien resuelve la ruta es `carpeta_de_cuenta`, y
+                # esa siempre uso el id de cuenta. Sin esto, la base y el disco
+                # discrepan y el arranque no sabe de quien es cada carpeta.
+                fila.session_storage_key = _clave_de_almacenamiento(fila.id)
+                # El flush va ANTES del expunge, y no es un detalle: expulsar
+                # una fila con cambios pendientes los DESCARTA, la UPDATE no
+                # llega a emitirse y la normalizacion se pierde en silencio.
+                # Se midio: la cuenta seguia con la clave `users/<usuario>`
+                # despues de pasar por aqui.
+                session.flush()
             session.expunge(fila)
             return fila
 
     def dueno_actual(self) -> Any:
-        """De quien es la vinculacion VIVA de este equipo, o ``None``.
+        """De quien es la UNICA vinculacion de este equipo, o ``None``.
 
         Estricto a proposito: solo cuentas que ya constan vinculadas. Es la
-        pregunta que necesita la comprobacion de propiedad, y ampliarla haria
+        pregunta que necesita la recuperacion al arrancar, y ampliarla haria
         que toda cuenta creada al pulsar "vincular" —aunque no llegara a
-        completarse— bloqueara a los demas.
+        completarse— se diera por buena.
+
+        CON DOS VINCULADAS SE CONTESTA ``None``, Y ES LO IMPORTANTE
+        ----------------------------------------------------------
+        Antes se devolvia ``.first()`` sin ordenar: con A y B vinculados,
+        PostgreSQL entrega la que quiera. Al arrancar, el runtime que sostiene
+        la sesion suelta de A pedia aqui su dueno y podia recibir a B -- y
+        entonces marcaba la cuenta de B como vinculada usando la identidad de
+        A. Es el peor fallo posible en multiusuario: no da error, y le entrega
+        a una persona la conversacion de otra.
+
+        Con dos no hay respuesta correcta desde aqui, asi que no se da
+        ninguna. Quien sepa de quien es cada sesion es el registro, que va por
+        carpeta de cuenta.
         """
         from app.models.accounts import LINKED_STATUSES
 
         with self._database.transaction() as session:
-            fila = (
+            filas = (
                 session.execute(
-                    select(WhatsAppAccount).where(
+                    select(WhatsAppAccount)
+                    .where(
                         WhatsAppAccount.session_status.in_(tuple(LINKED_STATUSES))
                     )
+                    .limit(2)
                 )
                 .scalars()
-                .first()
+                .all()
             )
-            return fila.user_id if fila is not None else None
+            return filas[0].user_id if len(filas) == 1 else None
 
     def dueno_de_la_sesion_en_disco(self) -> Any:
         """A quien pertenece la sesion que hay guardada, o ``None``.

@@ -48,9 +48,9 @@ class _DatabaseDeSesion:
 
 
 @pytest.fixture
-def chat_dormido(session):
+def chat_dormido(session, cuenta):
     """Un chat real sin un solo mensaje, marcado como esperando semilla."""
-    chat = Chat(jid=VIEJO, chat_type="individual", name="Contacto viejo")
+    chat = Chat(jid=VIEJO, chat_type="individual", name="Contacto viejo", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -103,7 +103,7 @@ def test_un_chat_sin_mensajes_aparece_en_el_listado(session, chat_dormido):
 # ---------------------------------------------------------------------------
 
 
-def _mensaje_live(session, chat_jid: str, raw: bytes, wamid: str):
+def _mensaje_live(session, cuenta, chat_jid: str, raw: bytes, wamid: str):
     """Guarda un mensaje por el camino real, el de LiveMessageService."""
     import app.compat.protocol_flag as protocol_flag
     from pywhats.events import JID, Message
@@ -116,7 +116,10 @@ def _mensaje_live(session, chat_jid: str, raw: bytes, wamid: str):
     protocol_flag.last_raw_message = lambda: raw
     try:
         servicio = LiveMessageService(
-            FakeDatabase(session), own_jid=OWN_PN, own_lid=OWN_LID
+            FakeDatabase(session),
+            own_jid=OWN_PN,
+            own_lid=OWN_LID,
+            whatsapp_account_id=cuenta.id,
         )
         usuario, _, servidor = chat_jid.partition("@")
         return servicio.handle(
@@ -135,8 +138,8 @@ def _mensaje_live(session, chat_jid: str, raw: bytes, wamid: str):
         protocol_flag.last_raw_message = original
 
 
-def test_un_entrante_despierta_el_chat(session, chat_dormido):
-    _mensaje_live(session, VIEJO, entrante(texto="hola"), "SEEDWAMID001")
+def test_un_entrante_despierta_el_chat(session, cuenta, chat_dormido):
+    _mensaje_live(session, cuenta, VIEJO, entrante(texto="hola"), "SEEDWAMID001")
     session.flush()
 
     informe = SeedRecovery(_DatabaseDeSesion(session)).seed_from_messages([VIEJO])
@@ -144,7 +147,7 @@ def test_un_entrante_despierta_el_chat(session, chat_dormido):
     assert _estado(session, VIEJO) == "pending"
 
 
-def test_un_saliente_tambien_despierta_el_chat(session, chat_dormido):
+def test_un_saliente_tambien_despierta_el_chat(session, cuenta, chat_dormido):
     """Antes era imposible: el mensaje caia en el chat propio.
 
     Se manda con ``chat`` = nuestro propio identificador, que es como llega de
@@ -154,7 +157,7 @@ def test_un_saliente_tambien_despierta_el_chat(session, chat_dormido):
     from tests.test_outgoing_routing import OWN_LID
 
     resultado = _mensaje_live(
-        session, OWN_LID, envuelto(VIEJO, texto="hola"), "SEEDWAMID002"
+        session, cuenta, OWN_LID, envuelto(VIEJO, texto="hola"), "SEEDWAMID002"
     )
     session.flush()
 
@@ -213,12 +216,12 @@ def test_la_revision_manual_no_inventa_cursor(session, chat_dormido, settings):
 
 
 def test_la_revision_manual_encuentra_un_ancla_que_ya_estaba(
-    session, chat_dormido, settings
+    session, cuenta, chat_dormido, settings
 ):
     """Si el ancla aparecio por otra via, la revision lo detecta."""
     from app.services.history_recheck import HistoryRecheck
 
-    _mensaje_live(session, VIEJO, entrante(texto="hola"), "SEEDWAMID003")
+    _mensaje_live(session, cuenta, VIEJO, entrante(texto="hola"), "SEEDWAMID003")
     session.flush()
 
     resultado = HistoryRecheck(_DatabaseDeSesion(session), settings).recheck(
@@ -230,17 +233,17 @@ def test_la_revision_manual_encuentra_un_ancla_que_ya_estaba(
     assert _estado(session, VIEJO) == "pending"
 
 
-def test_la_revision_busca_en_los_alias_del_contacto(session, chat_dormido, settings):
+def test_la_revision_busca_en_los_alias_del_contacto(session, cuenta, chat_dormido, settings):
     """El ancla puede haber entrado por el otro identificador del contacto."""
     from app.models import Contact
     from app.services.history_recheck import HistoryRecheck
 
     telefono = "34600444555@s.whatsapp.net"
-    session.add(Contact(jid=telefono, lid=VIEJO))
-    session.add(Chat(jid=telefono, chat_type="individual"))
+    session.add(Contact(jid=telefono, lid=VIEJO, whatsapp_account_id=cuenta.id))
+    session.add(Chat(jid=telefono, chat_type="individual", whatsapp_account_id=cuenta.id))
     session.flush()
 
-    _mensaje_live(session, telefono, entrante(texto="hola"), "SEEDWAMID004")
+    _mensaje_live(session, cuenta, telefono, entrante(texto="hola"), "SEEDWAMID004")
     session.flush()
 
     resultado = HistoryRecheck(_DatabaseDeSesion(session), settings).recheck(
@@ -276,7 +279,7 @@ def _atascar_en_fetching(session):
 
 
 def test_un_fetching_atascado_CON_ancla_vuelve_a_pending(
-    session, chat_dormido, settings
+    session, cuenta, chat_dormido, settings
 ):
     """Se midio con "Tia Diana": el proceso murio entre pedir y responder.
 
@@ -289,7 +292,7 @@ def test_un_fetching_atascado_CON_ancla_vuelve_a_pending(
     """
     from app.services.maintenance_service import MaintenanceService, ReconcileReport
 
-    _mensaje_live(session, VIEJO, entrante(texto="hola"), "3A1F8BDD4678EB6DE395")
+    _mensaje_live(session, cuenta, VIEJO, entrante(texto="hola"), "3A1F8BDD4678EB6DE395")
     session.flush()
     _atascar_en_fetching(session)
 

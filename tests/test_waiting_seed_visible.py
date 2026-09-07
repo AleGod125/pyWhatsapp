@@ -24,8 +24,8 @@ FANTASMA = "99988811122@lid"
 
 
 @pytest.fixture
-def chat_fantasma(session):
-    chat = Chat(jid=FANTASMA, chat_type="individual", name="Contacto fantasma")
+def chat_fantasma(session, cuenta):
+    chat = Chat(jid=FANTASMA, chat_type="individual", name="Contacto fantasma", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -72,12 +72,12 @@ def test_la_api_lo_expone_en_la_fila(session, chat_fantasma):
     assert cuerpo["message_count"] == 0
 
 
-def test_un_chat_agotado_no_se_marca_como_pendiente(session):
+def test_un_chat_agotado_no_se_marca_como_pendiente(session, cuenta):
     from app.api.serializers import chat_to_json
     from app.services import repository as repo
 
     jid = "99977766655@lid"
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(

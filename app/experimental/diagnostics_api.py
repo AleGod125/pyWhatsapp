@@ -101,9 +101,12 @@ def _cursor_actual(sesion, chat_jid: str):
     from app.history.cursor import get_valid_history_cursor
     from app.models import Chat
 
-    chat_id = sesion.execute(
-        select(Chat.id).where(Chat.jid == chat_jid)
-    ).scalar_one_or_none()
+    # Por CUENTA. El mismo JID existe en tantas filas como cuentas hablen con
+    # ese contacto: `scalar_one_or_none()` reventaba ahi, y `.first()` habria
+    # devuelto la conversacion de otra persona sin avisar.
+    from app.services.account_scope import chat_id_de
+
+    chat_id = chat_id_de(sesion, chat_jid)
     if chat_id is None:
         return None, "ese chat no existe en esta base"
     cursor = get_valid_history_cursor(sesion, chat_id=chat_id, chat_jid=chat_jid)

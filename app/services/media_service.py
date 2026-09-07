@@ -395,6 +395,13 @@ class MediaService:
             self._fail(media_id, "unavailable", f"tipo sin soporte de descarga: {media_type}")
             return
 
+        # Sin `direct_path` no hay nada que pedir: la URL del CDN se construye
+        # con el. Reintentarlo es reintentar lo imposible, y se estaban
+        # reintentando 26 filas asi en cada ronda. Es terminal.
+        if not direct_path:
+            self._fail(media_id, "unavailable", "el mensaje no traia direct_path")
+            return
+
         info = MediaInfo(
             direct_path=direct_path,
             media_key=bytes(media_key),
@@ -506,11 +513,34 @@ class MediaService:
 
         # Estados TERMINALES distintos:
         #   410 Gone      -> expired      (el CDN lo tuvo y ya no)
+        #   403 Forbidden -> expired      (idem; es lo que responde de verdad)
         #   404 Not Found -> unavailable  (el CDN no lo sirve)
         # El detalle individual va a DEBUG: con cientos de adjuntos antiguos
         # llenaba la consola sin aportar nada.
+        #
+        # EL 403 ES TERMINAL, Y ESTA MEDIDO
+        # ---------------------------------
+        # Estaba cayendo en "failed", que es reintentable, asi que cada ronda
+        # volvia a pedir los mismos adjuntos muertos cada 20 s para siempre.
+        # De ahi el contador que subia sin descargar nada: 368 -> 428 -> 465
+        # eran los MISMOS ficheros contados otra vez.
+        #
+        # Que el 403 significa "ya no esta" se comprobo contra el CDN, y el
+        # corte por antiguedad no deja lugar a duda:
+        #
+        #     403 Forbidden : 379 adjuntos, del 2025-10-29 al 2026-08-08
+        #     410 Gone      :   3 adjuntos, del 2026-08-10 al 2026-08-11
+        #     descargados   :   6 adjuntos, del 2026-08-21 al 2026-09-02
+        #
+        # Sin un solo solape. El CDN de WhatsApp sirve los adjuntos unos 30
+        # dias y despues responde 403 casi siempre, 410 justo en el borde. Se
+        # reprodujo con una peticion normal fuera de la aplicacion, asi que no
+        # depende de la sesion ni del socket.
         if "410" in lowered or "gone" in lowered:
             log.debug("Adjunto %d caducado en el CDN (%s)", media_id, message[:80])
+            self._fail(media_id, "expired", message)
+        elif "403" in lowered or "forbidden" in lowered:
+            log.debug("Adjunto %d ya no lo sirve el CDN (%s)", media_id, message[:80])
             self._fail(media_id, "expired", message)
         elif "404" in lowered or "not found" in lowered:
             log.debug("Adjunto %d no disponible en el CDN (%s)", media_id, message[:80])

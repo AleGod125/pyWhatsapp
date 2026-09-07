@@ -308,7 +308,20 @@ class RateLimitedLogger:
         self._contador: dict[str, int] = {}
         self._ultimo: dict[str, float] = {}
 
+    def info(self, clave: str, mensaje: str, *args: object) -> None:
+        """Igual que :meth:`warning`, pero para lo que no es un problema.
+
+        Hay avisos repetidos que describen algo NORMAL --el primer mensaje de
+        cada interlocutor no se puede descifrar hasta que exista sesion
+        Signal-- y pintarlos de WARNING hace que un arranque sano parezca una
+        averia. Se agrupan igual; solo cambia el nivel.
+        """
+        self._emitir(self._log.info, clave, mensaje, *args)
+
     def warning(self, clave: str, mensaje: str, *args: object) -> None:
+        self._emitir(self._log.warning, clave, mensaje, *args)
+
+    def _emitir(self, escribir, clave: str, mensaje: str, *args: object) -> None:
         import time
 
         ahora = time.monotonic()
@@ -317,7 +330,7 @@ class RateLimitedLogger:
         if visto is None:
             self._ultimo[clave] = ahora
             self._contador[clave] = 0
-            self._log.warning(mensaje, *args)
+            escribir(mensaje, *args)
             return
 
         self._contador[clave] = self._contador.get(clave, 0) + 1
@@ -326,7 +339,7 @@ class RateLimitedLogger:
             self._ultimo[clave] = ahora
             self._contador[clave] = 0
             if repetidos:
-                self._log.warning(
+                escribir(
                     "%s (y %d mas en los ultimos %.0f s)",
                     mensaje % args if args else mensaje,
                     repetidos,

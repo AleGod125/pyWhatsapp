@@ -130,8 +130,19 @@ class Contact(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    # JID canonico, p.ej. "34600111222@s.whatsapp.net". Unico cuando existe.
-    jid: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # A QUE CUENTA de WhatsApp pertenece este contacto.
+    #
+    # Sin esto `jid` era unico en todo el sistema, y el nombre que una persona
+    # le pone a un numero aparecia en la agenda de otra. La agenda es privada.
+    whatsapp_account_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # JID canonico. Unico DENTRO de su cuenta: dos personas distintas pueden
+    # tener el mismo contacto.
+    jid: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # LID ("...@lid"). WhatsApp usa ambos espacios de identificadores; se
     # conservan por separado y no se convierte uno en otro.
@@ -154,6 +165,10 @@ class Contact(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint(
+            "whatsapp_account_id", "jid", name="uq_contacts_account_jid"
+        ),
+        Index("ix_contacts_account", "whatsapp_account_id"),
         Index("ix_contacts_lid", "lid"),
         Index("ix_contacts_phone_number", "phone_number"),
         # Busqueda por nombre en el sidebar.
@@ -173,16 +188,21 @@ class Chat(Base):
     __tablename__ = "chats"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    jid: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # Unico DENTRO de su cuenta. Con `unique=True` la segunda persona que
+    # tuviera el mismo contacto no podia ni insertar la fila.
+    jid: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # De QUIEN es este chat. La propiedad se resuelve siguiendo una sola
     # cadena (chat -> whatsapp_account -> user) en vez de repetir ``user_id``
     # en cada tabla, que es donde acaban apareciendo filas con dueno
     # equivocado. Nulo solo mientras quedan datos de antes de multiusuario.
-    whatsapp_account_id: Mapped[uuid.UUID | None] = mapped_column(
+    # OBLIGATORIO. PostgreSQL trata los NULL como distintos entre si, asi que
+    # con la columna nullable dos filas `(NULL, mismo_jid)` no colisionarian y
+    # la unicidad por cuenta no deduplicaria nada.
+    whatsapp_account_id: Mapped[uuid.UUID] = mapped_column(
         PgUUID(as_uuid=True),
         ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
 
@@ -211,6 +231,7 @@ class Chat(Base):
 
     __table_args__ = (
         _enum_check("chat_type", CHAT_TYPES, "ck_chats_chat_type"),
+        UniqueConstraint("whatsapp_account_id", "jid", name="uq_chats_account_jid"),
         # Orden del sidebar: los chats mas recientes primero.
         Index(
             "ix_chats_last_message_timestamp",
@@ -311,9 +332,12 @@ class Message(Base):
         ),
         # Deduplicacion: UNIQUE parcial. Los mensajes sin ID real quedan
         # fuera del indice y por tanto nunca colisionan entre si.
+        # Por `chat_id`, NO por `chat_jid`: un mensaje de grupo lleva el mismo
+        # identificador para todos los que lo reciben, asi que por el jid el
+        # que le llega a la segunda persona se descartaba en silencio.
         Index(
             "uq_messages_chat_wamid",
-            "chat_jid",
+            "chat_id",
             "whatsapp_message_id",
             unique=True,
             postgresql_where=sa_text("whatsapp_message_id IS NOT NULL"),
@@ -348,7 +372,10 @@ class ChatHistoryState(Base):
     chat_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, unique=True
     )
-    chat_jid: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    # NO unico: `chat_id` ya lo es y da la cuenta a traves de `chats`. Forzar
+    # un solo estado por jid impedia que dos cuentas tuvieran la misma
+    # conversacion, cada una con su propio progreso.
+    chat_jid: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
     # Ancla mas antigua UTILIZABLE (ID real de WhatsApp). Puede no coincidir
     # con el mensaje mas antiguo almacenado: ver get_oldest_valid_history_cursor.

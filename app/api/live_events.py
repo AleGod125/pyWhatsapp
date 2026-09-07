@@ -169,8 +169,9 @@ def _historial_ingerido(carga: Any, runtime: Any) -> list[tuple[str, Any]]:
         filas = []
         for jid in jids:
             chat_id = sesion.execute(
-                select(Chat.id).where(Chat.jid == jid)
-            ).scalar_one_or_none()
+                select(Chat.id).where(Chat.jid == jid).limit(2)
+            ).scalars().all()
+            chat_id = chat_id[0] if len(chat_id) == 1 else None
             if chat_id is None:
                 continue
             resumen = repo.chat_summary(sesion, chat_id)

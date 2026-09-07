@@ -237,7 +237,7 @@ def test_un_resultado_identico_se_llama_igual():
         assert fila[5] == "igual"
 
 
-def test_el_numero_de_conversaciones_solo_se_informa():
+def test_el_numero_de_conversaciones_solo_se_informa(cuenta):
     """Que cambie no es bueno ni malo: depende de la cuenta, no de nosotros."""
     from tools.compare_baselines import comparar
 

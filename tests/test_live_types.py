@@ -136,7 +136,7 @@ CASOS = [
 )
 def test_cada_tipo_atraviesa_store_sin_typeerror(
     servicio, session, con_raw_proto, esperado, media, texto
-):
+, cuenta):
     """Ningun tipo puede reventar dentro de la transaccion.
 
     Se comprueba que la fila EXISTE, no solo que no hubo excepcion: el fallo
@@ -156,7 +156,7 @@ def test_cada_tipo_atraviesa_store_sin_typeerror(
     assert resultado["new"] is True
 
 
-def test_un_mensaje_de_texto_se_guarda(servicio, session, con_raw_proto):
+def test_un_mensaje_de_texto_se_guarda(servicio, session, con_raw_proto, cuenta):
     """El caso que el bug rompia: texto normal, sin adjunto de pywhats."""
     resultado = servicio.handle(
         mensaje(id="3EBLIVETXT001", text="prueba live 001")
@@ -170,7 +170,7 @@ def test_un_mensaje_de_texto_se_guarda(servicio, session, con_raw_proto):
     assert fila.source == "live"
 
 
-def test_un_mensaje_de_grupo_se_guarda(servicio, session, con_raw_proto):
+def test_un_mensaje_de_grupo_se_guarda(servicio, session, con_raw_proto, cuenta):
     resultado = servicio.handle(
         mensaje(
             id="3EBLIVEGRP001",
@@ -189,7 +189,7 @@ def test_un_mensaje_de_grupo_se_guarda(servicio, session, con_raw_proto):
 
 def test_un_adjunto_de_tipo_desconocido_no_pierde_el_mensaje(
     servicio, session, con_raw_proto
-):
+, cuenta):
     """Un ``kind`` que pywhats no traduce NO puede tirar la transaccion.
 
     El adjunto se registra como 'unknown', que SI es un valor valido de
@@ -215,7 +215,7 @@ def test_un_adjunto_de_tipo_desconocido_no_pierde_el_mensaje(
     assert adjunto.media_type == "unknown"
 
 
-def test_un_evento_de_sistema_no_rompe_el_pipeline(servicio, session, con_raw_proto):
+def test_un_evento_de_sistema_no_rompe_el_pipeline(servicio, session, con_raw_proto, cuenta):
     """Un mensaje sin texto ni adjunto se guarda; no se descarta."""
     resultado = servicio.handle(mensaje(id="3EBLIVESYS001", text=""))
 
@@ -293,7 +293,7 @@ def test_si_store_lanza_no_se_avisa_de_nada(servicio, session, con_raw_proto, mo
 
 def test_el_resultado_llega_con_el_mensaje_ya_en_la_base(
     servicio, session, con_raw_proto
-):
+, cuenta):
     """``handle()`` solo devuelve algo cuando la fila ya existe.
 
     Es lo que garantiza el orden que pide el pipeline: primero PostgreSQL,
@@ -309,7 +309,7 @@ def test_el_resultado_llega_con_el_mensaje_ya_en_la_base(
     assert resultado["chat_id"] is not None
 
 
-def test_un_duplicado_se_marca_como_no_nuevo(servicio, session, con_raw_proto):
+def test_un_duplicado_se_marca_como_no_nuevo(servicio, session, con_raw_proto, cuenta):
     """La deduplicacion por wamid sigue mandando; el evento la respeta."""
     primero = servicio.handle(mensaje(id="3EBLIVEDUP001", text="una vez"))
     segundo = servicio.handle(mensaje(id="3EBLIVEDUP001", text="una vez"))

@@ -50,8 +50,8 @@ class _RuntimeFalso:
 
 
 @pytest.fixture
-def fantasma(session):
-    chat = Chat(jid=FANTASMA, chat_type="individual", name="Sin ancla")
+def fantasma(session, cuenta):
+    chat = Chat(jid=FANTASMA, chat_type="individual", name="Sin ancla", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(

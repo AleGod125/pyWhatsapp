@@ -225,24 +225,37 @@ def test_la_respuesta_de_404_no_filtra_nada(
 # ---------------------------------------------------------------------------
 
 
-def test_un_chat_sin_dueno_no_es_de_nadie(app_de_pruebas, runtime, dos_usuarios, session):
-    """Filas anteriores a multiusuario.
+def test_un_chat_DE_OTRA_CUENTA_no_es_de_nadie(
+    app_de_pruebas, runtime, dos_usuarios, session, cuenta
+):
+    """La conversacion de otra persona no se ve ni se puede abrir.
 
-    Darlas por buenas para el primero que entre seria entregarle el historial
-    de la cuenta de pruebas. El reset de fase las elimina.
+    Antes esto se comprobaba con un chat SIN dueno --filas anteriores a
+    multiusuario--. Ese caso ya no puede existir: `whatsapp_account_id` es
+    obligatorio, porque un chat sin dueno no colisiona con nada y se
+    duplicaria en silencio.
+
+    Lo que sigue existiendo, y es lo que de verdad hay que impedir, es el chat
+    de OTRA cuenta. Se comprueban las dos puertas: pedirlo por su identificador
+    y buscarlo en el listado.
     """
     from app.models import Chat
 
-    huerfano = Chat(jid="99900011122@lid", chat_type="individual", name="Sin dueno")
-    session.add(huerfano)
+    ajeno = Chat(
+        jid="99900011122@lid",
+        chat_type="individual",
+        name="De otra persona",
+        whatsapp_account_id=cuenta.id,
+    )
+    session.add(ajeno)
     session.flush()
 
     a, _ = dos_usuarios
     cliente_a = _cliente_de(app_de_pruebas, runtime, a["token"])
 
-    assert cliente_a.get(f"/api/v1/chats/{huerfano.id}").status_code == 404
+    assert cliente_a.get(f"/api/v1/chats/{ajeno.id}").status_code == 404
     jids = {c["jid"] for c in cliente_a.get("/api/v1/chats").get_json()["chats"]}
-    assert huerfano.jid not in jids
+    assert ajeno.jid not in jids
 
 
 def test_un_usuario_sin_cuenta_de_whatsapp_no_ve_ningun_chat(

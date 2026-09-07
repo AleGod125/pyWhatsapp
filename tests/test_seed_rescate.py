@@ -52,8 +52,8 @@ class _DatabaseDeSesion:
         return scope()
 
 
-def _chat_esperando(session, jid: str) -> Chat:
-    chat = Chat(jid=jid, chat_type="individual", name="Conversacion sin historial")
+def _chat_esperando(session, cuenta, jid: str) -> Chat:
+    chat = Chat(jid=jid, chat_type="individual", name="Conversacion sin historial", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -71,16 +71,18 @@ def _colector(session, cuenta, usuario) -> RecentSeedCollector:
 
 
 @pytest.fixture
-def escenario(session, runtime):
-    """Una conversacion que espera, con dueno real, lista para recibir anclas."""
-    from app.models import WhatsAppAccount
+def escenario(session, runtime, cuenta):
+    """Una conversacion que espera, con dueno real, lista para recibir anclas.
 
-    cuenta = session.execute(select(WhatsAppAccount)).scalars().first()
-    assert cuenta is not None, "el runtime de pruebas debe traer una cuenta"
+    La cuenta la trae la fixture, no se rebusca en la base. Antes se cogia
+    "la primera que hubiera", que en la practica era la cuenta REAL de quien
+    ejecutaba la suite: la prueba pasaba prestada y dejaba de pasar en cuanto
+    la maquina no tenia ningun WhatsApp vinculado.
+    """
     # Un identificador propio de cada ejecucion: la suite comparte base con el
     # entorno local, donde la conversacion del caso real ya existe.
     jid = f"{uuid.uuid4().int % 10**15}@lid"
-    chat = _chat_esperando(session, jid)
+    chat = _chat_esperando(session, cuenta, jid)
     return {
         "session": session,
         "chat": chat,

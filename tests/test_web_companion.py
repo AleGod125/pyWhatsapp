@@ -56,10 +56,10 @@ class _SupervisorFalso:
 
 
 @pytest.fixture
-def esperando(session):
+def esperando(session, cuenta):
     """Una conversacion sin ancla, que es el caso que motiva todo esto."""
     jid = f"5730{uuid.uuid4().hex[:8]}@s.whatsapp.net"
-    chat = Chat(jid=jid, chat_type="individual")
+    chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
     session.add(chat)
     session.flush()
     session.add(
@@ -195,7 +195,7 @@ def test_un_candidato_malo_de_Node_lo_rechaza_Python(session, esperando, cambio,
     assert any(esperado in motivo for motivo in resultado["rejections"])
 
 
-def test_un_candidato_de_un_chat_que_no_existe_se_rechaza(session, esperando):
+def test_un_candidato_de_un_chat_que_no_existe_se_rechaza(session, cuenta, esperando):
     """WhatsApp Web ve mas conversaciones que este backend. No se inventan."""
     resultado = WebCompanionProbe(
         _DatabaseDeSesion(session),
@@ -207,12 +207,12 @@ def test_un_candidato_de_un_chat_que_no_existe_se_rechaza(session, esperando):
     assert "python:la conversacion no existe en esta cuenta" in resultado["rejections"]
 
 
-def test_un_candidato_por_LID_encuentra_su_conversacion(session, esperando):
+def test_un_candidato_por_LID_encuentra_su_conversacion(session, cuenta, esperando):
     """Telefono y LID son el mismo contacto: se usa el resolutor de siempre."""
     from app.models import Contact
 
     lid = f"9998{uuid.uuid4().hex[:8]}@lid"
-    session.add(Contact(jid=esperando.jid, lid=lid))
+    session.add(Contact(jid=esperando.jid, lid=lid, whatsapp_account_id=cuenta.id))
     session.flush()
 
     resultado = WebCompanionProbe(
