@@ -486,7 +486,7 @@ class PendingRecheckService:
         with self._database.transaction() as session:
             filas = session.execute(
                 select(Chat.id, Chat.name, Chat.jid)
-                .join(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+                .join(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
                 .where(ChatHistoryState.history_status.in_(SEEDLESS_STATUSES))
                 .order_by(Chat.id)
             ).all()

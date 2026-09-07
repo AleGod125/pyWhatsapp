@@ -157,12 +157,22 @@ def _chat(session, cuenta, jid, *, mensajes=5):
     return chat
 
 
-def _peticion(session, jid, estado):
+def _peticion(session, chat, estado):
+    """Una peticion de historial, con su CHAT.
+
+    Se pasa el chat entero y no solo el jid: `chat_id` es lo que ata la
+    peticion a una cuenta, y produccion siempre lo escribe
+    (`_record_request(chat_id, chat_jid, cursor)`). Sin el, la fila no se
+    puede atribuir a nadie y el historial de respuestas la deja fuera -- que
+    es lo correcto, porque contarla para todas las cuentas es exactamente el
+    cruce que se esta evitando.
+    """
     from app.models import HistoryRequest
 
     session.add(
         HistoryRequest(
-            chat_jid=jid,
+            chat_id=chat.id,
+            chat_jid=chat.jid,
             status=estado,
             cursor_message_id="AC7B0102030405060708090A0B0C24EB",
             cursor_timestamp=1_760_000_000,
@@ -182,9 +192,9 @@ def test_se_prueba_con_quien_YA_contesto(backfill, session, monkeypatch, cuenta)
     malo = "573002220000@s.whatsapp.net"
     chat_bueno = _chat(session, cuenta, bueno, mensajes=3)
     chat_malo = _chat(session, cuenta, malo, mensajes=40)  # más mensajes: antes ganaba
-    _peticion(session, bueno, "received")
+    _peticion(session, chat_bueno, "received")
     for _ in range(2):
-        _peticion(session, malo, "timeout")
+        _peticion(session, chat_malo, "timeout")
 
     monkeypatch.setattr(
         backfill,
@@ -208,7 +218,7 @@ def test_entre_desconocidos_se_prefiere_al_que_menos_ha_fallado(
     chat_uno = _chat(session, cuenta, uno)
     chat_otro = _chat(session, cuenta, otro)
     for _ in range(3):
-        _peticion(session, uno, "timeout")
+        _peticion(session, chat_uno, "timeout")
 
     monkeypatch.setattr(
         backfill,

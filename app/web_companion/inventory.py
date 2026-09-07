@@ -346,7 +346,7 @@ class WebInventoryService:
             with self._runtime.database.transaction() as sesion:
                 consulta = select(Chat.jid, ChatHistoryState.history_status).join(
                     ChatHistoryState,
-                    ChatHistoryState.chat_jid == Chat.jid,
+                    ChatHistoryState.chat_id == Chat.id,
                     isouter=True,
                 )
                 if cuenta is not None:

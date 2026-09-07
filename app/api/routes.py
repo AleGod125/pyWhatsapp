@@ -167,10 +167,14 @@ def session_state():
     endpoint es justo lo que el frontend consulta para orientarse, y negarselo
     lo dejaria sin saber que mostrar. Se dice la verdad en el cuerpo.
     """
-    rt = runtime()
-    cuerpo = state_to_json(rt)
-
-    cuentas = getattr(rt, "whatsapp_accounts", None)
+    # EL ESTADO ES EL DE MI RUNTIME, NO EL DEL PROCESO.
+    #
+    # `runtime()` devuelve el de quien vinculara primero en esta maquina. Con
+    # dos personas, a la segunda se le contaba el estado de la primera:
+    # CONNECTED, su fase de sincronizacion, su generacion de codigo QR. Los
+    # tres campos de acceso se corregian despues a mano, pero el resto del
+    # cuerpo seguia siendo ajeno.
+    mio = runtime_de_mi_cuenta()
     yo = usuario_actual()
 
     # De quien es esta vinculacion se decide por MEMBRESIA, no por el estado
@@ -187,11 +191,12 @@ def session_state():
     # vinculado, cualquier B recibia el estado de A. Un respaldo que responde
     # con los datos de otro es peor que no tener respaldo.
     de_otro = False
-    if yo is not None and rt.database is not None:
+    base = runtime()  # solo por la base de datos, que es del proceso
+    if yo is not None and base.database is not None:
         try:
             from app.auth.memberships import cuenta_efectiva_de
 
-            with rt.database.transaction() as sesion_db:
+            with base.database.transaction() as sesion_db:
                 mia = cuenta_efectiva_de(sesion_db, yo.id)
             # Sin cuenta propia esta persona no tiene vinculacion, haya lo que
             # haya conectado en la maquina.
@@ -199,6 +204,19 @@ def session_state():
         except Exception:  # noqa: BLE001 - ante la duda, se pide vincular
             log.debug("No se pudo resolver la membresia; se pedira vincular")
             de_otro = True
+
+    # El cuerpo se construye DESPUES de saber si hay cuenta propia.
+    #
+    # Sin ella no se recorta el estado ajeno campo a campo --eso deja pasar
+    # todo lo que nadie se acuerde de recortar--: sencillamente no se mira ese
+    # runtime. Se responde el estado de "no hay vinculacion", que es la verdad
+    # para esta persona.
+    if mio is None:
+        from app.api.serializers import estado_sin_vinculacion
+
+        cuerpo = estado_sin_vinculacion(base)
+    else:
+        cuerpo = state_to_json(mio)
 
     # No se dice de QUIEN es: ni nombre, ni telefono, ni nada suyo.
     cuerpo["owned_by_another_user"] = de_otro
@@ -443,6 +461,31 @@ def _asegurar_cuenta_de_whatsapp(rt):
     return cuentas.asegurar_cuenta(usuario_actual().id)
 
 
+def _mi_runtime(*, crear: bool = False):
+    """El runtime de MI cuenta de WhatsApp, o ``(None, respuesta de error)``.
+
+    Es el resolutor que tiene que usar TODA ruta que toque una sesion de
+    WhatsApp: emparejamiento, codigo QR, estado, sincronizacion, historial,
+    multimedia, recuperacion y eventos.
+
+    `runtime()` --el del proceso-- sirve para infraestructura: base de datos,
+    ajustes, salud, y saber si este backend trae WhatsApp. Para cualquier otra
+    cosa entrega el runtime de quien vinculara primero en la maquina, que con
+    dos personas es el de otro.
+
+    Quien no tiene cuenta recibe 409 y no el runtime de al lado: "no tienes
+    vinculacion" es la respuesta correcta, "toma la de tu companero" no.
+    """
+    rt = runtime_de_mi_cuenta(crear=crear)
+    if rt is None:
+        return None, _error_code(
+            "PAIRING_REQUIRED",
+            "Todavia no tienes una cuenta de WhatsApp vinculada.",
+            409,
+        )
+    return rt, None
+
+
 # `_conflicto_de_sesion()` ESTUVO AQUI Y SE HA IDO.
 #
 # Preguntaba dos cosas --de quien es el runtime de este proceso, y quien tiene
@@ -674,7 +717,11 @@ def chat_history_recheck(chat_id: int):
     recibe un ACK y despues nada, que es exactamente el fallo que mas costo
     diagnosticar.
     """
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     if rt.database is None:
         return _error("la base de datos no esta disponible", 503)
 
@@ -801,7 +848,11 @@ def media_retry(media_id: int):
 
     from app.models import MediaFile
 
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     sesion = _session()
     if sesion is None:
         return _error("la base de datos no esta disponible", 503)
@@ -1099,7 +1150,18 @@ def media_thumbnail(media_id: int):
 @requiere_drive
 def sync_status():
     """Progreso del trabajo de fondo Y del ciclo manual. Nunca bloquea."""
-    rt = runtime()
+    # De LECTURA: sin cuenta propia no se responde 409 --el frontend sondea
+    # esto y se quedaria sin saber que mostrar-- pero tampoco se cuenta la
+    # sincronizacion de otro. Se dice que no hay nada que sincronizar, que es
+    # la verdad para quien todavia no ha vinculado.
+    rt = runtime_de_mi_cuenta()
+    if rt is None:
+        from app.api.serializers import estado_sin_vinculacion
+
+        return jsonify(
+            {"state": "IDLE", "session": estado_sin_vinculacion(runtime())}
+        )
+
     cuerpo = sync_to_json(rt)
     cuerpo["session"] = state_to_json(rt)
 
@@ -1146,26 +1208,22 @@ def sync_status():
         "responses": int(getattr(acumulado, "responses_received", 0) or 0),
         "inserted_from_history": int(getattr(acumulado, "messages_new", 0) or 0),
     }
+    # Las cifras son de MIS cuentas, no de las de la maquina. Sin acotar, el
+    # panel de una persona ensenaba totales que incluian las conversaciones y
+    # los adjuntos de otra.
     if rt.database is not None:
         try:
             sesion2 = rt.database.session()
             try:
-                cuerpo["chats"] = repo.history_counters(sesion2)
+                mias = ownership.cuentas_de(sesion2, usuario_actual().id)
+                cuerpo["chats"] = repo.history_counters(sesion2, accounts=mias)
+                media = repo.media_stats(sesion2, accounts=mias)
             finally:
                 sesion2.close()
-        except Exception:  # noqa: BLE001 - las metricas no pueden reventar
-            log.debug("No se pudieron leer las metricas de chats")
-    if rt.database is not None:
-        try:
-            sesion = rt.database.session()
-            try:
-                media = repo.media_stats(sesion)
-            finally:
-                sesion.close()
             cuerpo["media"] = media
             cuerpo["media_pending"] = int(media.get("pending", 0))
-        except Exception:  # noqa: BLE001 - el estado no puede reventar
-            log.debug("No se pudieron leer las cifras de multimedia")
+        except Exception:  # noqa: BLE001 - las metricas no pueden reventar
+            log.debug("No se pudieron leer las metricas del panel")
     return jsonify(cuerpo)
 
 
@@ -1187,7 +1245,11 @@ def sync_run():
     """
     from app.services.sync_job import SyncAlreadyRunningError, SyncUnavailableError
 
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     trabajo = getattr(rt, "sync_job", None)
     if trabajo is None:
         return _error_code(
@@ -1239,7 +1301,11 @@ def onboarding_recovery():
         razon_no_lista,
     )
 
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     # La conexion principal manda, y se pregunta ENTERA. Que el estado diga
     # CONNECTED no basta: un emparejamiento a medias deja el objeto en pie sin
     # identidad ni Signal, y con eso no se puede excavar nada. Se evalua aqui,
@@ -1373,7 +1439,11 @@ def sync_full_recovery():
     """
     from app.services.sync_job import SyncAlreadyRunningError, SyncUnavailableError
 
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     trabajo = getattr(rt, "sync_job", None)
     if trabajo is None:
         return _error_code(
@@ -1423,7 +1493,11 @@ def chat_history_retry(chat_id: int):
     from app.history.cursor import get_valid_history_cursor
     from app.models import Chat, ChatHistoryState
 
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     if rt.database is None:
         return _error("la base de datos no esta disponible", 503)
 
@@ -1611,6 +1685,18 @@ def _ahora_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
+def _latidos():
+    """Solo el paso del tiempo, para quien no tiene bus que escuchar.
+
+    Imita la forma de ``EventBus.stream``: entrega ``None`` cada segundo, que
+    es lo que el bucle interpreta como "no ha pasado nada". Asi el codigo del
+    stream es el mismo con bus y sin el.
+    """
+    while True:
+        time.sleep(1.0)
+        yield None
+
+
 def eventos_para(evento: Any, rt: Any) -> list[tuple[str, Any]]:
     """Todos los eventos SSE que produce UN evento interno.
 
@@ -1684,14 +1770,36 @@ def events_stream():
     def generar():
         # Estado completo de entrada: quien se conecta a mitad tiene que saber
         # donde esta, no esperar al siguiente cambio.
-        yield _sse("session.state", state_to_json(rt))
+        #
+        # Sin cuenta propia, el estado NEUTRO. Antes se mandaba
+        # `state_to_json(base)` -- el de quien vinculara primero en la maquina
+        # -- y era lo primero que recibia un navegador recien conectado.
+        from app.api.serializers import estado_sin_vinculacion
+
+        yield _sse(
+            "session.state",
+            estado_sin_vinculacion(base) if sin_cuenta else state_to_json(rt),
+        )
         if es_dueno and not sin_cuenta:
             yield _sse("sync.status", sync_to_json(rt))
             if rt.pairing is not None and rt.pairing.available:
                 yield _sse("session.qr", qr_to_json(rt))
 
         ultimo_latido = time.monotonic()
-        for evento in rt.bus.stream(timeout=1.0):
+        # SIN CUENTA NO SE ENGANCHA A NINGUN BUS.
+        #
+        # Antes se escuchaba `rt.bus` --que sin cuenta propia era el del
+        # runtime base, o sea el de quien hubiera vinculado primero-- y el
+        # aislamiento lo sostenia el filtro por nombre de evento de mas abajo.
+        # Eso es tapar, no aislar: basta un evento nuevo que no empiece por uno
+        # de los prefijos conocidos para que empiece a llegarle a quien no
+        # debe, y nadie se entera hasta que pasa.
+        #
+        # Quien no tiene vinculacion no tiene nada que escuchar. Se le manda el
+        # latido, que es lo que mantiene viva la conexion y le dice al frontend
+        # que el backend responde.
+        bus = None if sin_cuenta else rt.bus
+        for evento in _latidos() if bus is None else bus.stream(timeout=1.0):
             ahora = time.monotonic()
             if evento is None:
                 if ahora - ultimo_latido >= SSE_HEARTBEAT:
@@ -1704,8 +1812,18 @@ def events_stream():
                         "heartbeat",
                         {
                             "ts": _ahora_iso(),
-                            "session_state": rt.state.state.value,
-                            "sync_state": getattr(rt, "sync_state", "IDLE"),
+                            # Sin cuenta no se cuenta el estado de otro runtime,
+                            # ni siquiera en el latido.
+                            "session_state": (
+                                "PAIRING_REQUIRED"
+                                if sin_cuenta
+                                else rt.state.state.value
+                            ),
+                            "sync_state": (
+                                "IDLE"
+                                if sin_cuenta
+                                else getattr(rt, "sync_state", "IDLE")
+                            ),
                         },
                     )
                 continue
@@ -1773,9 +1891,13 @@ def _web_bootstrap_apagado():
     )
 
 
-def _recovery():
-    """El servicio de recuperacion, creado una sola vez por proceso."""
-    rt = runtime()
+def _recovery(rt):
+    """El servicio de recuperacion de ESE runtime, creado una sola vez.
+
+    Uno por CUENTA, no por proceso: publica en `rt.bus` y trabaja sobre la
+    sesion de WhatsApp de esa cuenta. Cacheado en el runtime base, la cuenta B
+    habria recuperado historial publicando en el bus de A.
+    """
     existente = getattr(rt, "history_recovery", None)
     if existente is not None:
         return existente
@@ -1789,11 +1911,11 @@ def _recovery():
 
 def _lanzar_recuperacion(chat_id: int | None):
     """Arranca un intento y devuelve su estado. Comun a las dos entradas."""
-    rt = runtime()
-    if rt.database is None:
-        return _error("la base de datos no esta disponible", 503)
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
 
-    servicio = _recovery()
+    servicio = _recovery(rt)
     disponible, motivo = servicio.provider.available()
     if not disponible:
         return _error_code(
@@ -1845,7 +1967,10 @@ def recover_pending_status(job_id: str):
     if apagado is not None:
         return apagado
 
-    trabajo = _recovery().get(job_id)
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
+    trabajo = _recovery(rt).get(job_id)
     if trabajo is None:
         return _error("trabajo no encontrado", 404)
     return jsonify(trabajo.to_json())
@@ -1867,9 +1992,17 @@ def chat_history_recover(chat_id: int):
     if sesion is None:
         return _error("la base de datos no esta disponible", 503)
     try:
+        # LA PROPIEDAD, ANTES QUE NADA. Faltaba: con el id de una conversacion
+        # ajena en la URL se lanzaba una recuperacion sobre ella. Se responde
+        # 404 y no 403, que confirmaria que ese id existe.
+        if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
+            return _error("chat no encontrado", 404)
         fila = sesion.execute(
             select(Chat.jid, ChatHistoryState.history_status)
-            .outerjoin(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+            # Por `chat_id`, no por `chat_jid`: el jid se repite en cuanto dos
+            # cuentas tienen el mismo contacto, y esta union traia el estado de
+            # historial de la conversacion de OTRA persona.
+            .outerjoin(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
             .where(Chat.id == chat_id)
         ).first()
     finally:
@@ -1905,7 +2038,10 @@ def web_bootstrap_qr():
 
     from app.core.qr_render import render_qr
 
-    servicio = _recovery()
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
+    servicio = _recovery(rt)
     activo = servicio.active_job()
     payload = getattr(activo, "qr_payload", None) if activo else None
     if not payload:
@@ -1933,7 +2069,10 @@ def web_bootstrap_session():
     if apagado is not None:
         return apagado
 
-    servicio = _recovery()
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
+    servicio = _recovery(rt)
     disponible, motivo = servicio.provider.available()
     return jsonify(
         {
@@ -1956,7 +2095,10 @@ def web_bootstrap_forget():
     if apagado is not None:
         return apagado
 
-    return jsonify({"removed": _recovery().provider.forget()})
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
+    return jsonify({"removed": _recovery(rt).provider.forget()})
 
 
 # ---------------------------------------------------------------------------
@@ -1968,9 +2110,12 @@ def web_bootstrap_forget():
 # WhatsApp YA entrego. No vincula ningun dispositivo ni pide un segundo QR.
 
 
-def _recheck_pendientes():
-    """El servicio de revision, creado una sola vez por proceso."""
-    rt = runtime()
+def _recheck_pendientes(rt):
+    """El servicio de revision de ESE runtime, creado una sola vez.
+
+    Uno por CUENTA, no por proceso: publica en `rt.bus` y revisa las
+    conversaciones de esa cuenta.
+    """
     existente = getattr(rt, "pending_recheck", None)
     if existente is not None:
         return existente
@@ -1994,12 +2139,16 @@ def history_recheck_pending():
     espera entre ejecuciones y, si ya hay una en marcha, devuelve ESA en vez de
     fallar. Sin el parametro es el boton, que se ejecuta siempre.
     """
-    rt = runtime()
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
     if rt.database is None:
         return _error("la base de datos no esta disponible", 503)
 
     auto = request.args.get("auto", "").lower() in ("1", "true", "yes")
-    servicio = _recheck_pendientes()
+    servicio = _recheck_pendientes(rt)
     try:
         trabajo = servicio.start(rt, auto=auto)
     except RuntimeError as exc:
@@ -2019,7 +2168,10 @@ def history_recheck_pending():
 @requiere_drive
 def history_recheck_pending_status(job_id: str):
     """Progreso de la revision, para quien no pueda usar SSE."""
-    trabajo = _recheck_pendientes().get(job_id)
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
+    trabajo = _recheck_pendientes(rt).get(job_id)
     if trabajo is None:
         return _error("trabajo no encontrado", 404)
     return jsonify(trabajo.to_json())
@@ -2048,9 +2200,11 @@ def chat_history_priority(chat_id: int):
     poder excavarse por mucha prioridad que tenga: se queda esperando
     referencia, y se dice tal cual en la respuesta.
     """
-    rt = runtime()
-    if rt.database is None:
-        return _error("la base de datos no esta disponible", 503)
+    # El runtime de MI cuenta. `runtime()` entrega el de quien vinculara
+    # primero en esta maquina, que con dos personas es el de otro.
+    rt, fallo = _mi_runtime()
+    if fallo is not None:
+        return fallo
 
     sesion = _session()
     if sesion is None:

@@ -200,6 +200,22 @@ async def resolve_lids_via_usync(client: Any, database: Database, *, batch: int 
         if updates:
             with database.transaction() as session:
                 for contact_jid, lid_jid in updates:
+                    # SIN ACOTAR POR CUENTA, Y ES CORRECTO. Por que:
+                    #
+                    # La correspondencia PN<->LID es una propiedad GLOBAL de
+                    # WhatsApp, no de una cuenta: un telefono tiene el mismo
+                    # LID mire quien lo mire. El valor que escribe una cuenta
+                    # es identico al que escribiria cualquier otra.
+                    #
+                    # Ademas solo rellena NULOS --el `pending` de arriba pide
+                    # `Contact.lid IS NULL`-- y solo toca esa columna: ni
+                    # nombre, ni mensajes, ni nada que distinga a una persona
+                    # de otra. Asi que no puede contaminar: no hay ningun dato
+                    # de una cuenta viajando a otra, solo un identificador
+                    # publico que ya era cierto para las dos.
+                    #
+                    # Acotarlo obligaria a que cada cuenta repitiera el mismo
+                    # usync para escribir el mismo valor.
                     session.execute(
                         update(Contact)
                         .where(Contact.jid == contact_jid)

@@ -186,6 +186,48 @@ def owner_to_json(runtime: Any) -> dict[str, Any]:
     }
 
 
+def estado_sin_vinculacion(base: Any) -> dict[str, Any]:
+    """El estado que ve quien todavia NO tiene cuenta de WhatsApp.
+
+    POR LISTA BLANCA, Y ESO ES LO IMPORTANTE
+    ----------------------------------------
+    Los campos del PROCESO --si este backend trae WhatsApp, que proceso tiene
+    el cerrojo-- se toman del runtime base, porque son ciertos para todo el
+    mundo. Todo lo que describe una SESION se responde en su valor neutro.
+
+    Al reves --coger el estado de otra cuenta y tapar los campos delicados-- es
+    lo que habia, y deja pasar todo lo que nadie se acuerde de tapar: cada
+    campo que se anada al serializador seria una fuga silenciosa. Aqui hay que
+    anadir a proposito lo que se comparte.
+
+    No se responde 409 porque esto es lo que el frontend consulta para saber a
+    donde ir; negarselo lo dejaria sin saber que mostrar.
+    """
+    cuerpo: dict[str, Any] = {
+        "state": "PAIRING_REQUIRED",
+        "connected": False,
+        "linked": False,
+        "pairing_required": True,
+        "pairing_in_progress": False,
+        "qr_available": False,
+        "viewer_allowed": False,
+        "generation": 0,
+        "session_file_present": False,
+        "owner": None,
+        "decrypt_errors": 0,
+        "pairing_phase": "pairing_required",
+        "session_rejections": 0,
+        "session_rejections_max": 3,
+    }
+    # Del PROCESO, no de ninguna cuenta: los dos unicos grupos que se comparten.
+    try:
+        cuerpo["whatsapp_enabled"] = base.info().whatsapp_enabled
+    except Exception:  # noqa: BLE001 - un estado no puede reventar por esto
+        cuerpo["whatsapp_enabled"] = False
+    cuerpo.update(owner_to_json(base))
+    return cuerpo
+
+
 def state_to_json(runtime: Any) -> dict[str, Any]:
     """Estado de la sesion. Nunca deduce "conectado" de que exista un archivo.
 

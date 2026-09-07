@@ -287,7 +287,14 @@ class IncomingMessage:
 def bulk_upsert_messages(
     session: Session, chat_ids: dict[str, int], messages: Sequence[IncomingMessage]
 ) -> int:
-    """Inserta un lote deduplicando por ``(chat_jid, whatsapp_message_id)``.
+    """Inserta un lote deduplicando por ``(chat_id, whatsapp_message_id)``.
+
+    Por ``chat_id`` y no por ``chat_jid``: un mensaje de grupo lleva el MISMO
+    identificador para todos los que lo reciben, asi que deduplicando por el
+    jid el que le llega a la segunda cuenta se descartaria como duplicado del
+    de la primera -- en silencio, sin error, y sin forma de notarlo hasta que
+    alguien echa de menos una conversacion entera. `chat_id` ya es de una sola
+    cuenta, asi que la deduplicacion queda acotada sola.
 
     Devuelve cuantas filas se insertaron de verdad (las que ya existian no
     cuentan). Un unico INSERT para todo el lote: sin commit por mensaje.
@@ -561,9 +568,12 @@ def list_chat_summaries(
             func.coalesce(message_counts.c.total, 0),
             ChatHistoryState.history_status,
         )
-        .outerjoin(Contact, (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid))
+        .outerjoin(Contact, (
+                (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
+            )
+            & (Contact.whatsapp_account_id == Chat.whatsapp_account_id))
         .outerjoin(message_counts, message_counts.c.chat_id == Chat.id)
-        .outerjoin(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+        .outerjoin(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
         .order_by(Chat.last_message_timestamp.desc().nulls_last(), Chat.id.desc())
         .limit(limit)
     )
@@ -637,7 +647,10 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
             Contact.push_name,
             Contact.jid,
         )
-        .outerjoin(Contact, (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid))
+        .outerjoin(Contact, (
+                (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
+            )
+            & (Contact.whatsapp_account_id == Chat.whatsapp_account_id))
         .where(Chat.id == chat_id)
         .limit(1)
     ).first()
@@ -847,10 +860,26 @@ def media_for_messages(session: Session, message_ids: Iterable[int]) -> dict[int
     return {row.message_id: row for row in rows}
 
 
-def media_stats(session: Session) -> dict[str, int]:
-    """Contadores reales de multimedia, consultados a PostgreSQL."""
+def media_stats(session: Session, *, accounts: list | None = None) -> dict[str, int]:
+    """Contadores reales de multimedia, consultados a PostgreSQL.
+
+    ``accounts`` acota a las cuentas de WhatsApp de un usuario, y no es
+    opcional en la practica: sin el, esto contaba los adjuntos de TODAS las
+    cuentas de la maquina y el panel de una persona ensenaba cifras que
+    incluian los de otra. Se llega por `chat_id`, que es de una sola cuenta.
+
+    Sin ``accounts`` se devuelve vacio en vez de contarlo todo: quedarse sin
+    cifras se ve y se arregla; ensenar las de otro, no.
+    """
+    if accounts is None:
+        return {}
+    if not accounts:
+        return {}
     rows = session.execute(
-        select(MediaFile.download_status, func.count()).group_by(MediaFile.download_status)
+        select(MediaFile.download_status, func.count())
+        .join(Chat, Chat.id == MediaFile.chat_id)
+        .where(Chat.whatsapp_account_id.in_(accounts))
+        .group_by(MediaFile.download_status)
     ).all()
     return {status: total for status, total in rows}
 
@@ -888,7 +917,7 @@ def history_state_for(session: Session, chat_jid: str) -> Any | None:
     ).first()
 
 
-def history_counters(session: Session) -> dict[str, int]:
+def history_counters(session: Session, *, accounts: list | None = None) -> dict[str, int]:
     """Cuantos chats hay en cada situacion historica.
 
     Se agrupan por lo que SIGNIFICAN, no por el nombre interno del estado:
@@ -897,9 +926,27 @@ def history_counters(session: Session) -> dict[str, int]:
     """
     from app.models import COMPLETE_STATUSES, SEEDLESS_STATUSES
 
+    # ACOTADO A LAS CUENTAS DE QUIEN PREGUNTA.
+    #
+    # Sin esto se contaban los chats de TODAS las cuentas de la maquina, y el
+    # panel de una persona ensenaba un total que incluia las conversaciones de
+    # otra. Se llega por `chat_id`, que pertenece a una sola cuenta.
+    if not accounts:
+        return {
+            "chats_total": 0,
+            "chats_complete": 0,
+            "chats_fetching": 0,
+            "chats_pending": 0,
+            "chats_waiting_seed": 0,
+            "chats_no_cursor": 0,
+            "chats_empty_confirmed": 0,
+            "chats_seedless": 0,
+        }
     crudos = dict(
         session.execute(
             select(ChatHistoryState.history_status, func.count())
+            .join(Chat, Chat.id == ChatHistoryState.chat_id)
+            .where(Chat.whatsapp_account_id.in_(accounts))
             .group_by(ChatHistoryState.history_status)
         ).all()
     )

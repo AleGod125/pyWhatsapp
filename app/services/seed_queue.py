@@ -255,7 +255,7 @@ class SeedBackfillQueue:
         with self._database.transaction() as session:
             fila = session.execute(
                 select(Chat.id, ChatHistoryState.history_status)
-                .outerjoin(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+                .outerjoin(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
                 .where(Chat.jid == chat_jid)
             ).first()
             if fila is None:

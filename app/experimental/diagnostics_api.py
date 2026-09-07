@@ -499,7 +499,7 @@ def _emparejar_con_fantasmas(rt: Any, informe: Any) -> list[dict[str, Any]]:
         with rt.database.transaction() as sesion:
             dormidos = sesion.execute(
                 select(Chat.id, Chat.jid, Chat.name).join(
-                    ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid
+                    ChatHistoryState, ChatHistoryState.chat_id == Chat.id
                 ).where(ChatHistoryState.history_status.in_(tuple(SEEDLESS_STATUSES)))
             ).all()
     except Exception:  # noqa: BLE001

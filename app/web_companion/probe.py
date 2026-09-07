@@ -101,7 +101,7 @@ class WebCompanionProbe:
         with self._database.transaction() as sesion:
             consulta = (
                 select(Chat.id, Chat.jid)
-                .join(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+                .join(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
                 .where(ChatHistoryState.history_status.in_(SEEDLESS_STATUSES))
             )
             if account_id is not None:

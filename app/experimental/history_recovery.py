@@ -309,9 +309,12 @@ class HistoryRecoveryService:
         with self._database.transaction() as sesion:
             consulta = (
                 select(Chat.id, Chat.jid, Chat.name, Contact.display_name)
-                .join(ChatHistoryState, ChatHistoryState.chat_jid == Chat.jid)
+                .join(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
                 .outerjoin(
-                    Contact, (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
+                    Contact, (
+                (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
+            )
+            & (Contact.whatsapp_account_id == Chat.whatsapp_account_id)
                 )
                 .where(
                     ChatHistoryState.history_status.in_(tuple(SEEDLESS_STATUSES))

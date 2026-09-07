@@ -616,13 +616,32 @@ class BackfillService:
         """
         try:
             with self._database.transaction() as session:
-                filas = session.execute(
+                # ACOTADO A MI CUENTA, y no es un detalle.
+                #
+                # Esto se agrupaba por `chat_jid` a secas. En cuanto dos
+                # cuentas tienen el mismo contacto, el jid se repite: la
+                # excavacion de B leia el historial de peticiones de A sobre
+                # ESE contacto y elegia con el. No filtra mensajes, pero hace
+                # que una cuenta tome decisiones con la evidencia de otra, que
+                # es justo lo que el aislamiento tiene que impedir.
+                #
+                # Se acota por el chat, que es de una sola cuenta. Las filas
+                # antiguas sin `chat_id` quedan fuera: no se pueden atribuir a
+                # nadie, y contarlas para todos seria volver al mismo cruce.
+                consulta = (
                     select(
                         HistoryRequest.chat_jid,
                         HistoryRequest.status,
                         func.count(),
-                    ).group_by(HistoryRequest.chat_jid, HistoryRequest.status)
-                ).all()
+                    )
+                    .join(Chat, Chat.id == HistoryRequest.chat_id)
+                    .group_by(HistoryRequest.chat_jid, HistoryRequest.status)
+                )
+                if self.whatsapp_account_id is not None:
+                    consulta = consulta.where(
+                        Chat.whatsapp_account_id == self.whatsapp_account_id
+                    )
+                filas = session.execute(consulta).all()
         except Exception:  # noqa: BLE001 - sin historial se elige como antes
             log.debug("No se pudo leer el historial de peticiones", exc_info=True)
             return {}
@@ -2046,9 +2065,27 @@ class BackfillService:
                 log.debug("Misma sesion de extraccion; no hace falta revalidar")
                 return 0
 
+            # SOLO LAS DE ESTA CUENTA.
+            #
+            # Sin el filtro, una cuenta que estrena sesion de extraccion
+            # reabria los chats agotados de TODAS: la otra persona veia su
+            # historial --que ya estaba completo-- volver a "pendiente" y se
+            # reexcavaba entero. La clave de `app_state` ya iba por cuenta;
+            # este UPDATE no.
+            condiciones = [
+                ChatHistoryState.history_status.in_(("exhausted", "server_limited"))
+            ]
+            if self.whatsapp_account_id is not None:
+                condiciones.append(
+                    ChatHistoryState.chat_id.in_(
+                        select(Chat.id).where(
+                            Chat.whatsapp_account_id == self.whatsapp_account_id
+                        )
+                    )
+                )
             reopened = session.execute(
                 update(ChatHistoryState)
-                .where(ChatHistoryState.history_status.in_(("exhausted", "server_limited")))
+                .where(*condiciones)
                 .values(
                     history_status="pending",
                     consecutive_no_progress=0,
