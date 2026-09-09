@@ -1,0 +1,135 @@
+<aside class="sidebar">
+  <header>
+    <div>
+      <h1>WhatsApp Backup</h1>
+    </div>
+    <!-- Era un boton sin manejador. Ahora abre el menu de verdad. -->
+    <app-header-menu
+      [sincronizando]="sincronizando()"
+      (sincronizar)="sincronizar.emit()"
+    />
+  </header>
+  <div class="search">
+    <span>⌕</span
+    ><input
+      aria-label="Buscar un chat"
+      placeholder="Buscar un chat"
+      [ngModel]="query()"
+      (ngModelChange)="updateSearch($event)"
+    />
+  </div>
+  <div class="filters">
+    <button class="active">Todos</button><button disabled>No leídos</button
+    ><button disabled>Favoritos</button><button disabled>Grupos</button>
+  </div>
+  <!-- Las conversaciones vacías se ocultan, pero se DICEN.
+       WhatsApp reparte un aviso de cifrado a contactos con los que nunca se
+       ha hablado, y además quedan las que aún no se han excavado: de 205
+       traídas, 164 no tenían un solo mensaje escrito y tapaban las 41 de
+       verdad. Esconderlas sin contarlas sería indistinguible de una
+       extracción que no trajo nada. -->
+  @if (sinMensajes() > 0 || incluyeVacias()) {
+    <label class="solo-con-contenido">
+      <input
+        type="checkbox"
+        [checked]="!incluyeVacias()"
+        (change)="alternarVacias.emit(incluyeVacias())"
+      />
+      <span>Solo chats con contenido</span>
+      <small
+        >{{ conMensajes() }} con mensajes ({{ totalConversaciones() }} totales)</small
+      >
+    </label>
+  }
+  <!-- Empezar una excavacion de cero.
+       El fallo que cubre: la extraccion se corta --se pierde la conexion, el
+       telefono se duerme, el plazo vence antes de que llegue la respuesta-- y
+       las conversaciones afectadas quedan marcadas sin que nadie vuelva a por
+       ellas. Este boton las devuelve a la cola. No borra nada: cada una sigue
+       desde su ancla, asi que solo llega lo que falta. -->
+  @if (excavando()) {
+    <!-- Mientras dura NO hay boton, solo el aviso: la unica forma de que no
+         se pulse veinte veces es que no exista para pulsarlo. -->
+    <div class="excavando" role="status" aria-live="polite">
+      <div class="barra"><i></i></div>
+      <strong>Excavando el historial completo…</strong>
+      @if (excavacionProgreso()) {
+        <small class="progreso">{{ excavacionProgreso() }}</small>
+      }
+      <small class="aviso">
+        Puede tardar varios minutos y no hace falta que hagas nada:
+        <b>no recargues la página</b>, las conversaciones van apareciendo solas
+        a medida que llegan.
+      </small>
+    </div>
+  } @else {
+    <button
+      type="button"
+      class="excavar"
+      [disabled]="excavarBloqueado()"
+      [title]="excavarMotivo() ?? 'Vuelve a recorrer todas las conversaciones y trae lo que falte'"
+      (click)="excavarTodo.emit()"
+    >
+      <span aria-hidden="true">⛏</span> Excavar todo el historial
+    </button>
+  }
+  <!-- Los esqueletos SOLO cuando no hay nada que ensenar.
+       Antes bastaba `loading()`, y durante la extraccion eso significaba que
+       la lista entera desaparecia y volvia varias veces por segundo: cada
+       aviso de fondo la sustituia por seis rectangulos grises. Eso era el
+       parpadeo. Con conversaciones ya en pantalla, una recarga no se ve. -->
+  @if (loading() && !filtered().length) {
+    <div class="skeletons">
+      @for (i of [1, 2, 3, 4, 5, 6]; track i) {
+        <div><i></i><span></span></div>
+      }
+    </div>
+  } @else if (error()) {
+    <!-- Un fallo de red NO es "no tienes conversaciones": decir lo segundo
+         cuando pasa lo primero hace creer que se ha perdido la copia. -->
+    <div class="load-error">
+      <p>{{ error() }}</p>
+      <button type="button" (click)="retry.emit()">Reintentar</button>
+    </div>
+  } @else if (!filtered().length) {
+    <div class="no-results">No se encontraron conversaciones</div>
+  } @else {
+    <!-- Hay lista y ademas se esta recargando: se dice con una barra fina en
+         vez de vaciarlo todo. -->
+    @if (loading()) {
+      <div class="recargando" role="status" aria-label="Actualizando"></div>
+    }
+    <cdk-virtual-scroll-viewport itemSize="72" class="chat-list">
+      <button
+        *cdkVirtualFor="let chat of filtered(); trackBy: trackById"
+        class="chat"
+        [class.selected]="chat.id === selectedId()"
+        [class.entrando]="recientes().has(chat.id)"
+        (click)="select(chat)"
+      >
+        <app-avatar
+          [name]="nombreDe(chat).texto"
+          [id]="chat.id"
+          [src]="chat.avatarUrl"
+          [initialsOverride]="chat.avatar?.initials"
+          [color]="chat.avatar?.color"
+        /><span class="content"
+          ><span class="top"
+            ><strong [class.provisional]="nombreDe(chat).provisional">{{
+              nombreDe(chat).texto
+            }}</strong
+            ><time>{{ chat.lastMessageAt | date: 'HH:mm' }}</time></span
+          ><span class="bottom"
+            ><span>{{ preview(chat) }}</span>
+            @if (chat.waitingSeed || chat.historyStatus === 'waiting_seed') {
+              <em>Pendiente</em>
+            }
+            @if (chat.unreadCount) {
+              <b>{{ chat.unreadCount }}</b>
+            }
+          </span></span
+        >
+      </button></cdk-virtual-scroll-viewport
+    >
+  }
+</aside>

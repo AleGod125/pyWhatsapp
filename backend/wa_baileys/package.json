@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-backup-baileys-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Capa de WhatsApp sobre Baileys. Habla JSON Lines con service.py. SOLO LECTURA: no envia mensajes.",
+  "type": "commonjs",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.24"
+  }
+}

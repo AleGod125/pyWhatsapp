@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# whatsapp_backup - dependencias
+#
+# Versiones fijadas a lo verificado como funcional en Windows 11 + Python 3.11.9.
+#
+# NO hay cliente de WhatsApp en Python. El protocolo lo habla un proceso hijo
+# de Node sobre Baileys (``backend/wa_baileys/``, ``npm ci`` alli). Aqui
+# vivia ``pywhats==0.2.0``, que se retiro entera: era Pre-Alpha, de un solo
+# autor, con la criptografia Signal marcada por sus propios autores como NO
+# AUDITADA, y hacian falta 13 parches sobre atributos privados para usarla.
+#
+# alembic y psycopg no se importan directamente: el primero se ejecuta como
+# herramienta (``python -m alembic upgrade head``) y el segundo es el driver
+# que SQLAlchemy carga desde la URL ``postgresql+psycopg://``.
+# ---------------------------------------------------------------------------
+
+# --- Criptografia y protobuf ---
+# Las dos entraban antes como dependencias transitivas de pywhats. Se declaran
+# explicitamente porque se usan directamente: `cryptography` cifra las
+# credenciales de Google (app/auth/crypto.py) y `protobuf` lee los mensajes de
+# WhatsApp (app/wa/proto/) y los segmentos de la copia (app/models/proto/).
+cryptography==50.0.1
+protobuf==7.36.1
+
+# --- Persistencia: PostgreSQL ---
+SQLAlchemy==2.0.52
+alembic==1.19.1
+psycopg[binary]==3.3.5
+
+# --- Configuracion ---
+python-dotenv==1.2.3
+
+# --- QR / imagenes ---
+# El codigo QR lo dibujamos nosotros a partir de la cadena que da el worker.
+qrcode==8.2
+pillow==12.3.0
+
+# --- API HTTP: es el producto. service.py es el unico entrypoint. ---
+flask==3.1.3
+flask-cors==6.0.1
+
+# --- Tests ---
+pytest==9.1.1
+pytest-asyncio==1.4.0

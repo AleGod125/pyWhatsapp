@@ -1,0 +1,68 @@
+# --- Entorno / dependencias ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Configuracion con secretos ---
+.env
+.env.local
+*.env
+# Copias de .env: llevan las credenciales reales y NO las cubre `*.env`,
+# porque su nombre no acaba en .env.
+.env.*
+!.env.example
+
+# --- Estado del companion / protocolo (NUNCA versionar) ---
+session/
+*.signal.db
+*.signal.db-wal
+*.signal.db-shm
+device.json
+device.json.*
+# Cerrojo de proceso: quien tiene abierta la sesion de WhatsApp.
+runtime.lock
+
+# --- Datos de la aplicacion ---
+data/
+!data/.gitkeep
+
+# --- Diagnostico (puede contener metadata sensible) ---
+diagnostics/
+!diagnostics/.gitkeep
+
+# --- Dumps de base de datos ---
+*.sql
+*.dump
+*.backup
+
+# --- Sistema operativo / editores ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+backups/
+
+# Plan D: proveedor de semillas auxiliar. Las dependencias se instalan con
+# `npm install` dentro de web_bootstrap/, y la sesion auxiliar es una
+# vinculacion mas de la cuenta: ninguna de las dos cosas va al repositorio.
+web_bootstrap/node_modules/
+# Web Companion: dependencias de Node y su sesion (otro dispositivo vinculado)
+web_companion/node_modules/
+web_companion/session/
+session/web_bootstrap/
+session/backups/
+
+# Salida de la prueba simetrica del Plan J3.1. Va sanitizada --hashes, sin
+# texto ni identificadores-- pero es el resultado de UNA medicion en UNA
+# maquina, no codigo. El informe es lo que se guarda; esto es su materia prima.
+debug/
+
+# Cache de versiones de whatsapp-web.js. Lo descarga el worker solo y pesa
+# megas: es un artefacto de ejecucion, no codigo.
+web_companion/.wwebjs_cache/

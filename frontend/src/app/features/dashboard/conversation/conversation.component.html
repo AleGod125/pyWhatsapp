@@ -1,0 +1,92 @@
+<section class="conversation">
+  <header>
+    <app-avatar
+      [name]="nombre().texto"
+      [id]="chat().id"
+      [src]="chat().avatarUrl"
+      [initialsOverride]="chat().avatar?.initials"
+      [color]="chat().avatar?.color"
+    />
+    <div>
+      <h2 [class.provisional]="nombre().provisional">{{ nombre().texto }}</h2>
+      <!-- Un solo sitio decide el estado. Antes esta cabecera decía
+           "Historial sincronizado" mientras el centro decía que no se había
+           recuperado nada: la misma conversación, dos frases opuestas. -->
+      <p>
+        @if (chat().messageCount) {
+          <span>{{ chat().messageCount }} mensajes</span>
+          @if (chat().firstMessageAt) {
+            <span> · desde {{ chat().firstMessageAt | date: 'd MMM y' }}</span>
+          }
+        }
+        @if (estado().estado !== 'SYNCED' || !chat().messageCount) {
+          <!-- La versión corta: es una línea de cabecera. La explicación
+               larga va en el centro, donde hay sitio para leerla. -->
+          <span>{{ chat().messageCount ? ' · ' : '' }}{{ estado().etiqueta }}</span>
+        }
+      </p>
+      @if (estado().reintentable) {
+        <button class="history-retry" type="button" (click)="recheckHistory()">
+          {{ 'chat.recheck' | t }}
+        </button>
+      }
+    </div>
+    <app-chat-menu [chat]="chat()" (guardado)="avisarDeGuardado()" />
+  </header>
+  <!-- Encima del historial, no encima de la pantalla: el usuario tiene que
+       poder leer lo que ya hay mientras se recupera lo anterior. -->
+  @if (historialVisible()) {
+    <p class="recuperando" [class.quieto]="!historialGirando()" role="status">
+      @if (historialGirando()) {
+        <span class="giro" aria-hidden="true"></span>
+      }
+      <span class="que">
+        @switch (historialEstado()) {
+          @case ('recuperando') { Recuperando mensajes anteriores… }
+          @case ('reintentando') { Reintentando recuperación… }
+          @case ('esperando_referencia') {
+            Esperando una referencia de WhatsApp para recuperar mensajes anteriores.
+          }
+          @case ('error') { No se pudieron recuperar más mensajes por ahora. }
+          @default { Recuperando mensajes anteriores… }
+        }
+      </span>
+      @if (historialRecuperados() > 0) {
+        <span class="cuantos">+{{ historialRecuperados() }}</span>
+      }
+    </p>
+  }
+  <app-message-list
+    [messages]="messages()"
+    [loading]="loading()"
+    [loadingOlder]="loadingOlder()"
+    [hasMore]="hasMore()"
+    [historyStatus]="chat().historyStatus"
+    [chat]="chat()"
+    [waitingForPhone]="waitingForPhone()"
+    (loadOlder)="loadOlder()"
+    (mediaOpen)="viewer.set($event)"
+  />
+  @if (newMessages()) {
+    <button class="new-messages" (click)="showNewest()">
+      {{ newMessages() }} {{ newMessages() === 1 ? 'mensaje nuevo' : 'mensajes nuevos' }} ↓
+    </button>
+  }
+  <footer><span>🔒</span> Copia de consulta · envío de mensajes desactivado</footer>
+</section>
+@if (viewer(); as selected) {
+  <app-media-viewer
+    [media]="selected.media"
+    [type]="selected.type"
+    (close)="viewer.set(undefined)"
+  />
+}
+@if (recheckOpen()) {
+  <app-history-recheck-panel
+    [chat]="chat()"
+    [job]="recheckJob()"
+    [initialError]="recheckError()"
+    (close)="recheckOpen.set(false)"
+    (completed)="reload()"
+  />
+}

@@ -1,0 +1,39 @@
+<div #scroller class="message-scroll" (scroll)="onScroll()">
+  @if (loading()) {
+    <div class="loading">
+      @for (i of [1, 2, 3, 4, 5]; track i) {
+        <i [class.right]="i % 2 === 0"></i>
+      }
+    </div>
+  } @else {
+    @if (hasMore() && loadingOlder()) {
+      <div class="older" aria-live="polite">Cargando mensajes anteriores…</div>
+    } @else if (messages().length) {
+      <div class="history-start">Inicio del historial almacenado</div>
+    }
+    @for (message of messages(); track message.id; let index = $index) {
+      @if (dayChanged(index)) {
+        <div class="day">{{ dayLabel(message.timestamp) }}</div>
+      }
+      <app-message-bubble
+        [message]="message"
+        [grouped]="grouped(index)"
+        (openMedia)="mediaOpen.emit($event)"
+        (mediaLayoutChanged)="onMediaLayout()"
+      />
+    } @empty {
+      <!-- El texto sale de `chat-estado`, igual que el de la cabecera. Antes
+           cada uno tenía el suyo y podían contradecirse. -->
+      <div
+        class="empty pending-history"
+        [class.sin-mensajes]="vacio().estado === 'NO_MESSAGES_AVAILABLE'"
+      >
+        <span class="icono" aria-hidden="true">{{ vacio().icono }}</span>
+        <strong>{{ vacio().titulo }}</strong>
+        @if (vacio().detalle) {
+          <span>{{ vacio().detalle }}</span>
+        }
+      </div>
+    }
+  }
+</div>

@@ -1,0 +1,525 @@
+"""Carga y validacion de configuracion desde .env.
+
+Reglas de este modulo:
+
+* Ninguna ruta absoluta de una maquina concreta vive en el codigo. Todo sale
+  de ``.env`` y se resuelve contra la raiz del proyecto.
+* La password de PostgreSQL nunca se imprime ni se incluye en ``repr``.
+  Para logs se usa :meth:`Settings.safe_database_url`.
+* La validacion ocurre al arrancar y dice exactamente que variable falta.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import quote
+
+from dotenv import load_dotenv
+
+# Raiz del proyecto: la carpeta que CONTIENE el paquete ``app``.
+#
+# Se busca subiendo hasta encontrar ``app``, en vez de contar carpetas con
+# ``parent.parent``. Contarlas ata la constante a la profundidad exacta del
+# modulo, y al mover este archivo de ``app/`` a ``app/core/`` la raiz paso a
+# ser ``app/``: ``.env`` dejo de encontrarse y PostgreSQL empezo a fallar con
+# "no password supplied", sin decir en ningun momento que el problema era la
+# ruta. Asi el modulo puede moverse otra vez sin romper nada.
+def _project_root() -> Path:
+    aqui = Path(__file__).resolve()
+    for carpeta in aqui.parents:
+        if carpeta.name == "app":
+            return carpeta.parent
+    # Ultimo recurso, si algun dia el paquete cambia de nombre.
+    return aqui.parent.parent
+
+
+PROJECT_ROOT = _project_root()
+
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "off"}
+
+
+class ConfigError(RuntimeError):
+    """Configuracion ausente o invalida. El mensaje nombra la variable."""
+
+
+# ---------------------------------------------------------------------------
+# Lectores tipados
+# ---------------------------------------------------------------------------
+
+
+def _str(name: str, default: str | None = None, *, required: bool = False) -> str:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        if required:
+            raise ConfigError(
+                f"falta la variable obligatoria {name}. "
+                f"Copia .env.example a .env y completala."
+            )
+        return default if default is not None else ""
+    return raw.strip()
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ConfigError(
+        f"{name}={raw!r} no es un booleano valido. "
+        f"Usa uno de: {sorted(_TRUE_VALUES | _FALSE_VALUES)}"
+    )
+
+
+def _int(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name}={raw!r} no es un entero valido") from exc
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name}={value} debe ser >= {minimum}")
+    return value
+
+
+def _float(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name}={raw!r} no es un numero valido") from exc
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name}={value} debe ser >= {minimum}")
+    return value
+
+
+# Tope de mensajes por peticion ON_DEMAND. El servidor acota la respuesta por
+# su cuenta, asi que el valor pedido es una cota superior, no una promesa: el
+# backfill encadena peticiones hasta agotar cada chat de todos modos.
+# El limite real se descubre observando lo que devuelve (se registra en
+# history_requests.response_count), no suponiendolo.
+MAX_ON_DEMAND_COUNT = 500
+DEFAULT_ON_DEMAND_COUNT = 50
+
+
+def _history_count() -> int:
+    value = _int("HISTORY_ON_DEMAND_COUNT", DEFAULT_ON_DEMAND_COUNT, minimum=1)
+    if value > MAX_ON_DEMAND_COUNT:
+        import logging
+
+        logging.getLogger("app.config").warning(
+            "HISTORY_ON_DEMAND_COUNT=%d es mayor que el maximo razonable (%d). "
+            "El servidor acota la respuesta igualmente, asi que un valor alto no "
+            "acelera la extraccion y puede hacer que rechace la peticion. "
+            "Se usara %d; la extraccion sigue siendo completa porque encadena "
+            "peticiones hasta agotar el historial.",
+            value,
+            MAX_ON_DEMAND_COUNT,
+            MAX_ON_DEMAND_COUNT,
+        )
+        return MAX_ON_DEMAND_COUNT
+    return value
+
+
+def _path(name: str, default: str) -> Path:
+    """Resuelve una ruta del .env contra la raiz del proyecto.
+
+    Una ruta relativa como ``./session`` se ancla en PROJECT_ROOT para que el
+    comportamiento no dependa del directorio de trabajo. Una ruta absoluta se
+    respeta tal cual.
+    """
+    raw = _str(name, default)
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Configuracion efectiva de la aplicacion."""
+
+    # --- Aplicacion ---
+    app_env: str
+    app_debug: bool
+    log_level: str
+
+    # --- PostgreSQL ---
+    database_url: str = field(repr=False)  # contiene la password: fuera del repr
+    postgres_host: str
+    postgres_port: int
+    postgres_db: str
+    postgres_user: str
+
+    # --- Rutas ---
+    session_dir: Path
+    data_dir: Path
+    media_dir: Path
+    diagnostics_dir: Path
+    wa_version_cache: Path
+
+    # --- Companion ---
+    pairing_name: str
+    pairing_max_attempts: int
+    # Ventana de validez que se le promete al frontend para un QR, en
+    # segundos. No es la vida del ref (pywhats lo rota antes): es el tope
+    # tras el cual, si no llego uno nuevo, se pide otra vinculacion.
+    pairing_qr_ttl: float
+    # --- Historial que se pide AL VINCULAR ---
+    # Solo surte efecto en una vinculacion nueva: estos valores viajan en el
+    # DeviceProps del registro del companion. Cambiarlos con una sesion ya
+    # establecida no hace nada.
+    pairing_full_sync: bool
+    pairing_full_sync_days: int
+    pairing_full_sync_size_mb: int
+    pairing_storage_quota_mb: int
+    backfill_all_after_canary: bool
+
+    # --- History on-demand ---
+    history_on_demand_count: int
+    history_request_timeout: float
+    history_settle_seconds: float
+    max_on_demand_concurrency: int
+
+    # --- Multimedia ---
+    media_download_concurrency: int
+    # Cada cuanto revisa el worker permanente si hay adjuntos nuevos.
+    media_worker_interval: float
+
+    # --- Mantenimiento automatico ---
+    # Periodo de la reconciliacion en segundo plano. 0 la desactiva.
+    maintenance_interval_seconds: float
+
+    # --- API HTTP (service.py) ---
+    api_host: str
+    allow_remote_api: bool
+    api_port: int
+    frontend_origin: str
+
+
+    # Cada vez que se abre el panel se intenta una extraccion. Reinterpretar
+    # los blobs de decenas de chats no es gratis, asi que la automatica
+    # respeta esta espera; el boton manual no la respeta nunca. 0 la desactiva.
+    auto_recheck_cooldown_seconds: float
+
+    # --- Cuentas y autenticacion ---
+    session_cookie_name: str
+    session_lifetime_days: int
+    cookie_secure: bool
+    cookie_samesite: str
+    app_encryption_key: str | None
+    frontend_url: str
+    api_public_url: str
+
+    # --- Detalle de los registros ---
+    http_access_log: bool
+    protocol_debug: bool
+
+    # --- Almacenamiento del contenido (Google Drive) ---
+    drive_storage_enabled: bool
+    drive_message_segment_max_messages: int
+    drive_message_segment_max_bytes: int
+    drive_segment_max_age_seconds: float
+    local_media_cache_max_gb: float
+    local_media_cache_ttl_hours: int
+    max_pending_storage_bytes: int
+    storage_encryption_enabled: bool
+    storage_kek: str | None
+
+    # --- Google OAuth ---
+    google_client_id: str | None
+    google_client_secret: str | None
+    google_redirect_uri: str
+
+    # Aqui vivian las banderas de los OTROS DOS PROVEEDORES: el Web Bootstrap
+    # (una sesion auxiliar con su propio QR) y el Web Companion
+    # (whatsapp-web.js sobre Chrome, para medir), mas la instrumentacion del
+    # plan J3.1 que cronometraba los dos lados.
+    #
+    # Se retiraron enteros. Los dos pedian un SEGUNDO codigo QR al usuario y
+    # los dos venian apagados por defecto, asi que nadie los estaba usando; lo
+    # que costaban era superficie: rutas, procesos, un Chromium y un vigilante
+    # que decidia solo cuando arrancarlo.
+
+    # --- WhatsApp Web ---
+    # Cuanto esperar al resolver la version que se anuncia. Lo demas que habia
+    # aqui eran las 7 banderas COMPAT_* de pywhats: rodeaban carencias de
+    # aquella libreria y se fueron con ella.
+    wa_version_fetch_timeout: float
+    pairing_515_timeout: float
+
+    # -- Derivados -----------------------------------------------------------
+
+    @property
+    def session_dir_baileys(self) -> Path:
+        """LA UNIDAD INDIVISIBLE: credenciales y almacen de Signal juntos.
+
+        Se borra entera o no se borra. Llevarse media carpeta deja un
+        dispositivo NUEVO usando ratchets VIEJOS, y el sintoma es ``unknown
+        one-time pre-key id`` con peticiones de historial que reciben ACK y
+        despues nada.
+        """
+        return self.session_dir / "baileys"
+
+    @property
+    def session_file(self) -> Path:
+        """Las credenciales de la vinculacion.
+
+        Antes esto era el ``device.json`` de pywhats. Ahora es el
+        ``creds.json`` que escribe ``useMultiFileAuthState``: de el salen la
+        identidad propia (``me.id`` y ``me.lid``) y la huella de la sesion.
+
+        Que exista NO significa que la sesion valga: hasta que el servidor
+        acepta el login puede llegar un cierre 401.
+        """
+        return self.session_dir_baileys / "creds.json"
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.data_dir / "cache"
+
+    def safe_database_url(self) -> str:
+        """URL de PostgreSQL apta para logs, con la password sustituida.
+
+        Se opera sobre la cadena sin usar SQLAlchemy para que sea utilizable
+        aunque la URL este malformada.
+        """
+        return _redact_url(self.database_url)
+
+    def ensure_directories(self) -> None:
+        """Crea las carpetas de trabajo. Idempotente."""
+        for directory in (
+            self.session_dir,
+            self.data_dir,
+            self.media_dir,
+            self.diagnostics_dir,
+            self.cache_dir,
+            self.wa_version_cache.parent,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+
+def _redact_url(url: str) -> str:
+    """Sustituye la password de una URL por ``***``.
+
+    ``postgresql+psycopg://user:secreto@host:5432/db``
+        -> ``postgresql+psycopg://user:***@host:5432/db``
+    """
+    if "@" not in url or "//" not in url:
+        return url
+    scheme, _, rest = url.partition("//")
+    credentials, _, location = rest.rpartition("@")
+    if not credentials:
+        return url
+    user, sep, password = credentials.partition(":")
+    if not sep or not password:
+        return url
+    return f"{scheme}//{user}:***@{location}"
+
+
+def build_database_url(
+    *, host: str, port: int, database: str, user: str, password: str
+) -> str:
+    """Construye la URL de PostgreSQL a partir de las piezas POSTGRES_*.
+
+    Usuario y password se codifican para tolerar caracteres reservados
+    (``@``, ``:``, ``/``) sin romper el parseo de la URL.
+    """
+    user_part = quote(user, safe="")
+    if password:
+        user_part = f"{user_part}:{quote(password, safe='')}"
+    return f"postgresql+psycopg://{user_part}@{host}:{port}/{database}"
+
+
+def buscar_env(desde: Path | None = None, nombre: str = ".env") -> Path | None:
+    """El primer ``.env`` subiendo desde la raiz del backend. ``None`` si no hay.
+
+    ``nombre`` permite buscar tambien ``.env.example``, que vive en el mismo
+    sitio y se localiza con la misma regla: una sola forma de encontrar la
+    configuracion compartida, no dos que puedan discrepar.
+
+    POR QUE SE SUBE EN VEZ DE MIRAR UN SOLO SITIO
+    ---------------------------------------------
+    El backend y el frontend viven ahora en dos carpetas del MISMO repositorio
+    y comparten un unico ``.env`` en la raiz::
+
+        pyWhatsapp/
+          .env          <- este
+          backend/      <- PROJECT_ROOT
+          frontend/
+
+    ``PROJECT_ROOT`` es la carpeta que contiene ``app/``, o sea ``backend/``, y
+    ahi no hay ningun ``.env``. Se midio lo que pasaba: no se cargaba nada, no
+    saltaba ningun error, y la URL de PostgreSQL se construia con los valores
+    por defecto -- ``postgresql+psycopg://postgres@localhost:5432/...``, SIN
+    CONTRASENA. El fallo aparecia mucho despues y en otro sitio.
+
+    El orden importa: primero ``backend/.env``, que si alguien lo crea es
+    porque quiere pisar la configuracion compartida en su maquina, y despues
+    se sube hasta la raiz del repositorio.
+    """
+    inicio = desde if desde is not None else PROJECT_ROOT
+    for carpeta in (inicio, *inicio.parents):
+        candidato = carpeta / nombre
+        if candidato.is_file():
+            return candidato
+    return None
+
+
+def load_settings(*, env_file: Path | None = None, override: bool = False) -> Settings:
+    """Carga ``.env`` y devuelve la configuracion validada.
+
+    :param env_file: ruta al .env. Por defecto, el primero que aparezca
+        subiendo desde la raiz del backend (ver :func:`buscar_env`).
+    :param override: si el .env debe pisar variables ya presentes en el entorno.
+    :raises ConfigError: si falta una variable obligatoria o hay un valor invalido.
+    """
+    target = env_file if env_file is not None else buscar_env()
+    if target is not None and target.exists():
+        load_dotenv(target, override=override)
+
+    # --- PostgreSQL: DATABASE_URL manda; si no, se construye de POSTGRES_* ---
+    host = _str("POSTGRES_HOST", "localhost")
+    port = _int("POSTGRES_PORT", 5432, minimum=1)
+    database = _str("POSTGRES_DB", "whatsapp_backup")
+    user = _str("POSTGRES_USER", "postgres")
+    password = os.environ.get("POSTGRES_PASSWORD", "")
+
+    database_url = _str("DATABASE_URL", "")
+    if not database_url:
+        if not user:
+            raise ConfigError(
+                "no hay DATABASE_URL y POSTGRES_USER esta vacio: "
+                "no es posible construir la conexion a PostgreSQL"
+            )
+        database_url = build_database_url(
+            host=host, port=port, database=database, user=user, password=password
+        )
+
+    settings = Settings(
+        app_env=_str("APP_ENV", "development"),
+        app_debug=_bool("APP_DEBUG", True),
+        log_level=_str("LOG_LEVEL", "INFO").upper(),
+        database_url=database_url,
+        postgres_host=host,
+        postgres_port=port,
+        postgres_db=database,
+        postgres_user=user,
+        session_dir=_path("SESSION_DIR", "./session"),
+        data_dir=_path("DATA_DIR", "./data"),
+        media_dir=_path("MEDIA_DIR", "./data/media"),
+        diagnostics_dir=_path("DIAGNOSTICS_DIR", "./diagnostics"),
+        wa_version_cache=_path("WA_VERSION_CACHE", "./data/cache/wa_web_version.json"),
+        pairing_name=_str("PAIRING_NAME", "WhatsApp Backup"),
+        pairing_max_attempts=_int("PAIRING_MAX_ATTEMPTS", 3, minimum=1),
+        pairing_qr_ttl=_float("PAIRING_QR_TTL", 300.0, minimum=30.0),
+        pairing_full_sync=_bool("PAIRING_FULL_SYNC", True),
+        pairing_full_sync_days=_int("PAIRING_FULL_SYNC_DAYS", 3650, minimum=1),
+        pairing_full_sync_size_mb=_int(
+            "PAIRING_FULL_SYNC_SIZE_MB", 102400, minimum=1
+        ),
+        pairing_storage_quota_mb=_int(
+            "PAIRING_STORAGE_QUOTA_MB", 102400, minimum=1
+        ),
+        backfill_all_after_canary=_bool("BACKFILL_ALL_AFTER_CANARY", True),
+        history_on_demand_count=_history_count(),
+        history_request_timeout=_float("HISTORY_REQUEST_TIMEOUT", 45.0, minimum=1.0),
+        history_settle_seconds=_float("HISTORY_SETTLE_SECONDS", 8.0, minimum=1.0),
+        max_on_demand_concurrency=_int("MAX_ON_DEMAND_CONCURRENCY", 1, minimum=1),
+        media_download_concurrency=_int("MEDIA_DOWNLOAD_CONCURRENCY", 2, minimum=1),
+        media_worker_interval=_float("MEDIA_WORKER_INTERVAL", 20.0, minimum=5.0),
+        maintenance_interval_seconds=_float(
+            "MAINTENANCE_INTERVAL_SECONDS", 900.0, minimum=0.0
+        ),
+        api_host=_str("API_HOST", "127.0.0.1"),
+        allow_remote_api=_bool("ALLOW_REMOTE_API", False),
+        api_port=_int("API_PORT", 5000, minimum=1),
+        frontend_origin=_str("FRONTEND_ORIGIN", "http://localhost:4200"),
+        session_cookie_name=_str("SESSION_COOKIE_NAME", "whatsapp_backup_session"),
+        session_lifetime_days=_int("SESSION_LIFETIME_DAYS", 30, minimum=1),
+        # En localhost no hay HTTPS, y una cookie Secure no llegaria nunca:
+        # el login parecería fallar sin ningun error visible. En produccion
+        # tiene que ser true.
+        cookie_secure=_bool("COOKIE_SECURE", False),
+        cookie_samesite=_str("COOKIE_SAMESITE", "Lax"),
+        app_encryption_key=os.environ.get("APP_ENCRYPTION_KEY") or None,
+        frontend_url=_str("FRONTEND_URL", "http://localhost:4200"),
+        # Por donde entra el NAVEGADOR, no donde escucha el proceso. Tiene que
+        # ser "localhost" y no "127.0.0.1": para el navegador son sitios
+        # distintos, y una cookie SameSite=Lax puesta en uno no viaja en las
+        # peticiones que hace el otro.
+        api_public_url=_str("API_PUBLIC_URL", "http://localhost:5000"),
+        # Las peticiones HTTP correctas no se registran: con el panel abierto
+        # son decenas por minuto y entierran lo que hay que ver.
+        http_access_log=_bool("HTTP_ACCESS_LOG", False),
+        # Detalle de protocolo (cursores, ACKs, formas de peticion). Apagado
+        # por defecto; no se ha borrado nada, solo baja de nivel.
+        protocol_debug=_bool("PROTOCOL_DEBUG", False),
+        drive_storage_enabled=_bool("DRIVE_STORAGE_ENABLED", True),
+        drive_message_segment_max_messages=_int(
+            "DRIVE_MESSAGE_SEGMENT_MAX_MESSAGES", 1000, minimum=1
+        ),
+        drive_message_segment_max_bytes=_int(
+            "DRIVE_MESSAGE_SEGMENT_MAX_BYTES", 5_242_880, minimum=1024
+        ),
+        drive_segment_max_age_seconds=_float(
+            "DRIVE_SEGMENT_MAX_AGE_SECONDS", 60.0, minimum=1.0
+        ),
+        local_media_cache_max_gb=_float("LOCAL_MEDIA_CACHE_MAX_GB", 5.0, minimum=0.0),
+        local_media_cache_ttl_hours=_int(
+            "LOCAL_MEDIA_CACHE_TTL_HOURS", 24, minimum=1
+        ),
+        max_pending_storage_bytes=_int(
+            "MAX_PENDING_STORAGE_BYTES", 10_737_418_240, minimum=0
+        ),
+        storage_encryption_enabled=_bool("STORAGE_ENCRYPTION_ENABLED", True),
+        # Separada de APP_ENCRYPTION_KEY a proposito: una protege los secretos
+        # del servidor y la otra el contenido de los usuarios. Si falta, se
+        # deriva de la primera con HKDF y una etiqueta distinta.
+        storage_kek=os.environ.get("STORAGE_KEK") or None,
+        google_client_id=os.environ.get("GOOGLE_CLIENT_ID") or None,
+        google_client_secret=os.environ.get("GOOGLE_CLIENT_SECRET") or None,
+        google_redirect_uri=_str(
+            "GOOGLE_REDIRECT_URI",
+            "http://127.0.0.1:5000/api/v1/auth/google/callback",
+        ),
+        auto_recheck_cooldown_seconds=_float(
+            "AUTO_RECHECK_COOLDOWN_SECONDS", 300.0, minimum=0.0
+        ),
+        wa_version_fetch_timeout=_float("WA_VERSION_FETCH_TIMEOUT", 10.0, minimum=1.0),
+        pairing_515_timeout=_float("PAIRING_515_TIMEOUT", 20.0, minimum=1.0),
+    )
+
+    _validate(settings)
+    return settings
+
+
+def _validate(settings: Settings) -> None:
+    """Comprobaciones que no dependen de servicios externos."""
+    valid_levels = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+    if settings.log_level not in valid_levels:
+        raise ConfigError(
+            f"LOG_LEVEL={settings.log_level!r} invalido. Usa uno de: {sorted(valid_levels)}"
+        )
+
+    if not settings.database_url.startswith("postgresql"):
+        raise ConfigError(
+            "DATABASE_URL debe apuntar a PostgreSQL "
+            "(se esperaba un esquema 'postgresql+psycopg://...'). "
+            "Este proyecto no admite SQLite como base de datos del backup."
+        )
