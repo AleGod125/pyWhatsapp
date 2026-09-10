@@ -17,12 +17,24 @@ import { Chat } from '../../../core/models/api.models';
 import { ChatListState } from '../../../core/services/chat-list-state.service';
 import { AvatarComponent } from '../../../shared/components/avatar.component';
 import { HeaderMenuComponent } from '../header-menu.component';
+import { AccountSwitcherComponent } from '../account-switcher.component';
+import { SeccionesDeChatsComponent } from './secciones-de-chats.component';
+import { Vista } from '../../../core/services/chat.service';
+import { WhatsAppAccountInfo } from '../../../core/services/account.service';
 import { previewFor } from '../../../shared/utils/display';
 import { estadoDeChat, lineaDeLista } from '../chat-estado';
 
 @Component({
   selector: 'app-chat-sidebar',
-  imports: [ScrollingModule, FormsModule, DatePipe, AvatarComponent, HeaderMenuComponent],
+  imports: [
+    ScrollingModule,
+    FormsModule,
+    DatePipe,
+    AvatarComponent,
+    HeaderMenuComponent,
+    AccountSwitcherComponent,
+    SeccionesDeChatsComponent,
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './chat-sidebar.component.html',
   styleUrl: './chat-sidebar.component.scss',
@@ -69,6 +81,11 @@ export class ChatSidebarComponent {
   readonly excavarTodo = output<void>();
   /** Pide recargar incluyendo (o no) las conversaciones sin mensajes. */
   readonly alternarVacias = output<boolean>();
+  /** Se eligió otro WhatsApp. Cambia el contexto ENTERO, no filtra. */
+  readonly cambiarCuenta = output<WhatsAppAccountInfo>();
+  readonly agregarCuenta = output<void>();
+  /** Cambiar de sección: normal, archivados o restringidos. Recarga el panel. */
+  readonly cambiarVista = output<Vista>();
   chatSelected = output<Chat>();
   readonly query = signal('');
   readonly debouncedQuery = signal('');
@@ -78,6 +95,9 @@ export class ChatSidebarComponent {
   readonly sinMensajes = this.listaState.sinMensajes;
   readonly incluyeVacias = this.listaState.incluyeVacias;
   readonly conMensajes = this.listaState.conMensajes;
+  readonly vista = this.listaState.vista;
+  readonly archivados = this.listaState.archivados;
+  readonly restringidos = this.listaState.restringidos;
 
   readonly filtered = computed(() => {
     const q = this.debouncedQuery().trim().toLocaleLowerCase();

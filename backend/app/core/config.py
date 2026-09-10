@@ -172,6 +172,18 @@ class Settings:
     media_dir: Path
     diagnostics_dir: Path
     wa_version_cache: Path
+    #: Donde se archivan los lotes de historial EN CRUDO.
+    #:
+    #: Por cuenta, no comun. `ajustes_de_cuenta` lo apunta a
+    #: `data/history_baileys/<cuenta>/`; el valor por defecto --la carpeta
+    #: plana-- solo lo usa un proceso sin cuenta resuelta.
+    #:
+    #: Estuvo compartido, y costo caro: los ficheros no dicen de quien son,
+    #: asi que la reingesta tenia que adivinar el dueno de cada conversacion.
+    #: Tras vaciar la base, la primera cuenta que se vinculo adopto 256 lotes
+    #: de otra persona -- 6613 mensajes, con el telefono apagado y sin
+    #: vincular. Separados por cuenta, eso no se puede dar.
+    history_blobs_dir: Path
 
     # --- Companion ---
     pairing_name: str
@@ -422,6 +434,7 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         postgres_user=user,
         session_dir=_path("SESSION_DIR", "./session"),
         data_dir=_path("DATA_DIR", "./data"),
+        history_blobs_dir=_path("DATA_DIR", "./data") / "history_baileys",
         media_dir=_path("MEDIA_DIR", "./data/media"),
         diagnostics_dir=_path("DIAGNOSTICS_DIR", "./diagnostics"),
         wa_version_cache=_path("WA_VERSION_CACHE", "./data/cache/wa_web_version.json"),
@@ -480,9 +493,19 @@ def load_settings(*, env_file: Path | None = None, override: bool = False) -> Se
         drive_segment_max_age_seconds=_float(
             "DRIVE_SEGMENT_MAX_AGE_SECONDS", 60.0, minimum=1.0
         ),
-        local_media_cache_max_gb=_float("LOCAL_MEDIA_CACHE_MAX_GB", 5.0, minimum=0.0),
+        # MEDIO GIGA, NO CINCO. Esto es una CACHE, no el sitio donde vive la
+        # copia: la buena esta en Drive, cifrada, y si el archivo local falta
+        # se sirve de alli sin que el navegador se entere.
+        #
+        # Estaba en 5 GB y ademas nadie llamaba al desalojo, asi que en la
+        # practica no habia limite: se midieron 5,8 GB de fotos, audios y
+        # documentos en claro junto al codigo. Medio giga cubre lo que se esta
+        # mirando sin convertir el disco en un segundo archivo.
+        local_media_cache_max_gb=_float("LOCAL_MEDIA_CACHE_MAX_GB", 0.5, minimum=0.0),
         local_media_cache_ttl_hours=_int(
-            "LOCAL_MEDIA_CACHE_TTL_HOURS", 24, minimum=1
+            # Seis horas: lo que dura una sesion de lectura. Pasadas, el
+            # adjunto se baja de Drive otra vez si hace falta.
+            "LOCAL_MEDIA_CACHE_TTL_HOURS", 6, minimum=1
         ),
         max_pending_storage_bytes=_int(
             "MAX_PENDING_STORAGE_BYTES", 10_737_418_240, minimum=0

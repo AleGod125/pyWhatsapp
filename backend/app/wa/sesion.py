@@ -59,6 +59,44 @@ def hay_sesion(settings: Any) -> bool:
     return any(carpeta.iterdir())
 
 
+#: Lo que un nombre de carpeta puede llevar. Todo lo demas se sustituye.
+_PERMITIDO = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+)
+
+
+def _para_nombre(motivo: Any) -> str:
+    r"""El motivo, convertido en algo que Windows admita como carpeta.
+
+    EL FALLO, Y COMO SE VEIA
+    ------------------------
+    El motivo se metia en el nombre TAL CUAL. Con pywhats era un numero
+    --``401``-- y funcionaba. Baileys manda un diccionario::
+
+        {'reason': 'loggedOut'}
+
+    y ``{``, ``'``, ``:`` y ``}`` son ilegales en un nombre de fichero de
+    Windows. El resultado::
+
+        NotADirectoryError: [WinError 267] El nombre del directorio no es
+        valido: "...\session-20260909-210626-revoked-{'reason': 'loggedOut'}"
+
+    Y lo que provocaba era mucho peor que un error feo: archivar fallaba, las
+    credenciales revocadas se quedaban en disco, y en cada arranque la cuenta
+    volvia a intentar entrar con una sesion que el servidor ya habia
+    rechazado. Un bucle del que no se sale solo.
+
+    Se recorta ademas a 40 caracteres: el motivo es una pista, no un informe,
+    y una ruta demasiado larga vuelve a fallar en Windows por otro sitio.
+    """
+    texto = str(motivo)
+    limpio = "".join(c if c in _PERMITIDO else "-" for c in texto).strip("-")
+    # Varios seguidos quedan feos y no aportan nada.
+    while "--" in limpio:
+        limpio = limpio.replace("--", "-")
+    return limpio[:40] or "desconocido"
+
+
 def archive_session(settings: Any, reason: str) -> Path | None:
     """Mueve la sesion actual a ``diagnostics/``. Devuelve donde, o ``None``.
 
@@ -69,7 +107,7 @@ def archive_session(settings: Any, reason: str) -> Path | None:
         return None
 
     sello = datetime.now().strftime("%Y%m%d-%H%M%S")
-    destino = Path(settings.diagnostics_dir) / f"session-{sello}-{reason}"
+    destino = Path(settings.diagnostics_dir) / f"session-{sello}-{_para_nombre(reason)}"
     destino.mkdir(parents=True, exist_ok=True)
 
     movidos: list[str] = []

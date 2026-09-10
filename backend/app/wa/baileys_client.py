@@ -252,6 +252,21 @@ def _peticion_de_historial(mensaje: Any) -> dict[str, Any] | None:
     }
 
 
+def _archivar_lotes_activado() -> bool:
+    """Si se pide guardar los lotes de historial en claro. Apagado por defecto.
+
+    Solo un ``1``/``true``/``si`` explicito lo enciende. Cualquier otra cosa
+    --incluida la variable ausente, que es el caso normal-- lo deja apagado:
+    una opcion que expone conversaciones no puede encenderse por descuido.
+    """
+    return os.environ.get("WA_HISTORY_BLOBS", "").strip().lower() in (
+        "1",
+        "true",
+        "si",
+        "yes",
+    )
+
+
 class SesionBaileys:
     """Lo que hoy es el ``pywhats.Client`` crudo, hablando con el worker.
 
@@ -326,6 +341,15 @@ class BaileysClient:
     def __init__(self, settings: Any, events: Any) -> None:
         self._settings = settings
         self._events = events
+        #: De que cuenta de WhatsApp es este worker. Se pone ANTES de
+        #: arrancarlo --el runtime la sabe en cuanto hay vinculacion-- y viaja
+        #: a Node en `WA_ACCOUNT_ID`, que firma cada evento que emite.
+        #:
+        #: Sin esto, la unica fuente del dueno era `runtime_owner_account_id`
+        #: en memoria, y cuando ese campo se equivoca no hay nada que lo note:
+        #: lo que llega a PostgreSQL es un `chat_id` valido de la cuenta
+        #: equivocada. Se midio -- 195 conversaciones cruzadas.
+        self.whatsapp_account_id: Any = None
         self._proceso: subprocess.Popen[str] | None = None
         self._candado = threading.Lock()
         self._parando = threading.Event()
@@ -422,9 +446,21 @@ class BaileysClient:
     # -- Arranque ------------------------------------------------------------
 
     def start(self) -> None:
-        """Lanza el worker. No bloquea."""
+        """Lanza el worker. No bloquea.
+
+        SIN CUENTA NO SE LANZA. El worker tambien se niega --sale con codigo
+        1-- pero comprobarlo aqui deja un mensaje que explica que hacer en vez
+        de un proceso que muere al nacer.
+        """
         with self._candado:
             if self.vivo:
+                return
+            if not str(self.whatsapp_account_id or ""):
+                log.error(
+                    "[WA] No se lanza el worker: no se sabe de que cuenta de "
+                    "WhatsApp seria. Sin cuenta, sus eventos no se pueden "
+                    "atribuir y acabarian bajo la cuenta equivocada."
+                )
                 return
             self.carpeta_de_sesion.mkdir(parents=True, exist_ok=True)
             try:
@@ -480,9 +516,44 @@ class BaileysClient:
     def _entorno(self) -> dict[str, str]:
         entorno = dict(os.environ)
         entorno["WA_BAILEYS_SESSION_DIR"] = str(self.carpeta_de_sesion)
-        # Los lotes de historial se archivan CRUDOS antes de interpretarlos.
-        # Es lo que salvo 5920 mensajes cuando la base se vacio.
-        entorno["WA_BAILEYS_HISTORY_DIR"] = str(Path(self._settings.data_dir) / "history_baileys")
+        # LA CUENTA, para que el worker pueda firmar cada evento. El propio
+        # worker se niega a arrancar sin ella (`exigirCuenta()`).
+        # `getattr` y no acceso directo: `_entorno()` se inspecciona con
+        # clientes construidos a medias (`object.__new__`) para comprobar que
+        # NO archiva lotes por defecto, y reventar ahi seria fallar por el
+        # andamiaje. En un cliente de verdad el atributo existe siempre: lo
+        # pone `__init__`.
+        entorno["WA_ACCOUNT_ID"] = str(getattr(self, "whatsapp_account_id", None) or "")
+        # ARCHIVAR LOS LOTES EN CRUDO: APAGADO POR DEFECTO.
+        #
+        # Con la variable vacia el worker no escribe ni un fichero
+        # (`archivarLote` sale en la primera linea). Estaba encendida siempre,
+        # y lo que dejaba en disco eran las conversaciones ENTERAS de la
+        # persona, en claro, en JSON: cada `WebMessageInfo` en base64, texto
+        # incluido. Sin cifrar, sin dueno apuntado, y sin que nadie lo mirara
+        # otra vez.
+        #
+        # Lo que costo: al vaciar la base, 256 de esos ficheros se quedaron
+        # huerfanos. La siguiente cuenta que se vinculo --otra persona, otro
+        # correo de Google-- los adopto: 326 conversaciones y 6613 mensajes
+        # ajenos, con el telefono de su dueno apagado y sin vincular.
+        #
+        # El contenido va a Drive, cifrado. Un duplicado en claro en el disco
+        # no es una copia de seguridad: es una copia mas que proteger.
+        #
+        # Se puede encender para diagnosticar --`WA_HISTORY_BLOBS=1`-- y
+        # entonces va a la carpeta de ESTA cuenta, nunca a una comun.
+        if _archivar_lotes_activado():
+            entorno["WA_BAILEYS_HISTORY_DIR"] = str(
+                getattr(self._settings, "history_blobs_dir", None)
+                or Path(self._settings.data_dir) / "history_baileys"
+            )
+            log.warning(
+                "[WA] WA_HISTORY_BLOBS activo: los lotes de historial se "
+                "guardaran EN CLARO en disco. Solo para diagnosticar."
+            )
+        else:
+            entorno["WA_BAILEYS_HISTORY_DIR"] = ""
         entorno["WA_BAILEYS_ONDEMAND_COUNT"] = str(
             getattr(self._settings, "history_on_demand_count", 50)
         )
@@ -537,10 +608,57 @@ class BaileysClient:
                 # canal se recupera en la siguiente linea.
                 log.debug("[WA] linea no interpretable del worker")
                 continue
+            if not self._firma_correcta(mensaje):
+                continue
             try:
                 self._procesar(mensaje)
             except Exception:  # noqa: BLE001 - un evento roto no para el canal
                 log.exception("[WA] fallo procesando un evento del worker")
+
+    def _firma_correcta(self, mensaje: dict[str, Any]) -> bool:
+        """El evento dice de que cuenta es, y tiene que ser la de este worker.
+
+        LA GARANTIA QUE ESTO ANADE
+        --------------------------
+        Antes ningun evento decia de quien era: el dueno lo ponia Python desde
+        `runtime_owner_account_id`, un campo en memoria. Mientras ese campo
+        este bien todo cuadra; cuando se equivoca **nada lo detecta**, porque
+        lo que acaba en PostgreSQL es un `chat_id` perfectamente valido de la
+        cuenta equivocada.
+
+        Se midio: 195 conversaciones de un telefono entraron bajo la cuenta de
+        otro, catorce segundos despues de vincular el segundo movil. Con esta
+        comprobacion, ese mismo fallo habria dejado 195 avisos en el log y
+        cero datos cruzados.
+
+        Se compara como TEXTO a proposito: al otro lado es una cadena de
+        entorno, y convertir a UUID aqui solo anadiria una forma de fallar.
+        """
+        esperada = str(self.whatsapp_account_id or "")
+        if not esperada:
+            # El worker no deberia haber arrancado sin cuenta --`start()` lo
+            # impide-- pero si por lo que sea corre uno viejo, no se inventa
+            # un dueno: se deja pasar y que decida quien atribuye.
+            return True
+        recibida = str(mensaje.get("wa_account_id") or "")
+        if not recibida:
+            log.error(
+                "[WA] ATRIBUCION_SIN_FIRMA event=%s: el worker no firmo el "
+                "evento. Es un worker anterior a la firma; se descarta antes "
+                "que atribuirlo a ciegas.",
+                mensaje.get("event"),
+            )
+            return False
+        if recibida != esperada:
+            log.error(
+                "[WA] ATRIBUCION_MISMATCH esperada=%s recibida=%s event=%s "
+                "-- descartado. Este socket no es el de esa cuenta.",
+                esperada[:8],
+                recibida[:8],
+                mensaje.get("event"),
+            )
+            return False
+        return True
 
     def _leer_errores(self) -> None:
         """``stderr``: lo legible. Va al log del proyecto."""

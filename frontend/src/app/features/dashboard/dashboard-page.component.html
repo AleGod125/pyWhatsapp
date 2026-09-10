@@ -25,6 +25,9 @@
       (retry)="reloadChats()"
       (sincronizar)="runSync()"
       (alternarVacias)="alternarVacias($event)"
+      (cambiarCuenta)="cambiarDeCuenta($event)"
+      (agregarCuenta)="abrirAltaDeCuenta()"
+      (cambiarVista)="cambiarVista($event)"
       (excavarTodo)="runFullRecovery()"
       (chatSelected)="select($event)"
     />
@@ -147,3 +150,12 @@
      <main> a propósito: ocupa el ancho completo del viewport, no solo el de
      una columna, y por eso <main> lleva su padding-bottom en el .scss. -->
 <app-sync-status-bar [status]="sync()" />
+
+<!-- Añadir OTRO WhatsApp. La cuenta que ya está funcionando no se toca:
+     el emparejamiento va dirigido a la nueva con `account_id`. -->
+@if (altaDeCuentaAbierta()) {
+  <app-add-account-dialog
+    (cerrar)="cerrarAltaDeCuenta()"
+    (listo)="cuentaAgregada($event)"
+  />
+}

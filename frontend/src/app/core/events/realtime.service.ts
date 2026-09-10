@@ -3,6 +3,7 @@ import { sseDebug } from './sse-debug';
 import { Observable, Subject } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { RealtimeEnvelope } from '../models/api.models';
+import { AccountState } from '../services/account-state.service';
 
 /**
  * Los eventos a los que hay que suscribirse, uno por uno.
@@ -27,6 +28,15 @@ export const EVENT_NAMES = [
   // -- Sesión y vinculación ----------------------------------------------
   'session.state',
   'session.qr',
+  // La cuenta recién vinculada pasa a ser la activa. Sin escuchar esto, se
+  // escaneaba el QR del segundo teléfono y el selector seguía en el primero:
+  // la cuenta nueva estaba bien vinculada y había que ir a buscarla a mano.
+  'account.activated',
+  // El nombre de la cuenta llega DESPUÉS del sellado: WhatsApp manda
+  // `me.name` un instante después del pair-success, cuando la fila ya se
+  // escribió. Sin escuchar esto, el selector se queda con el número crudo
+  // hasta el siguiente arranque.
+  'account.updated',
   // -- Conversaciones ------------------------------------------------------
   'chat.created',
   'chat.updated',
@@ -88,6 +98,7 @@ export const RONDA_DE_VIGILANCIA_MS = 15_000;
 @Injectable({ providedIn: 'root' })
 export class RealtimeService {
   private readonly zone = inject(NgZone);
+  private readonly cuenta = inject(AccountState);
   private readonly eventsSubject = new Subject<RealtimeEnvelope>();
   private readonly connectionSubject = new Subject<'connected' | 'disconnected'>();
   private source?: EventSource;
@@ -118,7 +129,20 @@ export class RealtimeService {
     // del resto de la app no le aplica. Sin esto la cookie no viaja, el backend
     // responde 401 y el frontend se queda sin enterarse de nada: era justo lo
     // que dejaba la pantalla de vinculación colgada tras conectar.
-    const source = new EventSource(`${environment.apiBaseUrl}/events/stream`, {
+    // DE QUE CUENTA son los eventos.
+    //
+    // Cada cuenta de WhatsApp tiene su propio bus en el servidor, y esta
+    // conexión escucha UNO. `EventSource` no admite cabeceras, así que la
+    // cuenta viaja en la URL; sin ella el servidor usa la activa, que es lo
+    // correcto al arrancar.
+    //
+    // Al cambiar de cuenta hay que llamar a `reconnect()`: mantener el canal
+    // abierto dejaría llegando eventos de la cuenta anterior, y un evento
+    // tardío de la otra modificaría lo que se está viendo ahora.
+    const id = this.cuenta.activaId();
+    const url = new URL(`${environment.apiBaseUrl}/events/stream`, location.origin);
+    if (id) url.searchParams.set('account_id', id);
+    const source = new EventSource(url.toString(), {
       withCredentials: true,
     });
     this.source = source;
@@ -143,6 +167,18 @@ export class RealtimeService {
       source.addEventListener(name, (event) => this.emit(name, (event as MessageEvent).data));
 
     this.vigilar();
+  }
+
+  /**
+   * Cierra el canal y abre otro. Para cuando se cambia de cuenta.
+   *
+   * No basta con volver a llamar a `connect()`: hay una guarda que devuelve
+   * en cuanto ya existe una conexión, precisamente para no acabar con veinte
+   * streams abiertos. Aquí hay que cerrar primero, a propósito.
+   */
+  reconnect(): void {
+    this.disconnect();
+    this.connect();
   }
 
   disconnect(): void {

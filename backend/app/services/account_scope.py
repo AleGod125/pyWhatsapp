@@ -90,19 +90,39 @@ def _hay_unicidad(modelo: Any, columnas: tuple[str, ...]) -> bool:
 
 
 def destino_de_dedupe_de_mensaje() -> list[Any]:
-    """Por que columnas se deduplica un mensaje.
+    """Por que columnas se deduplica un mensaje: ``(chat_id, wa_msg_id)``.
 
-    Hoy ``(chat_jid, wa_msg_id)``, que es lo que el esquema tiene indexado.
-    Cuando la migracion mueva el indice a ``(chat_id, wa_msg_id)``, esto lo
-    sigue: un mensaje de grupo lleva el MISMO identificador para todos los que
-    lo reciben, asi que por el jid el que le llega a la segunda persona se
-    descarta como duplicado del de la primera, en silencio.
+    POR QUE `chat_id` Y NUNCA `chat_jid`
+    ------------------------------------
+    ``chat_id`` es unico por ``(cuenta, jid)``, asi que deduplicar por el es
+    per-cuenta de forma transitiva: dos cuentas que hablen con la misma persona
+    tienen ``chat_id`` distintos y el mismo identificador de mensaje NO
+    colisiona.
+
+    ``chat_jid`` es identico entre cuentas. Deduplicar por el significa que el
+    mensaje que le llega a la segunda cuenta se descarta como duplicado del de
+    la primera, **en silencio**. Y en un grupo es peor: el identificador es el
+    mismo para todos los que lo reciben.
+
+    AQUI HABIA UN RESPALDO, Y SE QUITO
+    ----------------------------------
+    Si el indice no existia, esto devolvia la version por ``chat_jid``. La
+    intencion era sobrevivir a una base a medio migrar; el efecto real es que
+    una instalacion sin migrar cruza mensajes entre cuentas sin que nada lo
+    diga. Un fallo de despliegue tiene que doler en el arranque, no aparecer
+    meses despues como conversaciones que faltan.
     """
     from app.models import Message
 
-    if _hay_unicidad(Message, ("chat_id", "whatsapp_message_id")):
-        return [Message.chat_id, Message.whatsapp_message_id]
-    return [Message.chat_jid, Message.whatsapp_message_id]
+    if not _hay_unicidad(Message, ("chat_id", "whatsapp_message_id")):
+        raise RuntimeError(
+            "Falta la unicidad (chat_id, whatsapp_message_id) en `messages`. "
+            "Sin ella, los mensajes se deduplicarian por `chat_jid`, que es "
+            "el mismo en todas las cuentas: el mensaje de la segunda cuenta se "
+            "descartaria como duplicado del de la primera. Ejecuta las "
+            "migraciones antes de arrancar."
+        )
+    return [Message.chat_id, Message.whatsapp_message_id]
 
 
 def cuenta_unica(sesion: Any) -> Any:

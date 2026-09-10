@@ -32,10 +32,24 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { emitir, registrar, troceador, blindarStdout } = require('./protocol');
+const {
+  emitir,
+  registrar,
+  troceador,
+  blindarStdout,
+  exigirCuenta,
+} = require('./protocol');
 const traducir = require('./traducir');
 
 blindarStdout();
+// SIN CUENTA NO SE ARRANCA.
+//
+// Cada evento que sale de aqui va firmado con `WA_ACCOUNT_ID` para que el
+// supervisor pueda comprobar de quien es en vez de suponerlo. Un worker sin
+// firma obligaria a elegir entre descartar su historial o creerselo a ciegas,
+// y creerselo a ciegas es como 195 conversaciones acabaron en la cuenta de
+// otra persona. Se sale con codigo 1 y se dice por que.
+exigirCuenta();
 
 // --- Configuracion, toda por entorno ---------------------------------------
 
@@ -490,9 +504,31 @@ function registrarManejadores(sock) {
     for (const c of lista || []) {
       const jid = traducir.jidTexto(c.id);
       if (!jid) continue;
-      if (c.mute !== undefined) evento('mute', { jid, muted: Boolean(c.mute) });
-      if (c.pinned !== undefined) evento('pin', { jid, pinned: Boolean(c.pinned) });
-      if (c.archived !== undefined) evento('archive', { jid, archived: Boolean(c.archived) });
+      // Se manda el VALOR, no solo el si/no. `pinned` es la marca de tiempo
+      // en que se fijo --y es la que ordena entre varios fijados-- y
+      // `muteEndTime` es hasta cuando dura el silencio. Reducirlos a booleano
+      // tiraba justo el dato que hace falta para ordenar y para saber cuando
+      // vuelve a sonar. El booleano se manda igual porque es lo que estaba en
+      // el contrato y hay quien lo lee.
+      if (c.mute !== undefined) {
+        evento('mute', {
+          jid,
+          muted: Boolean(c.mute),
+          // 0 es "para siempre" en WhatsApp, asi que no se puede colapsar
+          // con "sin silenciar": nulo es lo uno y 0 lo otro.
+          mute_until: c.mute === null ? null : Number(c.mute),
+        });
+      }
+      if (c.pinned !== undefined) {
+        evento('pin', {
+          jid,
+          pinned: Boolean(c.pinned),
+          pinned_at: Number(c.pinned || 0) || null,
+        });
+      }
+      if (c.archived !== undefined) {
+        evento('archive', { jid, archived: Boolean(c.archived) });
+      }
     }
   });
 

@@ -239,7 +239,11 @@ def _filas_de(sesion: Any, jids: list[str], cuenta: Any) -> list[dict]:
         if chat_id is None:
             continue
         resumen = repo.chat_summary(sesion, chat_id)
-        if resumen is not None:
+        # LA MISMA REGLA QUE EL LISTADO. Sin esto, los avisos en vivo metian
+        # por la puerta de atras las conversaciones que `/chats` deja fuera:
+        # durante una excavacion aparecian "+0" y chats con un solo aviso de
+        # cifrado, que es justo lo que el filtro existe para evitar.
+        if resumen is not None and repo.se_lista(resumen):
             salida.append(chat_to_json(resumen))
     return salida
 
@@ -293,7 +297,7 @@ def _mensaje_guardado(carga: Any, runtime: Any) -> list[tuple[str, Any]]:
             )
 
         resumen = repo.chat_summary(sesion, chat_id)
-        if resumen is not None:
+        if resumen is not None and repo.se_lista(resumen):
             fila_sidebar = chat_to_json(resumen)
             salida.append(
                 (

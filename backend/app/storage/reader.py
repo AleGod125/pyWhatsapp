@@ -79,7 +79,9 @@ class MessageReader:
     def __init__(self, database: Any, storage_service: Any) -> None:
         self._database = database
         self._storage = storage_service
-        self._cache: "OrderedDict[uuid.UUID, list[dict]]" = OrderedDict()
+        # La clave es (usuario, segmento), NO solo el segmento: la cache la
+        # comparten todos los usuarios de la instalacion. Ver `_lineas_de`.
+        self._cache: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
 
     # -- Lectura -------------------------------------------------------------
 
@@ -160,12 +162,26 @@ class MessageReader:
     def _lineas_de(
         self, segmento_id: uuid.UUID, *, user_id: uuid.UUID, almacenamiento: Any
     ) -> list[dict]:
-        if segmento_id in self._cache:
-            self._cache.move_to_end(segmento_id)
-            return self._cache[segmento_id]
+        # LA CLAVE LLEVA EL USUARIO, y no es un detalle.
+        #
+        # La comprobacion de propiedad --`fila.user_id != user_id`-- vive en
+        # `_descargar`, y la cache se mira ANTES. Con la clave solo por
+        # segmento, un acierto SE SALTABA esa comprobacion y devolvia
+        # contenido ya descifrado sin preguntar de quien era.
+        #
+        # Y esta cache no es de un usuario: el lector se guarda en el runtime
+        # del PROCESO (`rt._message_reader` en `app/api/routes.py`), asi que
+        # la comparten todos los que entren en esta instalacion.
+        #
+        # Con el usuario en la clave, cada uno tiene su entrada y el unico
+        # camino hasta el contenido pasa por `_descargar`, que comprueba.
+        clave = (str(user_id), str(segmento_id))
+        if clave in self._cache:
+            self._cache.move_to_end(clave)
+            return self._cache[clave]
 
         lineas = self._descargar(segmento_id, user_id, almacenamiento)
-        self._cache[segmento_id] = lineas
+        self._cache[clave] = lineas
         while len(self._cache) > CACHE_SEGMENTOS:
             self._cache.popitem(last=False)
         return lineas

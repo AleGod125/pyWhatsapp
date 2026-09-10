@@ -456,3 +456,75 @@ def test_los_segmentos_de_otro_usuario_no_se_tocan(montaje, session, runtime):
         .count()
     )
     assert mios == 0
+
+
+# ---------------------------------------------------------------------------
+# Lo que NO se reintenta
+# ---------------------------------------------------------------------------
+#
+# Las dos ramas del `except StorageError` llamaban a `reintentar`. Lo unico
+# que cambiaba entre ellas era escribir "[no reintentable]" delante del
+# motivo: se etiquetaba el error como definitivo y acto seguido se repetia,
+# doce veces, con espera creciente.
+#
+# Se vio con la carpeta de la copia borrada desde Google Drive: cientos de
+# "Drive respondio 404 (notFound)" en el log, 199 trabajos dando vueltas y ni
+# una subida saliendo. El 404 llevaba `reintentable=False` desde el principio;
+# nadie lo miraba.
+
+
+def test_un_error_definitivo_NO_se_reintenta(montaje, session):
+    """Un 404 no se arregla repitiendolo: se para y se dice por que."""
+    from app.models.storage import StorageJob
+
+    montaje["drive"]._fallos = [
+        StorageError("DRIVE_NOT_FOUND", "Ese archivo ya no esta en Drive.")
+    ]
+    _segmento_pendiente(montaje, session)
+
+    montaje["worker"].procesar_lote()
+
+    session.expire_all()
+    trabajo = session.query(StorageJob).one()
+    assert trabajo.status == "failed"
+    assert trabajo.attempts == 1, "se reintento algo que no se puede arreglar"
+
+
+def test_un_error_pasajero_SI_se_reintenta(montaje, session):
+    """La distincion tiene que seguir en pie: un 500 es otra cosa."""
+    from app.models.storage import StorageJob
+
+    montaje["drive"]._fallos = [
+        StorageError("DRIVE_SERVER_ERROR", "500", reintentable=True)
+    ]
+    _segmento_pendiente(montaje, session)
+
+    montaje["worker"].procesar_lote()
+
+    session.expire_all()
+    trabajo = session.query(StorageJob).one()
+    assert trabajo.status == "pending"
+    assert trabajo.next_retry_at is not None
+
+
+def test_el_contenido_sigue_estando_tras_rendirse(montaje, session):
+    """Rendirse es dejar de intentarlo, no perder nada.
+
+    Los mensajes viven en PostgreSQL, que es la fuente de verdad; Drive es la
+    copia. El segmento se puede volver a encolar cuando se corrija la causa.
+    """
+    from app.models import Message
+
+    montaje["drive"]._fallos = [
+        StorageError("DRIVE_NOT_FOUND", "Ese archivo ya no esta en Drive.")
+    ]
+    fila = _segmento_pendiente(montaje, session)
+
+    montaje["worker"].procesar_lote()
+
+    session.expire_all()
+    mensajes = (
+        session.query(Message).filter(Message.segment_id == fila.id).all()
+    )
+    assert len(mensajes) == 3
+    assert all(m.text for m in mensajes)

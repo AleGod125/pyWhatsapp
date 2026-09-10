@@ -84,6 +84,17 @@ class MediaInfo:
     Los cinco campos salen del mensaje y se guardan en ``media_files``. Los dos
     hashes no son opcionales de hecho: son los que permiten comprobar que lo
     descargado es lo que decia ser, antes y despues de descifrarlo.
+
+    ``raw_proto`` NO ES UN EXTRA
+    ---------------------------
+    Baileys no descarga a partir de ``direct_path`` y ``media_key`` sueltos:
+    ``downloadMediaMessage`` recibe el ``WebMessageInfo`` entero, y ademas lo
+    necesita para pedirle al telefono que resuba el adjunto cuando el CDN ya
+    no lo sirve (``reuploadRequest``). Sin este campo la descarga no llega ni
+    a empezar.
+
+    Se deja opcional porque el resto del proyecto construye ``MediaInfo`` para
+    describir un adjunto, no siempre para bajarlo.
     """
 
     direct_path: str
@@ -94,3 +105,6 @@ class MediaInfo:
     #: siempre coincide con el tipo del mensaje: un audio de voz y una musica
     #: se descifran igual.
     media_type: str
+    #: El ``WebMessageInfo`` serializado, tal cual se guardo en
+    #: ``messages.raw_proto``. Es lo que de verdad descarga el adjunto.
+    raw_proto: bytes | None = None

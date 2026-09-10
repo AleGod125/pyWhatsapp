@@ -20,6 +20,13 @@ import {
 } from '../../core/models/api.models';
 import { ChatService, normalizeChat } from '../../core/services/chat.service';
 import { ChatListState } from '../../core/services/chat-list-state.service';
+import { Vista, porOrdenDeLista } from '../../core/services/chat.service';
+import {
+  AccountService,
+  WhatsAppAccountInfo,
+} from '../../core/services/account.service';
+import { AccountSwitcherComponent } from './account-switcher.component';
+import { AddAccountDialogComponent } from './add-account-dialog.component';
 import { normalizeMedia, normalizeMessage } from '../../core/services/message.service';
 import { sseDebug } from '../../core/events/sse-debug';
 import { RealtimeService } from '../../core/events/realtime.service';
@@ -57,6 +64,7 @@ import { PreferencesService } from '../../core/services/preferences.service';
     ProgressToolbarComponent,
     HistoryRecheckPanelComponent,
     SettingsPanelComponent,
+    AddAccountDialogComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './dashboard-page.component.html',
@@ -65,6 +73,7 @@ import { PreferencesService } from '../../core/services/preferences.service';
 export class DashboardPageComponent implements OnInit {
   private readonly chatsApi = inject(ChatService);
   private readonly listaState = inject(ChatListState);
+  private readonly cuentasApi = inject(AccountService);
   private readonly syncApi = inject(SyncService);
   private readonly sessionApi = inject(SessionService);
   private readonly recheckApi = inject(HistoryRecheckService);
@@ -203,7 +212,20 @@ export class DashboardPageComponent implements OnInit {
     this.loadRuntimeMode();
     this.loadChats();
     this.loadSync();
-    this.realtimeSvc.connect();
+    // LAS CUENTAS PRIMERO. De ellas sale cuál se está mirando, y esa
+    // decide qué chats se piden y a qué bus se conecta el canal en vivo.
+    // Abrir el canal antes dejaría escuchando el bus equivocado durante
+    // los primeros segundos.
+    this.cuentasApi
+      .listar()
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe({
+        next: () => this.realtimeSvc.connect(),
+        // Sin cuentas no hay contexto, pero el canal se abre igual: el
+        // servidor usará la activa que él tenga y la pantalla no se
+        // queda muda por un fallo al listar.
+        error: () => this.realtimeSvc.connect(),
+      });
     this.realtimeSvc.connection$.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((state) => {
       if (state === 'disconnected') {
         this.disconnected.set(true);
@@ -386,7 +408,7 @@ export class DashboardPageComponent implements OnInit {
     if (!opciones.silencioso) this.loading.set(true);
     this.error.set(undefined);
     this.chatsApi
-      .list(this.listaState.incluyeVacias())
+      .list(this.listaState.incluyeVacias(), this.listaState.vista())
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe({
         next: (chats) => {
@@ -415,10 +437,95 @@ export class DashboardPageComponent implements OnInit {
   /** Interruptor "Solo chats con contenido". Recarga con el modo pedido. */
   alternarVacias(incluir: boolean) {
     this.chatsApi
-      .list(incluir)
+      .list(incluir, this.listaState.vista())
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe({ next: (chats) => this.chats.set(chats) });
   }
+
+  /**
+   * Cambiar de sección: normal, archivados o restringidos.
+   *
+   * Se VACÍA antes de pedir. Si no, mientras carga la sección nueva se siguen
+   * viendo los chats de la anterior bajo la cabecera de la nueva — y en la de
+   * bloqueados eso significa enseñar conversaciones normales como si fueran
+   * las restringidas, o al revés al salir.
+   *
+   * El chat abierto también se suelta: pertenecía a la sección que se deja.
+   */
+  cambiarVista(vista: Vista) {
+    if (vista === this.listaState.vista()) return;
+    this.chats.set([]);
+    this.selected.set(undefined);
+    this.listaState.vista.set(vista);
+    this.loadChats();
+  }
+  // -- Cambiar de cuenta de WhatsApp --------------------------------------
+
+  readonly altaDeCuentaAbierta = signal(false);
+
+  /**
+   * Otro WhatsApp: contexto ENTERO, no un filtro.
+   *
+   * El orden no es casual y cada paso cubre un fallo concreto:
+   *
+   * 1. se avisa al servidor, que es quien guarda la cuenta activa. Si fallara
+   *    y ya hubiéramos vaciado la pantalla, el usuario se quedaría mirando
+   *    una lista vacía de una cuenta que no cambió;
+   * 2. se VACÍA lo que había —lista, chat abierto, contadores—. Sin esto, las
+   *    conversaciones de la cuenta anterior siguen pintadas hasta que llega
+   *    la respuesta, y durante ese rato se ven mezcladas con las nuevas;
+   * 3. se reconecta el canal en vivo, que escucha el bus de UNA cuenta. Sin
+   *    reconectar seguirían llegando eventos de la anterior y un mensaje
+   *    tardío de aquella aparecería en esta.
+   */
+  cambiarDeCuenta(cuenta: WhatsAppAccountInfo) {
+    if (cuenta.id === this.cuentasApi.activa()?.id) return;
+    this.cuentasApi
+      .activar(cuenta.id)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe({
+        next: () => this.recargarContexto(),
+        error: () =>
+          this.error.set('No se pudo cambiar de cuenta. Inténtalo otra vez.'),
+      });
+  }
+
+  private recargarContexto() {
+    this.chats.set([]);
+    this.selected.set(undefined);
+    this.error.set(undefined);
+    this.loading.set(true);
+    // El canal ANTES de pedir: así los eventos que lleguen mientras se carga
+    // ya son de la cuenta nueva.
+    this.realtimeSvc.reconnect();
+    this.loadChats();
+  }
+
+  abrirAltaDeCuenta() {
+    this.altaDeCuentaAbierta.set(true);
+  }
+
+  cerrarAltaDeCuenta() {
+    this.altaDeCuentaAbierta.set(false);
+    // Se refresca el selector, pero la cuenta a medio crear YA NO APARECE.
+    //
+    // Antes sí, con el argumento de que «no diera la sensación de que se
+    // perdió». En la práctica sonaba mejor de lo que era: cancelar dos o tres
+    // veces dejaba el selector con varias entradas que decían «hay que
+    // vincular» y no llevaban a ninguna parte. Una opción que no se puede
+    // elegir no informa; estorba. Vuelve a salir en cuanto se vincule.
+    this.cuentasApi.listar().pipe(takeUntilDestroyed(this.destroyRef)).subscribe();
+  }
+
+  /** El alta terminó: se cambia a la cuenta nueva, que ya tiene sesión. */
+  cuentaAgregada(cuenta: WhatsAppAccountInfo) {
+    this.altaDeCuentaAbierta.set(false);
+    this.cuentasApi
+      .listar()
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe({ next: () => this.cambiarDeCuenta(cuenta) });
+  }
+
   private reconcileAfterReconnect() {
     const selectedId = this.selected()?.id;
     this.chatsApi
@@ -509,6 +616,41 @@ export class DashboardPageComponent implements OnInit {
     }
     if (type === 'history.recovery_resumed') {
       this.waitingForPhone.set(false);
+      return;
+    }
+    // La cuenta recién vinculada pasa a ser la activa, y el selector se entera
+    // sin recargar. Sin esto se escaneaba el QR del segundo teléfono y el
+    // panel seguía enseñando el primero: la cuenta nueva estaba bien
+    // vinculada y había que ir a buscarla a mano, con la lista de otra
+    // delante y sin nada que dijera que eso había pasado.
+    if (type === 'account.activated' && data && typeof data === 'object') {
+      const carga = (data as Record<string, unknown>)['payload'] ?? data;
+      const id = String((carga as Record<string, unknown>)['account_id'] ?? '');
+      if (id && id !== this.cuentasApi.activa()?.id) {
+        // Basta con recargar el listado: el servidor ya cambió la activa y
+        // `listar()` la toma de ahí. Fijarla aquí primero sería adelantarse a
+        // quien manda y, si la petición fallara, dejar el selector diciendo
+        // una cosa y el backend sirviendo otra.
+        this.cuentasApi
+          .listar()
+          .pipe(takeUntilDestroyed(this.destroyRef))
+          .subscribe({ next: () => this.recargarContexto(), error: () => {} });
+      }
+      return;
+    }
+    // El nombre de la cuenta llegó después del sellado. Solo se refresca el
+    // selector: NO se recarga el contexto, porque la cuenta es la misma y
+    // vaciar la lista de chats por un cambio de etiqueta sería un parpadeo
+    // gratuito en mitad de la extracción.
+    if (type === 'account.updated' && data && typeof data === 'object') {
+      const carga = (data as Record<string, unknown>)['payload'] ?? data;
+      const id = String((carga as Record<string, unknown>)['account_id'] ?? '');
+      if (id) {
+        this.cuentasApi
+          .listar()
+          .pipe(takeUntilDestroyed(this.destroyRef))
+          .subscribe({ next: () => {}, error: () => {} });
+      }
       return;
     }
     if (type === 'session.state' && data && typeof data === 'object') {
@@ -727,6 +869,21 @@ export class DashboardPageComponent implements OnInit {
   }
 
   private upsertChat(chat: Chat) {
+    // LA SECCIÓN MANDA, tambien en vivo.
+    //
+    // Antes se insertaba cualquier fila que llegara. Con las secciones eso
+    // significa que un chat ARCHIVADO reaparece en la lista normal en cuanto
+    // recibe un mensaje —y, peor, que uno RESTRINGIDO se destapa solo con que
+    // le escriban, delante de quien esté mirando la pantalla. El servidor no
+    // puede evitarlo: manda el aviso a quien esté suscrito sin saber qué
+    // sección tiene abierta. Se decide aquí, con el estado que viaja en la
+    // propia fila.
+    if (chat.id && !this.perteneceALaVista(chat)) {
+      // Y si estaba en la lista, sale: acaban de archivarlo o bloquearlo.
+      this.chats.update((items) => items.filter((item) => item.id !== chat.id));
+      if (this.selected()?.id === chat.id) this.selected.set(undefined);
+      return;
+    }
     // Nueva de verdad: no estaba en la lista. Es lo que hace que se vea caer
     // una a una durante la extraccion, en vez de aparecer todas de golpe al
     // recargar.
@@ -736,13 +893,30 @@ export class DashboardPageComponent implements OnInit {
     this.chats.update((items) => {
       const previous = items.find((item) => item.id === chat.id);
       const merged = mergeDefined(previous, chat);
+      // El MISMO orden que usa la carga inicial: primero las fijadas. Ordenar
+      // aquí solo por fecha las devolvía al montón en cuanto llegaba un aviso.
       return [merged, ...items.filter((item) => item.id !== chat.id)].sort(
-        (a, b) =>
-          (b.lastMessageTimestamp ?? Date.parse(b.lastMessageAt ?? '') ?? 0) -
-          (a.lastMessageTimestamp ?? Date.parse(a.lastMessageAt ?? '') ?? 0),
+        porOrdenDeLista,
       );
     });
     if (this.selected()?.id === chat.id) this.selected.update((value) => mergeDefined(value, chat));
+  }
+
+  /** Si esta conversación va en la sección que se está mirando ahora. */
+  private perteneceALaVista(chat: Chat): boolean {
+    // Un aviso antiguo puede no traer el estado. Se toma como "normal", que
+    // es lo que era antes de que existieran las secciones: no se pierde una
+    // fila por falta de un campo.
+    const archivado = chat.archived === true;
+    const restringido = chat.locked === true;
+    switch (this.listaState.vista()) {
+      case 'archivados':
+        return archivado && !restringido;
+      case 'restringidos':
+        return restringido;
+      default:
+        return !archivado && !restringido;
+    }
   }
   private showToast(message: string) {
     this.toast.set(message);

@@ -110,6 +110,17 @@ export interface Chat {
   historyComplete?: boolean;
   /** La conversación de uno consigo mismo. Se guarda igual; solo no se lista. */
   selfChat?: boolean;
+  /** Archivada. No sale en la lista normal; tiene su propia sección. */
+  archived?: boolean;
+  /** «Chat bloqueado» de WhatsApp. Su sección pide el código de acceso. */
+  locked?: boolean;
+  /** Fijada arriba del todo. */
+  pinned?: boolean;
+  /** CUÁNDO se fijó: entre varias fijadas, ese es el orden. */
+  pinnedAt?: number;
+  /** Silenciada. Ojo: `muteUntil === 0` es «para siempre», no «no lo está». */
+  muted?: boolean;
+  muteUntil?: number;
   type?: string;
   unreadCount?: number;
   favorite?: boolean;
@@ -247,6 +258,18 @@ export interface SyncStatus {
   backfillCurrent?: number;
   backfillTotal?: number;
   messagesNew?: number;
+  /**
+   * Los que ha traído ESTA corrida, contados sobre la base.
+   *
+   * Distinto de `messagesNew`, que se apoya en un observador que se cierra
+   * antes de que llegue el blob y por eso se quedaba en 0 mientras la base
+   * crecía. Este sale de una resta de totales y no se puede desincronizar.
+   */
+  messagesInRun?: number;
+  /** Mensajes que todavía no están confirmados en Drive. */
+  drivePending?: number;
+  /** Los que ya llegaron. `drivePending + driveDone` es el total. */
+  driveDone?: number;
   synced?: number;
   waitingSeed?: number;
   timeouts?: number;

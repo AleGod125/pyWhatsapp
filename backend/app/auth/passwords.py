@@ -64,6 +64,19 @@ class PasswordHasherService:
             raise ValueError(problema)
         return self._ph.hash(password)
 
+    def hash_sin_politica(self, secreto: str) -> str:
+        """El mismo Argon2id, sin la politica de CONTRASENAS DE CUENTA.
+
+        Existe para los secretos que no son una contrasena de cuenta y no
+        deben medirse con su vara: el codigo de los chats restringidos, que en
+        WhatsApp son seis digitos. Pedirle ahi ocho caracteres con mayusculas
+        seria ofrecerle otra cosa distinta con el mismo nombre.
+
+        Lo que NO cambia es el coste por intento, que es lo que de verdad
+        protege un secreto corto. Quien llama pone su propio limite de largo.
+        """
+        return self._ph.hash(secreto)
+
     def verify(self, hash_guardado: str | None, password: str) -> ResultadoVerificacion:
         """Comprueba la contrasena. NUNCA lanza por una contrasena mala.
 

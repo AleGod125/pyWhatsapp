@@ -53,9 +53,12 @@ async function destino(resultado: unknown): Promise<string | true> {
 }
 
 describe('guards de onboarding', () => {
-  it('sin sesión, el panel manda al login', async () => {
+  it('sin sesión, el panel manda a la PORTADA', async () => {
+    // No al formulario: quien llega sin sesión escribiendo `/dashboard` a mano
+    // se encontraba dos campos y ninguna explicación de qué es esto. La
+    // portada presenta el producto y lleva al acceso desde ahí.
     const r = ejecutar(dashboardGuard, estado({ nextStep: 'login' }));
-    expect(await destino(r)).toBe('/login');
+    expect(await destino(r)).toBe('/');
   });
 
   it('autenticado sin Drive, el panel manda a conectar Google', async () => {
@@ -130,7 +133,9 @@ describe('guards de onboarding', () => {
   });
 
   it('cada paso tiene una ruta', () => {
-    expect(rutaPara('login')).toBe('/login');
+    // `login` apunta a la portada a propósito: es lo que la hace obligatoria
+    // para quien todavía no ha entrado. El formulario sigue en `/login`.
+    expect(rutaPara('login')).toBe('/');
     expect(rutaPara('connect_google')).toBe('/connect-google');
     expect(rutaPara('pairing')).toBe('/pairing');
     expect(rutaPara('dashboard')).toBe('/dashboard');
@@ -192,10 +197,10 @@ describe('Acceso al panel: los cuatro estados', () => {
     expect(await firstValueFrom(correr(dashboardGuard) as never)).toBe(true);
   });
 
-  it('D) sin autenticar -> login', async () => {
+  it('D) sin autenticar -> portada', async () => {
     onboarding.mockReturnValue(of(estado({ nextStep: 'login' })));
     const resultado = await firstValueFrom(correr(dashboardGuard) as never);
-    expect(destino(resultado)).toBe('/login');
+    expect(destino(resultado)).toBe('/');
   });
 
   it('E) escribir /dashboard a mano sin WhatsApp NO deja entrar', async () => {

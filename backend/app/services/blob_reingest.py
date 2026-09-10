@@ -48,9 +48,17 @@ Asi que se atribuye por evidencia, no por conveniencia:
 
 * la conversacion ya es un chat de ESTA cuenta -> se ingiere;
 * la conversacion es un chat de OTRA cuenta    -> se salta, siempre;
-* la conversacion no la conoce nadie           -> se ingiere solo si en este
-  dispositivo hay UNA sola cuenta vinculada, porque entonces no hay ninguna
-  otra a la que pudiera pertenecer. Con dos o mas se salta y se cuenta.
+* la conversacion no la conoce nadie           -> SE SALTA, y se cuenta.
+
+Ese ultimo punto decia otra cosa: "se ingiere si en este dispositivo hay una
+sola cuenta vinculada, porque entonces no hay ninguna otra a la que pudiera
+pertenecer". El razonamiento daba por hecho que el lote lo produjo una cuenta
+que todavia existe, y fallo justo cuando no era asi -- se vacio la base, los
+lotes se quedaron en disco, y la siguiente cuenta que se vinculo adopto 326
+conversaciones de otra persona.
+
+Ademas los lotes ya no se guardan juntos: cada cuenta tiene su carpeta
+(`settings.history_blobs_dir`), asi que un lote ajeno ni siquiera se abre.
 
 Saltarse una conversacion se informa. Adivinar, no.
 """
@@ -120,7 +128,10 @@ def carpeta_de_blobs_baileys(settings: Any) -> Path:
     lote grande-- no pueda costar historial. Debe coincidir con
     ``WA_BAILEYS_HISTORY_DIR`` (``app/wa/baileys_client.py:_entorno``).
     """
-    return Path(settings.data_dir) / "history_baileys"
+    return Path(
+        getattr(settings, "history_blobs_dir", None)
+        or Path(settings.data_dir) / "history_baileys"
+    )
 
 
 def _cuentas_vinculadas(session: Any) -> int:
@@ -146,12 +157,33 @@ def _duenos_de_cada_jid(session: Any) -> dict[str, set[Any]]:
 
 
 def _es_mia(jid: str, cuenta: Any, duenos: dict[str, set[Any]], sola: bool) -> bool | None:
-    """``True`` mia, ``False`` de otra, ``None`` no se puede atribuir."""
+    """``True`` mia, ``False`` de otra, ``None`` no se puede atribuir.
+
+    UNA CONVERSACION QUE NADIE TIENE NO ES DE NADIE
+    -----------------------------------------------
+    Aqui habia un atajo: "si en esta maquina solo hay una cuenta, no hay a
+    quien mas pueda pertenecer, luego es suya". Suena razonable y es falso: da
+    por hecho que el lote lo produjo una cuenta que TODAVIA existe.
+
+    Lo que paso de verdad, medido:
+
+    1. se vacia la base -- las cuentas desaparecen, los 256 lotes en crudo se
+       quedan en disco;
+    2. se vincula OTRO telefono, de otra persona y bajo otra cuenta de Google;
+    3. `sola` es cierto --hay una sola cuenta-- y ningun jid tiene dueno
+       --la base esta vacia--, asi que este atajo contesto "es tuya" a las 326
+       conversaciones de otra persona;
+    4. 6613 mensajes ajenos ingeridos, con el telefono de su dueno apagado y
+       sin vincular.
+
+    Ahora la carpeta de lotes es por cuenta, asi que un lote de otro ni
+    siquiera se llega a leer. Esto es la segunda linea: si aun asi aparece una
+    conversacion que nadie tiene, NO se adopta. Perder una reingesta se ve y se
+    repite; ingerir la conversacion de otro no se ve.
+    """
     de_quien = duenos.get(jid)
     if de_quien is None:
-        # Nadie la tiene. Sin ninguna otra cuenta en la maquina no hay a quien
-        # mas pueda pertenecer; con otras, no se adivina.
-        return True if sola else None
+        return None
     if cuenta in de_quien:
         return True
     return False

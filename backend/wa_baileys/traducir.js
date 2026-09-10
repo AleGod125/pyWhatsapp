@@ -173,12 +173,23 @@ function traducirHistorial(lote, serializar) {
     const jid = jidTexto(chat.id);
     if (!jid) continue;
     vistos.add(jid);
-    conversaciones.push(conversacion(jid, chat, porChat.get(jid) || []));
+    conversaciones.push(conversacion(jid, chat, porChat.get(jid) || [], true));
   }
   // Una conversacion puede traer mensajes sin venir en `chats`. No se pierde:
-  // se manda igual, sin metadatos.
+  // se manda igual, SIN METADATOS -- y eso hay que decirlo, no fingirlo.
+  //
+  // El cuarto argumento es la diferencia entre "esta sin archivar" y "no se
+  // si esta archivada". Sin el, esta rama afirmaba lo primero: `{}` hacia que
+  // `Boolean(chat.archived)` diera `false`, y ese `false` viajaba a la base y
+  // PISABA el `true` que habia traido el lote anterior.
+  //
+  // Medido con dos lotes del mismo segundo: el primero traia el grupo
+  // "Steel Riders" con `archived: true`, el segundo lo repetia --solo por sus
+  // mensajes-- con `archived: false`, y en la base quedaba sin archivar. De
+  // 159 conversaciones de aquel lote, solo 41 traian metadatos de verdad; las
+  // otras 118 estaban inventando un estado.
   for (const [jid, msgs] of porChat) {
-    if (!vistos.has(jid)) conversaciones.push(conversacion(jid, {}, msgs));
+    if (!vistos.has(jid)) conversaciones.push(conversacion(jid, {}, msgs, false));
   }
 
   return {
@@ -192,7 +203,15 @@ function traducirHistorial(lote, serializar) {
   };
 }
 
-function conversacion(jid, chat, mensajes) {
+/**
+ * Una conversacion para `ingest_history_sync`.
+ *
+ * `conMetadatos` dice si `chat` es un `proto.Conversation` de verdad o un
+ * relleno. NO es un detalle: de el depende que el estado se afirme o se calle,
+ * y afirmar de menos es la unica opcion segura -- lo que no se sabe no puede
+ * pisar lo que si se sabia.
+ */
+function conversacion(jid, chat, mensajes, conMetadatos) {
   const fin = marcadorDeFin(chat);
   return {
     jid,
@@ -202,6 +221,29 @@ function conversacion(jid, chat, mensajes) {
     messages: mensajes,
     end_of_history_type: fin.tipo,
     end_of_history: fin.terminado,
+    // EL ESTADO DE LA CONVERSACION, que se estaba tirando.
+    //
+    // `proto.Conversation` trae los cuatro y aqui solo se copiaban el nombre,
+    // la marca de tiempo y los no leidos. El dato llegaba en CADA lote y se
+    // descartaba, asi que no habia forma de separar los archivados ni de
+    // saber cuales son los "chats restringidos".
+    //
+    // `pinned` es una MARCA DE TIEMPO, no un booleano: entre varios fijados
+    // el orden es el de cuando se fijaron. Y `muteEndTime` usa 0 para "para
+    // siempre", asi que no se puede comparar con la hora actual sin mirar
+    // antes ese caso.
+    // Nulo significa "no lo se" y el receptor lo respeta dejando lo guardado
+    // como estaba. `false` significa "no lo esta", y eso solo se puede decir
+    // cuando WhatsApp ha mandado la conversacion de verdad.
+    archived: conMetadatos ? Boolean(chat.archived) : null,
+    locked: conMetadatos ? Boolean(chat.locked) : null,
+    pinned_at: conMetadatos ? Number(chat.pinned || 0) || null : null,
+    mute_until:
+      conMetadatos &&
+      chat.muteEndTime !== undefined &&
+      chat.muteEndTime !== null
+        ? Number(chat.muteEndTime)
+        : null,
   };
 }
 

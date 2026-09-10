@@ -60,6 +60,18 @@ export function normalizeSyncStatus(r: Record<string, unknown>): SyncStatus {
       typeof r['backfill_current'] === 'number' ? (r['backfill_current'] as number) : undefined,
     backfillTotal:
       typeof r['backfill_total'] === 'number' ? (r['backfill_total'] as number) : undefined,
+    drivePending:
+      typeof (r['drive_pending'] ?? r['drivePending']) === 'number'
+        ? ((r['drive_pending'] ?? r['drivePending']) as number)
+        : undefined,
+    driveDone:
+      typeof (r['drive_done'] ?? r['driveDone']) === 'number'
+        ? ((r['drive_done'] ?? r['driveDone']) as number)
+        : undefined,
+    messagesInRun:
+      typeof (r['messages_in_run'] ?? r['messagesInRun']) === 'number'
+        ? ((r['messages_in_run'] ?? r['messagesInRun']) as number)
+        : undefined,
     messagesNew:
       typeof (r['messages_new'] ?? r['messagesNew']) === 'number'
         ? ((r['messages_new'] ?? r['messagesNew']) as number)

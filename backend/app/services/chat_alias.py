@@ -26,6 +26,8 @@ declaro.
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -40,11 +42,26 @@ def _usuario(jid: str) -> str:
     return jid.split("@")[0].split(":")[0].split(".")[0]
 
 
-def canonical_chat_jid(session: Session, jid: str) -> str:
+def canonical_chat_jid(
+    session: Session, jid: str, *, account_id: Any = None
+) -> str:
     """El JID del chat que YA representa a este contacto, o el mismo si no hay.
 
     Los grupos y las listas de difusion se devuelven intactos: su
     identificador es unico y no tiene forma alterna.
+
+    POR QUE NO SE EXIGE UNA SOLA FILA
+    ---------------------------------
+    Todas las busquedas de aqui usaban ``scalar_one_or_none()``, y eso
+    reventaba con "Multiple rows were found" en cuanto dos cuentas hablaban
+    con el mismo contacto: hay un chat por cuenta con el mismo jid.
+
+    Y exigir una sola fila nunca fue lo correcto aqui: lo que se devuelve es
+    una CADENA --el jid canonico--, que es identica mire quien la mire. Dos
+    filas no son una ambiguedad, son la misma respuesta dos veces.
+
+    ``account_id`` acota igualmente cuando se sabe, que es mas barato y deja
+    claro de que conversacion se habla.
     """
     if not jid or "@" not in jid:
         return jid
@@ -56,41 +73,58 @@ def canonical_chat_jid(session: Session, jid: str) -> str:
     # El sufijo de dispositivo no forma parte de la conversacion.
     limpio = f"{_usuario(jid)}@{servidor}"
 
-    existente = session.execute(
-        select(Chat.jid).where(Chat.jid == limpio)
-    ).scalar_one_or_none()
+    existente = _un_chat(session, limpio, account_id)
     if existente:
         return existente
 
-    alterno = _alterno(session, limpio, servidor)
+    alterno = _alterno(session, limpio, servidor, account_id)
     if alterno is None:
         return limpio
 
-    existente = session.execute(
-        select(Chat.jid).where(Chat.jid == alterno)
-    ).scalar_one_or_none()
+    existente = _un_chat(session, alterno, account_id)
     if existente:
         log.debug("Destino %s resuelto al chat existente %s", _corto(limpio), _corto(existente))
         return existente
     return limpio
 
 
-def _alterno(session: Session, jid: str, servidor: str) -> str | None:
-    """La otra forma del mismo contacto, segun ``contacts``. Nunca se deduce."""
+def _un_chat(session: Session, jid: str, account_id: Any) -> str | None:
+    """El jid de un chat existente con ese identificador, si lo hay.
+
+    ``.first()`` y no ``scalar_one_or_none()``: con dos cuentas hay un chat
+    por cuenta con el mismo jid, y lo que se devuelve --la cadena-- es la
+    misma en los dos casos.
+    """
+    stmt = select(Chat.jid).where(Chat.jid == jid)
+    if account_id is not None:
+        stmt = stmt.where(Chat.whatsapp_account_id == account_id)
+    return session.execute(stmt.limit(1)).scalars().first()
+
+
+def _alterno(
+    session: Session, jid: str, servidor: str, account_id: Any = None
+) -> str | None:
+    """La otra forma del mismo contacto, segun ``contacts``. Nunca se deduce.
+
+    La correspondencia PN<->LID de un telefono es la misma mire quien la mire,
+    asi que varias filas --una por cuenta-- dan la misma respuesta. Se acota
+    igualmente cuando se sabe de que cuenta se habla.
+    """
+
+    def _uno(columna, condicion):
+        stmt = select(columna).where(condicion)
+        if account_id is not None:
+            stmt = stmt.where(Contact.whatsapp_account_id == account_id)
+        return session.execute(stmt.limit(1)).scalars().first()
+
     usuario = _usuario(jid)
     if servidor == "lid":
-        telefono = session.execute(
-            select(Contact.jid).where(Contact.lid == jid)
-        ).scalar_one_or_none()
+        telefono = _uno(Contact.jid, Contact.lid == jid)
         if telefono is None:
             # ``contacts.lid`` puede estar guardado sin servidor.
-            telefono = session.execute(
-                select(Contact.jid).where(Contact.lid == usuario)
-            ).scalar_one_or_none()
+            telefono = _uno(Contact.jid, Contact.lid == usuario)
         return telefono
-    lid = session.execute(
-        select(Contact.lid).where(Contact.jid == jid)
-    ).scalar_one_or_none()
+    lid = _uno(Contact.lid, Contact.jid == jid)
     if not lid:
         return None
     return lid if "@" in lid else f"{lid}@lid"

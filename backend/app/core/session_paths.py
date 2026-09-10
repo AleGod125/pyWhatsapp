@@ -84,7 +84,35 @@ def ajustes_de_cuenta(settings: Any, account_id: Any) -> Any:
     """
     destino = carpeta_de_cuenta(settings, account_id)
     destino.mkdir(parents=True, exist_ok=True)
-    return dataclasses.replace(settings, session_dir=destino)
+    # Y LOS LOTES DE HISTORIAL TAMBIEN, que vivian todos juntos.
+    #
+    # `data/history_baileys/` era comun a todas las cuentas y los ficheros no
+    # dicen de quien son. Con eso, la reingesta de archivados tenia que
+    # ADIVINAR el dueno de cada conversacion, y adivino mal: tras borrar la
+    # base, la primera cuenta que se vinculo adopto 256 lotes de otra persona
+    # --6613 mensajes-- con el telefono apagado y sin vincular.
+    #
+    # Separandolos por cuenta el problema no se puede dar: cada runtime solo
+    # ve los suyos, igual que ya pasaba con la sesion y el Signal Store.
+    # La RUTA se calcula siempre; la CARPETA no se crea.
+    #
+    # Crearla era dejar `data/history_baileys/<cuenta>/` en el disco en cada
+    # arranque, aunque el archivado este apagado y nadie vaya a escribir ahi.
+    # Una carpeta vacia con ese nombre invita a volver a llenarla, y lo que se
+    # guardaba dentro eran las conversaciones en claro.
+    #
+    # Quien archive de verdad la crea: `archivarLote` en el worker hace
+    # `mkdirSync(..., {recursive: true})` antes de escribir.
+    return dataclasses.replace(
+        settings,
+        session_dir=destino,
+        history_blobs_dir=carpeta_de_blobs_de_cuenta(settings, account_id),
+    )
+
+
+def carpeta_de_blobs_de_cuenta(settings: Any, account_id: Any) -> Path:
+    """Donde guarda ESA cuenta sus lotes de historial en crudo."""
+    return Path(settings.data_dir) / "history_baileys" / str(account_id)
 
 
 def hay_sesion_en(carpeta: Path) -> bool:

@@ -237,6 +237,30 @@ class LiveMessageService:
                     chat_jid.split("@")[0][:6] + "...",
                 )
 
+            # EL NOMBRE PUBLICO, QUE SE ESTABA TIRANDO.
+            #
+            # El mensaje en vivo trae `push_name` --como se llama quien
+            # escribe, segun su propio WhatsApp-- y esta capa no lo miraba.
+            #
+            # Es la unica fuente que funciona de verdad para las
+            # conversaciones `@lid`, y se midio por que:
+            #
+            #   * de 674 mensajes de historial, CERO traian `pushName`:
+            #     WhatsApp no lo manda en el History Sync;
+            #   * la agenda del bootstrap llego con 8 contactos para 327
+            #     conversaciones;
+            #   * 317 de esas 327 se identifican por `@lid`, y no hay consulta
+            #     inversa de LID a telefono en esta version de Baileys
+            #     (`onWhatsApp` va al reves).
+            #
+            # Sin esto, esas conversaciones se quedan en "Desconocido (lid)"
+            # hasta que alguien escriba. Con esto, en cuanto escriben una vez
+            # quedan nombradas para siempre.
+            #
+            # Se guarda ANTES del chat para que la fila que se cree a
+            # continuacion ya tenga con que nombrarse.
+            self._anotar_nombre_publico(session, message, sender_jid, sender_lid)
+
             chat_id = repo.upsert_chat(
                 session,
                 jid=chat_jid,
@@ -308,7 +332,10 @@ class LiveMessageService:
                 ):
                     self.stats.media += 1
 
-            repo.refresh_history_state(session, chat_jid)
+            # CON el chat_id: sin el, el recuento sumaba los mensajes de
+            # las dos conversaciones cuando dos cuentas hablan con el mismo
+            # contacto -- y antes de eso reventaba pidiendo una sola fila.
+            repo.refresh_history_state(session, chat_jid, chat_id=chat_id)
 
         log.info(
             "Mensaje live guardado chat=%s tipo=%s %s",
@@ -327,6 +354,39 @@ class LiveMessageService:
             "message_id": message_id,
             "new": bool(inserted),
         }
+
+    def _anotar_nombre_publico(
+        self, session: Any, message: Any, sender_jid: Any, sender_lid: Any
+    ) -> None:
+        """Guarda como se llama quien acaba de escribir. Nunca lanza.
+
+        Es un `push_name`, no un nombre de la agenda: es como se ha puesto esa
+        persona en SU WhatsApp. Vale exactamente para lo que hace falta aqui
+        --dejar de ensenar un identificador-- y `display_name_for` ya sabe que
+        va despues del nombre guardado, nunca por delante.
+
+        NO se anota lo que escribe uno mismo: el `pushName` de un mensaje
+        propio es el nombre de uno, y meterlo como contacto llenaria la agenda
+        de la propia cuenta.
+        """
+        nombre = (getattr(message, "push_name", None) or "").strip()
+        if not nombre or getattr(message, "from_me", False):
+            return
+        # El LID sirve de identificador cuando no hay telefono: es como viene
+        # identificada la conversacion, asi que es por donde se buscara.
+        clave = sender_jid or sender_lid
+        if not clave:
+            return
+        try:
+            repo.upsert_contact(
+                session,
+                whatsapp_account_id=self.whatsapp_account_id,
+                jid=clave,
+                push_name=nombre,
+                lid=sender_lid,
+            )
+        except Exception:  # noqa: BLE001 - un nombre no puede perder el mensaje
+            log.debug("No se pudo anotar el nombre publico de %s", str(clave)[:18])
 
     def _register_media(
         self,
@@ -362,6 +422,9 @@ class LiveMessageService:
         statement = insert(MediaFile).values(
             message_id=message_id,
             chat_id=chat_id,
+            # La cuenta, escrita a mano ademas de deducible por `chat_id`:
+            # asi una consulta de multimedia no puede olvidarse de acotar.
+            whatsapp_account_id=self.whatsapp_account_id,
             whatsapp_message_id=message.id,
             media_type=media_type,
             mime_type=getattr(media, "mimetype", "") or None,

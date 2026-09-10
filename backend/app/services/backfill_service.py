@@ -460,7 +460,7 @@ class BackfillService:
         from app.history.cursor import espera_cumplida
 
         with self._database.transaction() as session:
-            rows = session.execute(
+            consulta = (
                 select(
                     Chat.id,
                     Chat.jid,
@@ -477,8 +477,22 @@ class BackfillService:
                         )
                     )
                 )
-                .order_by(Chat.last_message_timestamp.desc().nulls_last())
-                .limit(limit)
+            )
+            # SOLO LAS CONVERSACIONES DE ESTA CUENTA.
+            #
+            # Esto faltaba, y no se veia con una sola cuenta porque entonces
+            # "todos los chats" y "los suyos" eran lo mismo. Con dos, el motor
+            # de una cuenta cogia las conversaciones de la otra y le pedia su
+            # historial a un telefono que no las conoce: ACK y despues nada.
+            # Se midio: 336 candidatos para una cuenta con 131 chats.
+            if self.whatsapp_account_id is not None:
+                consulta = consulta.where(
+                    Chat.whatsapp_account_id == self.whatsapp_account_id
+                )
+            rows = session.execute(
+                consulta.order_by(
+                    Chat.last_message_timestamp.desc().nulls_last()
+                ).limit(limit)
             ).all()
             candidatos = []
             en_espera = 0
@@ -567,6 +581,11 @@ class BackfillService:
         if chat_jid in getattr(self, "_own_jids", set()):
             return False
         if chat_jid.startswith("status@") or chat_jid.endswith("@broadcast"):
+            return False
+        # La cuenta de servicio de WhatsApp. No es una persona: por ahi entran
+        # los avisos del sistema, y pedirle historial gasta una peticion y una
+        # espera para no traer nada.
+        if chat_jid.split("@")[0] in ("", "0"):
             return False
         if chat_jid.endswith("@newsletter"):
             return False
@@ -1299,7 +1318,7 @@ class BackfillService:
                 # chat recuperable en uno que vuelve a esperar una semilla que
                 # ya tiene.
                 self._set_status(chat_jid, "timeout", "sin respuesta ON_DEMAND")
-                intento, proximo = self._anotar_reintento(chat_jid)
+                intento, proximo = self._anotar_reintento(chat_jid, chat_id=chat_id)
                 self.stats.timeouts += 1
                 self._anotar_timeout_real()
                 log.info(
@@ -1900,12 +1919,17 @@ class BackfillService:
         except Exception:  # noqa: BLE001
             log.debug("No se pudo publicar el cambio de estado del chat")
 
-    def _anotar_reintento(self, chat_jid: str) -> tuple[int, Any]:
+    def _anotar_reintento(
+        self, chat_jid: str, *, chat_id: int | None = None
+    ) -> tuple[int, Any]:
         """Suma un intento fallido y fija cuando se puede volver a probar."""
         from app.history.cursor import anotar_intento_fallido
 
         with self._database.transaction() as session:
-            return anotar_intento_fallido(session, chat_jid)
+            # CON el chat_id. Sin el, un timeout de una cuenta sumaba
+            # el intento en el estado de la otra: la conversacion de otra
+            # persona se marcaba como fallida y dejaba de excavarse.
+            return anotar_intento_fallido(session, chat_jid, chat_id=chat_id)
 
     def _limpiar_reintentos(self, chat_jid: str) -> None:
         """La peticion respondio: la espera de reintento deja de aplicar."""
@@ -1915,10 +1939,22 @@ class BackfillService:
             limpiar_reintentos(session, chat_jid)
 
     def _bump_no_progress(self, chat_jid: str) -> int:
+        """Una respuesta mas que no aporto nada. Solo para ESTA cuenta.
+
+        Buscaba por jid a secas mientras el metodo de al lado
+        --`_reset_no_progress`-- ya usaba `_esta_conversacion`. Con dos
+        cuentas que hablen con el mismo contacto hay DOS filas de estado con
+        ese jid, y entonces:
+
+        * `scalar_one_or_none()` lanza `MultipleResultsFound` y el ciclo de
+          esa conversacion muere sin dar el motivo real; o, si solo existiera
+          una, se contaria el intento fallido en la cuenta EQUIVOCADA -- y
+          esa conversacion se daria por agotada sin haberlo intentado.
+        """
         with self._database.transaction() as session:
             state = session.execute(
-                select(ChatHistoryState).where(ChatHistoryState.chat_jid == chat_jid)
-            ).scalar_one_or_none()
+                select(ChatHistoryState).where(self._esta_conversacion(chat_jid))
+            ).scalars().first()
             if state is None:
                 return 0
             state.consecutive_no_progress += 1

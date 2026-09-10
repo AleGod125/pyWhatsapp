@@ -101,25 +101,90 @@ def test_sin_usuario_o_sin_cuenta_no_se_concede_nada(dos_usuarios):
 
 
 # ---------------------------------------------------------------------------
-# Una persona, una cuenta
+# Una persona, VARIAS cuentas -- pero solo una activa
 # ---------------------------------------------------------------------------
 
 
-def test_UNA_PERSONA_NO_PUEDE_TENER_DOS_CUENTAS(dos_usuarios):
-    """La regla de producto de hoy, y la base tambien la impide."""
-    sesion = dos_usuarios["session"]
-    otra = WhatsAppAccount(
-        user_id=dos_usuarios["a"].user_id,
+def _otra_cuenta(sesion, user_id):
+    fila = WhatsAppAccount(
+        user_id=user_id,
         session_status="never_linked",
-        session_storage_key=f"users/{uuid.uuid4().hex}",
+        session_storage_key=f"accounts/{uuid.uuid4()}",
     )
-    sesion.add(otra)
+    sesion.add(fila)
     sesion.flush()
+    return fila
 
-    with pytest.raises(memberships.YaTieneCuenta):
-        memberships.conceder(
-            sesion, user_id=dos_usuarios["a"].user_id, account_id=otra.id
+
+def test_una_persona_SI_puede_tener_dos_cuentas(dos_usuarios):
+    """El WhatsApp personal y el del trabajo son cosas distintas.
+
+    Aqui habia un `UNIQUE(user_id)` en la membresia -- "una cuenta por
+    persona" -- que era correcto mientras no habia forma de elegir cuenta en
+    la interfaz. Ahora la hay, asi que la regla cambio.
+    """
+    sesion = dos_usuarios["session"]
+    yo = dos_usuarios["a"].user_id
+    otra = _otra_cuenta(sesion, yo)
+
+    memberships.conceder(sesion, user_id=yo, account_id=otra.id)
+
+    mias = {str(c.id) for c in memberships.cuentas_de_usuario(sesion, yo)}
+    assert str(otra.id) in mias
+    assert len(mias) >= 2
+
+
+def test_SOLO_UNA_puede_estar_activa(dos_usuarios):
+    """Lo garantiza la base con un indice unico parcial, no el codigo.
+
+    Dos peticiones a la vez dejarian dos activas, y la siguiente lectura
+    elegiria una al azar: el usuario veria un WhatsApp u otro sin tocar nada.
+    """
+    sesion = dos_usuarios["session"]
+    yo = dos_usuarios["a"].user_id
+    primera = dos_usuarios["cuenta_a"].id
+    otra = _otra_cuenta(sesion, yo)
+
+    memberships.conceder(sesion, user_id=yo, account_id=primera, activar=True)
+    memberships.conceder(sesion, user_id=yo, account_id=otra.id, activar=True)
+
+    activa = memberships.cuenta_activa_de(sesion, yo)
+    assert activa is not None and str(activa.id) == str(otra.id)
+
+    from app.models import UserWhatsAppMembership
+    from sqlalchemy import func, select
+
+    cuantas = sesion.execute(
+        select(func.count())
+        .select_from(UserWhatsAppMembership)
+        .where(
+            UserWhatsAppMembership.user_id == yo,
+            UserWhatsAppMembership.is_active.is_(True),
         )
+    ).scalar()
+    assert cuantas == 1, "quedaron dos cuentas activas a la vez"
+
+
+def test_activar_una_cuenta_AJENA_no_hace_nada(dos_usuarios):
+    """El identificador llega del navegador: no se cree por si solo.
+
+    Sin esta comprobacion, cambiar un parametro dejaria a alguien mirando la
+    copia de seguridad de otra persona.
+    """
+    sesion = dos_usuarios["session"]
+    # Una cuenta de B, a la que A no tiene ningun acceso.
+    ajena = _otra_cuenta(sesion, dos_usuarios["b"].user_id)
+    memberships.conceder(
+        sesion, user_id=dos_usuarios["b"].user_id, account_id=ajena.id
+    )
+
+    hecho = memberships.activar_cuenta(
+        sesion, user_id=dos_usuarios["a"].user_id, account_id=ajena.id
+    )
+
+    assert hecho is False
+    activa = memberships.cuenta_activa_de(sesion, dos_usuarios["a"].user_id)
+    assert activa is None or str(activa.id) != str(ajena.id)
 
 
 def test_conceder_lo_mismo_dos_veces_no_es_un_error(dos_usuarios):
@@ -207,14 +272,27 @@ def test_COMPARTIR_NUNCA_OCURRE_SOLO(dos_usuarios, cuenta):
 
 
 def test_el_modulo_no_concede_nada_por_su_cuenta():
-    """Guardia de codigo: `conceder` es la UNICA via, y hay que llamarla."""
+    """Guardia de codigo: nadie mas puede crear una membresia.
+
+    `conceder` es la via normal. `activar_cuenta` tambien escribe, y esta
+    permitido a proposito: crea la fila que le FALTA a una cuenta creada antes
+    de que existieran las membresias, y esa cuenta ya era de ese usuario por
+    `whatsapp_accounts.user_id`. No concede acceso nuevo -- anota uno que ya
+    existia. Sin eso, quien tenga una de esas no podria seleccionarla nunca.
+
+    Cualquier otra funcion que empiece a escribir aqui hace saltar esto, que
+    es justo lo que se quiere: conceder acceso tiene que ser una decision
+    visible, no un efecto secundario.
+    """
     import ast
     import pathlib
+
+    PERMITIDAS = {"conceder", "activar_cuenta"}
 
     arbol = ast.parse(
         pathlib.Path("app/auth/memberships.py").read_text(encoding="utf-8")
     )
-    escriben = [
+    escriben = {
         n.name
         for n in ast.walk(arbol)
         if isinstance(n, ast.FunctionDef)
@@ -222,8 +300,8 @@ def test_el_modulo_no_concede_nada_por_su_cuenta():
             isinstance(x, ast.Attribute) and x.attr in ("add", "merge")
             for x in ast.walk(n)
         )
-    ]
-    assert escriben == ["conceder"], f"solo `conceder` escribe; escriben: {escriben}"
+    }
+    assert escriben <= PERMITIDAS, f"escriben sin permiso: {escriben - PERMITIDAS}"
 
 
 # ---------------------------------------------------------------------------

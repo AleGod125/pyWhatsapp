@@ -45,9 +45,50 @@ function troceador(alRecibirLinea) {
   };
 }
 
+/**
+ * De que cuenta de WhatsApp es ESTE worker.
+ *
+ * POR QUE VIAJA EN CADA LINEA
+ * ---------------------------
+ * Antes ningun evento decia de quien era. El supervisor de Python atribuia lo
+ * que llegara a `runtime_owner_account_id`, un campo EN MEMORIA del runtime
+ * que posee el proceso. Mientras ese campo este bien, todo cuadra; cuando se
+ * equivoca, no hay nada que lo detecte -- porque lo que acaba en PostgreSQL es
+ * un `chat_id` perfectamente valido de la cuenta equivocada.
+ *
+ * Se midio: 195 conversaciones de un telefono entraron bajo la cuenta de otro,
+ * catorce segundos despues de vincular el segundo movil. Ni una restriccion de
+ * la base podia verlo, porque la base no sabe que socket escribio.
+ *
+ * Firmando cada linea, el dato dice de quien es. Si no coincide con lo que el
+ * runtime cree, se descarta y se anota. El mismo fallo habria producido 195
+ * lineas de aviso en vez de 195 conversaciones cruzadas.
+ */
+const WA_ACCOUNT_ID = process.env.WA_ACCOUNT_ID || '';
+
 /** Escribe un evento en stdout. La unica funcion que puede tocar stdout. */
 function emitir(evento) {
-  process.stdout.write(codificar(evento));
+  // La firma se pone AQUI, en el unico sitio que escribe en stdout, y no en
+  // cada `emitir(...)` repartido por el worker: asi no existe la posibilidad
+  // de que alguien anada un evento nuevo y se le olvide firmarlo.
+  process.stdout.write(codificar({ ...evento, wa_account_id: WA_ACCOUNT_ID }));
+}
+
+/**
+ * Sin cuenta NO se arranca. Se sale con codigo 1 y se dice por que.
+ *
+ * Arrancar igual seria emitir eventos sin firmar, y el supervisor tendria que
+ * elegir entre descartarlos --perder el historial-- o creerselos, que es
+ * exactamente el agujero que esto cierra.
+ */
+function exigirCuenta() {
+  if (!WA_ACCOUNT_ID) {
+    process.stderr.write(
+      '[FATAL] WA_ACCOUNT_ID no definido. El worker no puede firmar sus ' +
+        'eventos y el supervisor no sabria de que cuenta son.\n',
+    );
+    process.exit(1);
+  }
 }
 
 /** Lo legible para humanos. Va a stderr y el supervisor lo manda al log. */
@@ -68,4 +109,12 @@ function blindarStdout() {
   console.debug = () => {};
 }
 
-module.exports = { codificar, troceador, emitir, registrar, blindarStdout };
+module.exports = {
+  codificar,
+  troceador,
+  emitir,
+  registrar,
+  blindarStdout,
+  exigirCuenta,
+  WA_ACCOUNT_ID,
+};

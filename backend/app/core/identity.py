@@ -76,6 +76,28 @@ def _identidad_de_credenciales(data: Any) -> tuple[str | None, str | None]:
     return _sin_dispositivo(yo.get("id")), _sin_dispositivo(yo.get("lid"))
 
 
+def nombre_del_perfil(settings: Any) -> str | None:
+    """El nombre que el usuario tiene puesto en SU WhatsApp, si se sabe.
+
+    Lo trae Baileys en ``creds.me.name`` y sirve para que una cuenta recien
+    anadida ya se llame de alguna forma en el selector, en vez de aparecer
+    como un numero. Es un punto de partida: el usuario puede renombrarla, y a
+    partir de ahi manda lo que el escribio.
+    """
+    session_file: Path = settings.session_file
+    if not session_file.exists():
+        return None
+    try:
+        datos = json.loads(session_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    yo = datos.get("me")
+    if not isinstance(yo, dict):
+        return None
+    nombre = str(yo.get("name") or "").strip()
+    return nombre or None
+
+
 def session_fingerprint(settings: Any) -> str | None:
     """Huella NO sensible de la sesion guardada, leida del disco.
 

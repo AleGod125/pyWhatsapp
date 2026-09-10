@@ -228,18 +228,24 @@ async def resolve_lids_via_usync(client: Any, database: Database, *, batch: int 
                     # LID mire quien lo mire. El valor que escribe una cuenta
                     # es identico al que escribiria cualquier otra.
                     #
-                    # Ademas solo rellena NULOS --el `pending` de arriba pide
-                    # `Contact.lid IS NULL`-- y solo toca esa columna: ni
-                    # nombre, ni mensajes, ni nada que distinga a una persona
-                    # de otra. Asi que no puede contaminar: no hay ningun dato
-                    # de una cuenta viajando a otra, solo un identificador
-                    # publico que ya era cierto para las dos.
+                    # Solo rellena NULOS, y esa condicion va AQUI.
                     #
-                    # Acotarlo obligaria a que cada cuenta repitiera el mismo
-                    # usync para escribir el mismo valor.
+                    # Estaba solo en el `SELECT` de `pending`, y el comentario
+                    # la daba por hecha en la escritura. No lo estaba: este
+                    # `UPDATE` alcanzaba tambien las filas de las OTRAS cuentas
+                    # que ya tuvieran un LID, y se lo pisaba. Es la unica forma
+                    # en que este bloque podia contaminar -- un LID resuelto
+                    # mal por una cuenta se propagaba a todas.
+                    #
+                    # Rellenando solo huecos, lo global sigue siendo global y
+                    # nada de una cuenta pisa lo de otra: ni nombre, ni
+                    # mensajes, ni un identificador ya resuelto.
+                    #
+                    # Acotarlo por cuenta obligaria a que cada una repitiera el
+                    # mismo usync para escribir el mismo valor.
                     session.execute(
                         update(Contact)
-                        .where(Contact.jid == contact_jid)
+                        .where(Contact.jid == contact_jid, Contact.lid.is_(None))
                         .values(lid=lid_jid)
                     )
             resolved += len(updates)

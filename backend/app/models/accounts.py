@@ -38,6 +38,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
@@ -239,6 +240,20 @@ class WhatsAppAccount(Base):
         PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
 
+    # COMO LA LLAMA EL USUARIO. Se rellena al vincular con el nombre del
+    # perfil que da WhatsApp (`creds.me.name`), pero es suyo: renombrarla no
+    # toca nada mas. Nulo significa "todavia no se sabe", y entonces la
+    # interfaz cae al numero.
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # `personal`, `business` o `unknown`. Se queda en `unknown` mientras no se
+    # pueda determinar de forma fiable: inventarselo seria peor que callar.
+    account_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     phone_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     wa_pn: Mapped[str | None] = mapped_column(String(64), nullable=True)
     wa_lid: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -271,7 +286,44 @@ class WhatsAppAccount(Base):
             "('never_linked','linked','disconnected','revoked','error')",
             name="ck_whatsapp_accounts_status",
         ),
+        # Existe en la base desde `c3d4e5f6a7b8`; se declara aqui para que el
+        # autogenerado no proponga borrarla en la siguiente migracion.
+        CheckConstraint(
+            "account_type IN ('personal','business','unknown')",
+            name="ck_whatsapp_accounts_type",
+        ),
         UniqueConstraint("session_storage_key", name="uq_whatsapp_accounts_storage"),
+        # UN TELEFONO, UNA CUENTA POR USUARIO.
+        #
+        # Vincular el mismo movil dos veces no da dos copias: da la MISMA
+        # copia duplicada, con los mismos identificadores de mensaje en dos
+        # filas. Se midio -- 132 conversaciones guardadas dos veces, una de
+        # ellas con 654 de 654 mensajes repetidos.
+        #
+        # Habia una comprobacion en codigo, y esta bien tenerla porque da un
+        # mensaje util; pero una comprobacion que solo vive en el codigo se
+        # salta por cualquier camino que no pase por ella.
+        #
+        # SOBRE `phone_number`, NO SOBRE `wa_pn`.
+        #
+        # `wa_pn` llega de WhatsApp con el identificador de DISPOSITIVO pegado
+        # --`573008927374:30@s.whatsapp.net`-- y ese cambia en cada
+        # re-vinculacion. Con la unicidad ahi, el mismo telefono se colaba dos
+        # veces sin mas que volver a escanear. Se midio, con la restriccion ya
+        # puesta:
+        #
+        #     e2492d66   wa_pn = 573008927374@s.whatsapp.net      linked
+        #     4f9774ab   wa_pn = 573008927374:30@s.whatsapp.net   revoked
+        #
+        # Dos filas, el mismo telefono, y PostgreSQL sin nada que objetar
+        # porque las cadenas no son iguales.
+        #
+        # `phone_number` son solo los digitos, que es lo que identifica a una
+        # persona. PUEDE ser NULL, y ahi PostgreSQL trata los NULL como
+        # distintos: varias cuentas creadas y aun sin vincular conviven.
+        UniqueConstraint(
+            "user_id", "phone_number", name="uq_whatsapp_accounts_user_phone"
+        ),
         Index("ix_whatsapp_accounts_user", "user_id"),
     )
 
@@ -328,6 +380,31 @@ class UserWhatsAppMembership(Base):
     #: falta seria inventarse un modelo de permisos sin un caso que lo pida.
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="owner")
 
+    # LA CUENTA QUE ESTA MIRANDO esa persona ahora mismo.
+    #
+    # Va en la membresia y no en la cuenta a proposito: dos personas pueden
+    # compartir un WhatsApp y estar mirando cosas distintas. Y es la base
+    # quien impide que queden dos activas a la vez -- un indice unico parcial
+    # sobre `user_id WHERE is_active` --, no el codigo: dos peticiones a la
+    # vez dejarian dos activas y la siguiente lectura elegiria al azar.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    #: Si esta cuenta la eligio LA PERSONA o la puso el sistema por defecto.
+    #:
+    #: `is_active` dice cual se esta mirando, pero no de donde salio, y esas
+    #: dos cosas se tratan distinto: una eleccion explicita se respeta aunque
+    #: la cuenta parezca vacia --acaba de vincularse y aun no ha traido nada--
+    #: mientras que un valor por defecto se puede sustituir sin preguntar.
+    #:
+    #: Sin esta distincion el sistema movia al usuario de cuenta por su cuenta
+    #: y en silencio: se vinculaba el segundo telefono, se elegia, y setenta
+    #: segundos despues aparecia el primero otra vez.
+    elegida_por_el_usuario: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -339,12 +416,21 @@ class UserWhatsAppMembership(Base):
         CheckConstraint(
             "role IN ('owner','member')", name="ck_memberships_role"
         ),
-        # UNA cuenta de WhatsApp por persona. La regla de producto, en la base.
-        UniqueConstraint("user_id", name="uq_memberships_user"),
-        # Y la misma pareja no se puede anotar dos veces.
+        # Aqui vivia `UNIQUE(user_id)` -- "una cuenta de WhatsApp por persona".
+        # Era correcta mientras no habia forma de elegir cuenta en la
+        # interfaz; ahora la sustituye la regla de la activa, mas abajo.
+        #
+        # La misma pareja no se puede anotar dos veces.
         UniqueConstraint(
             "user_id", "whatsapp_account_id", name="uq_memberships_user_account"
         ),
         Index("ix_memberships_account", "whatsapp_account_id"),
+        # COMO MUCHO UNA ACTIVA por usuario, garantizado por la base.
+        Index(
+            "uq_memberships_activa",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_active"),
+        ),
     )
 

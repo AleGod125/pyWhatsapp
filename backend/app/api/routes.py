@@ -77,11 +77,18 @@ def runtime() -> Any:
     return current_app.config["RUNTIME"]
 
 
-def runtime_de_mi_cuenta(*, crear: bool = False) -> Any:
-    """El runtime de la cuenta de quien hace la peticion. Puede ser ``None``."""
+def runtime_de_mi_cuenta(*, crear: bool = False, pedida: Any = None) -> Any:
+    """El runtime de la cuenta de quien hace la peticion. Puede ser ``None``.
+
+    ``pedida`` deja elegir CUAL de sus cuentas, y hace falta para vincular una
+    nueva: sin ella se resuelve la ACTIVA, y "agregar cuenta" acababa
+    emparejando sobre la que ya estaba. El identificador se comprueba contra
+    las cuentas de quien pregunta, asi que cambiarlo en la URL no da acceso a
+    la de otro.
+    """
     from app.api.account_runtime import runtime_de_mi_cuenta as _resolver
 
-    return _resolver(crear=crear)
+    return _resolver(crear=crear, pedida=pedida)
 
 
 def _session():
@@ -261,10 +268,61 @@ def session_pair():
     # falta. Antes se usaba el runtime unico del proceso, y por eso con la
     # cuenta de otra persona conectada esto contestaba 409 --su estado-- o
     # devolvia su codigo QR.
-    cuenta = _asegurar_cuenta_de_whatsapp(runtime())
+    # LA CUENTA QUE SE PIDE, no "la que estabas mirando".
+    #
+    # Esto ignoraba `?account_id=` a proposito, de cuando habia una sola
+    # cuenta por usuario: `asegurar_cuenta()` devuelve LA ACTIVA, que era la
+    # respuesta correcta entonces.
+    #
+    # Con varias cuentas es el fallo de raiz del emparejamiento. La secuencia
+    # medida:
+    #
+    #   1. "+ Agregar cuenta" crea la fila B (`never_linked`) y NO la activa
+    #      --deliberado: activarla dejaria al usuario mirando una lista vacia
+    #      mientras escanea--;
+    #   2. el frontend llama a `/session/pair?account_id=B`;
+    #   3. aqui se ignoraba y se cogia la ACTIVA, o sea A;
+    #   4. el QR que se enseñaba era el del runtime de A;
+    #   5. al escanear el segundo telefono, sus credenciales caian en la
+    #      carpeta de A -> IDENTIDAD INVERTIDA.
+    #
+    # El identificador SIGUE sin creerse por si solo: `cuenta_del_usuario_actual`
+    # lo comprueba contra las cuentas de quien pregunta, asi que cambiarlo en
+    # la URL no da acceso a la de otro. Lo que se admite es elegir entre LAS
+    # SUYAS, que es justo lo que "agregar cuenta" necesita.
+    pedida = request.args.get("account_id") or None
+
+    # LA CUENTA Y EL RUNTIME, RESUELTOS IGUAL. Ese era el fallo.
+    #
+    # `runtime_de_mi_cuenta` ya honraba `?account_id=` --lo lee por su cuenta
+    # en `_cuenta_pedida_en_la_peticion`-- asi que `rt` SI era el runtime de la
+    # cuenta pedida. La que se resolvia mal era la otra mitad: `cuenta` salia
+    # de `asegurar_cuenta()`, que devuelve LA ACTIVA.
+    #
+    # Y abajo se hace `rt.iniciar_vinculacion(usuario, cuenta.id)`. O sea: el
+    # runtime de B se marcaba como A. Al llegar el pair-success, se sellaba A.
+    # En el log se veia asi, y parecia que los eventos se cruzaban entre
+    # workers:
+    #
+    #     14:19:44  runtime levantado para la cuenta 76a24d67
+    #     14:20:13  pair-success -> Cuenta e2492d66 marcada como vinculada
+    #
+    # No se cruzaba nada. El runtime nuevo estaba ahi, con la etiqueta del
+    # viejo puesta.
+    #
+    # `cuenta_del_usuario_actual` comprueba `tiene_acceso` antes de devolver
+    # nada, asi que cambiar el identificador en la URL no da acceso a la cuenta
+    # de otro: solo deja elegir entre las propias.
+    from app.api.account_runtime import cuenta_del_usuario_actual
+
+    cuenta = cuenta_del_usuario_actual(crear=True, pedida=pedida)
     if cuenta is None:
-        return _error("la base de datos no esta disponible", 503)
-    rt = runtime_de_mi_cuenta(crear=True)
+        return _error_code(
+            "ACCOUNT_NOT_FOUND",
+            "No se encontro esa cuenta de WhatsApp entre las tuyas.",
+            404,
+        )
+    rt = runtime_de_mi_cuenta(crear=True, pedida=pedida)
     if rt is None:
         return _error_code(
             "ACCOUNT_RUNTIME_UNAVAILABLE",
@@ -502,6 +560,35 @@ def _mi_runtime(*, crear: bool = False):
 # de donde sacar los datos.
 
 
+def _cuenta_visible(sesion) -> Any:
+    """La cuenta cuyo contenido se enseña en ESTA peticion, o ``None``.
+
+    ``?account_id=`` permite pedir otra de las del usuario; si no viene, se usa
+    la suya. Lo que llega del navegador se COMPRUEBA contra sus cuentas: sin
+    eso, cambiar un parametro de la URL leeria la copia de otra persona.
+    """
+    from flask import request
+
+    yo = usuario_actual()
+    if yo is None:
+        return None
+    return ownership.cuenta_visible_de(
+        sesion, yo.id, request.args.get("account_id") or None
+    )
+
+
+def _acotado_a_la_cuenta(sesion) -> list:
+    """La cuenta visible como LISTA, que es lo que esperan los repositorios.
+
+    Una sola, nunca todas: acotar por usuario mezclaria en un mismo listado
+    los chats de dos WhatsApp distintos. Con la lista vacia los repositorios
+    aplican una condicion imposible, que es lo correcto para quien todavia no
+    tiene cuenta.
+    """
+    cuenta = _cuenta_visible(sesion)
+    return [cuenta] if cuenta is not None else []
+
+
 def _identificadores_propios() -> "tuple[str | None, str | None] | None":
     """El (PN, LID) de la sesion vinculada, para marcar el chat propio.
 
@@ -517,6 +604,74 @@ def _identificadores_propios() -> "tuple[str | None, str | None] | None":
         return None
 
 
+def _restringidos_abiertos() -> bool:
+    """Si esta peticion puede ver los chats restringidos.
+
+    Nunca lanza: si el modulo del pestillo no esta disponible por lo que sea,
+    la respuesta es que NO. Un fallo tiene que cerrar la puerta, no abrirla.
+    """
+    try:
+        from app.api.chat_lock_routes import abierto_para_la_peticion
+
+        return abierto_para_la_peticion()
+    except Exception:  # noqa: BLE001 - ante la duda, cerrado
+        return False
+
+
+def _fuera_de_la_cuenta_en_contexto(sesion, chat_id: int) -> bool:
+    """Si ese chat NO es de la cuenta de WhatsApp que se esta mirando.
+
+    POR QUE NO BASTA CON `chat_es_de`
+    ---------------------------------
+    `chat_es_de` contesta "es suyo", mirando TODAS sus cuentas, y esta bien
+    que lo haga: es una pregunta de propiedad. Pero lo que se puede VER es
+    otra cosa -- es el WhatsApp que tiene abierto ahora mismo.
+
+    Sin esta distincion, cambiar de cuenta no cambiaba lo que se estaba
+    leyendo: la lista se vaciaba, pero el identificador del chat seguia en la
+    URL y el servidor lo servia igual. El usuario cambiaba de cuenta y seguia
+    viendo la conversacion de la otra, que es exactamente lo contrario de
+    tener dos WhatsApp separados.
+
+    Se responde 404, no 403: un 403 confirmaria que ese chat existe en otra
+    de sus cuentas, y de paso deja al frontend un camino comun -- "aqui no
+    esta" es lo mismo que ha de hacer con un identificador inventado.
+    """
+    from sqlalchemy import select
+
+    from app.models import Chat
+
+    cuentas = _acotado_a_la_cuenta(sesion)
+    if not cuentas:
+        return False
+    dueno = sesion.execute(
+        select(Chat.whatsapp_account_id).where(Chat.id == chat_id)
+    ).scalar_one_or_none()
+    if dueno is None:
+        return False
+    return str(dueno) not in {str(c) for c in cuentas}
+
+
+def _restringido_y_cerrado(sesion, chat_id: int) -> bool:
+    """Si este chat esta restringido y el pestillo no esta abierto.
+
+    Ocultarlo del listado no basta: quien sepa el identificador puede pedir el
+    chat o sus mensajes directamente. El pestillo tiene que valer en los dos
+    sitios o no vale en ninguno.
+    """
+    from sqlalchemy import select
+
+    from app.models import Chat
+
+    if _restringidos_abiertos():
+        return False
+    return bool(
+        sesion.execute(
+            select(Chat.locked).where(Chat.id == chat_id)
+        ).scalar_one_or_none()
+    )
+
+
 @api.get("/chats")
 @requiere_drive
 def chats():
@@ -527,19 +682,34 @@ def chats():
     try:
         busqueda = (request.args.get("search") or "").strip() or None
         limite = min(_entero("limit", 500) or 500, 1000)
-        cuentas = ownership.cuentas_de(sesion, usuario_actual().id)
+        cuentas = _acotado_a_la_cuenta(sesion)
         # Por defecto solo las conversaciones donde se ha escrito algo.
         #
         # `?todos=1` las trae todas, incluidas las que aun no se han excavado.
         # No se borra nada: una conversacion aparece sola en cuanto recibe su
         # primer mensaje real.
         todos = (request.args.get("todos") or "").lower() in ("1", "true", "si")
+        # QUE SECCION se pide: la lista normal, los archivados o los
+        # restringidos. Lo que no sea uno de los tres es la normal: un
+        # parametro mal escrito en la URL no puede acabar ensenando lo que
+        # estaba escondido.
+        vista = (request.args.get("vista") or "normal").strip().lower()
+        if vista not in ("normal", "archivados", "restringidos"):
+            vista = "normal"
+        # EL PESTILLO SE COMPRUEBA AQUI, no solo en la pantalla.
+        #
+        # Una seccion que se tapa unicamente en el frontend no esta tapada:
+        # basta con escribir la URL a mano. Y responder 403 con la lista
+        # dentro seria peor todavia.
+        if vista == "restringidos" and not _restringidos_abiertos():
+            return _error("los chats restringidos estan bloqueados", 423)
         resumenes = repo.list_chat_summaries(
             sesion,
             search=busqueda,
             limit=limite,
             accounts=cuentas,
             solo_con_mensajes=not todos,
+            vista=vista,
         )
         # Cuantas quedaron fuera. Se dice: un filtro que esconde sin avisar es
         # indistinguible de una extraccion que no trajo nada.
@@ -548,10 +718,34 @@ def chats():
             if todos
             else len(
                 repo.list_chat_summaries(
-                    sesion, search=busqueda, limit=limite, accounts=cuentas
+                    sesion,
+                    search=busqueda,
+                    limit=limite,
+                    accounts=cuentas,
+                    vista=vista,
                 )
             )
         )
+        # Cuantos hay en las OTRAS secciones. Va siempre, tambien desde la
+        # lista normal: es lo que permite pintar "Archivados 12" sin tener que
+        # pedir la seccion entera solo para contar. Se cuenta con el mismo
+        # filtro de contenido que la lista que se esta viendo, para que el
+        # numero de la cabecera y el de la seccion no se contradigan.
+        def _cuantos(seccion: str) -> int:
+            return len(
+                repo.list_chat_summaries(
+                    sesion,
+                    limit=limite,
+                    accounts=cuentas,
+                    solo_con_mensajes=not todos,
+                    vista=seccion,
+                )
+            )
+
+        secciones = {
+            "archivados": _cuantos("archivados"),
+            "restringidos": _cuantos("restringidos"),
+        }
     finally:
         sesion.close()
     propios = _identificadores_propios()
@@ -561,6 +755,8 @@ def chats():
             "count": len(resumenes),
             "total_conversaciones": total,
             "sin_mensajes": max(0, total - len(resumenes)),
+            "vista": vista,
+            "secciones": secciones,
         }
     )
 
@@ -574,6 +770,10 @@ def chat_detail(chat_id: int):
     try:
         if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
             return _error("chat no encontrado", 404)
+        if _fuera_de_la_cuenta_en_contexto(sesion, chat_id):
+            return _error("chat no encontrado", 404)
+        if _restringido_y_cerrado(sesion, chat_id):
+            return _error("este chat esta restringido", 423)
         resumen = repo.chat_summary(sesion, chat_id)
         if resumen is None:
             return _error("chat no encontrado", 404)
@@ -643,6 +843,10 @@ def chat_messages(chat_id: int):
     try:
         if _no_es_mio(sesion, ownership.chat_es_de, chat_id):
             return _error("chat no encontrado", 404)
+        if _fuera_de_la_cuenta_en_contexto(sesion, chat_id):
+            return _error("chat no encontrado", 404)
+        if _restringido_y_cerrado(sesion, chat_id):
+            return _error("este chat esta restringido", 423)
         if repo.chat_summary(sesion, chat_id) is None:
             return _error("chat no encontrado", 404)
         if despues_ts is not None:
@@ -1250,7 +1454,10 @@ def sync_status():
         try:
             sesion2 = rt.database.session()
             try:
-                mias = ownership.cuentas_de(sesion2, usuario_actual().id)
+                # De la cuenta VISIBLE, la misma que la lista. Con las
+                # de todas, el panel decia 5000 mensajes mientras la lista
+                # enseñaba los 800 de un solo WhatsApp.
+                mias = _acotado_a_la_cuenta(sesion2)
                 cuerpo["chats"] = repo.history_counters(sesion2, accounts=mias)
                 media = repo.media_stats(sesion2, accounts=mias)
             finally:
@@ -1607,6 +1814,14 @@ EVENT_NAMES: dict[str, str] = {
     # Revision local de historiales pendientes: la ruta normal del producto,
     # sin sesion auxiliar. Se pasan tal cual: el nombre ya esta en el
     # vocabulario del frontend.
+    # La cuenta recien vinculada pasa a ser la activa. El selector cambia sin
+    # recargar; sin esto, se escaneaba el QR del segundo telefono y el panel
+    # seguia enseñando el primero.
+    "account.activated": "account.activated",
+    # El nombre de la cuenta llega despues del sellado --WhatsApp manda
+    # `me.name` un instante despues del pair-success-- asi que el selector
+    # tiene que poder enterarse sin recargar.
+    "account.updated": "account.updated",
     "history.recheck.started": "history.recheck.started",
     "history.recheck.progress": "history.recheck.progress",
     "history.recheck.completed": "history.recheck.completed",
@@ -1683,6 +1898,8 @@ _sse_seq = itertools.count(1)
 #: llega, como va su sincronizacion. Solo su dueno los recibe.
 EVENTOS_DE_SESION = (
     "session.",
+    # Que cuenta se esta mirando es cosa de su dueno, no de un espectador.
+    "account.",
     "sync.",
     "message.",
     "chat.",

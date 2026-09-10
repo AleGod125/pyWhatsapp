@@ -198,3 +198,61 @@ def test_archivar_nunca_lanza_aunque_haya_bloqueos():
     assert "except OSError" in fuente, (
         "un fichero bloqueado se salta y se anota; no puede abortar el resto"
     )
+
+# ---------------------------------------------------------------------------
+# El motivo del rechazo va en el NOMBRE de la carpeta
+# ---------------------------------------------------------------------------
+
+
+def test_un_motivo_con_caracteres_raros_no_impide_archivar(settings, tmp_path):
+    """El fallo que dejaba la sesion revocada en disco para siempre.
+
+    El motivo se metia en el nombre de la carpeta tal cual. Con pywhats era un
+    numero (``401``) y funcionaba; Baileys manda un diccionario::
+
+        {'reason': 'loggedOut'}
+
+    y `{`, `'`, `:` y `}` son ilegales en un nombre de fichero de Windows::
+
+        NotADirectoryError: [WinError 267] El nombre del directorio no es valido
+
+    Lo grave no era el error: era que archivar fallaba, las credenciales
+    revocadas se quedaban, y en cada arranque la cuenta volvia a intentar
+    entrar con una sesion que el servidor ya habia rechazado.
+    """
+    import dataclasses
+
+    from app.wa.sesion import archive_session
+
+    aislado = dataclasses.replace(
+        settings,
+        session_dir=tmp_path / "session",
+        diagnostics_dir=tmp_path / "diagnostics",
+    )
+    carpeta = aislado.session_dir_baileys
+    carpeta.mkdir(parents=True, exist_ok=True)
+    (carpeta / "creds.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "diagnostics").mkdir(parents=True, exist_ok=True)
+
+    destino = archive_session(aislado, reason="revoked-{'reason': 'loggedOut'}")
+
+    assert destino is not None, "no se pudo archivar por el nombre"
+    assert destino.is_dir()
+    assert not (carpeta / "creds.json").exists(), "las credenciales se quedaron"
+    for prohibido in "{}':":
+        assert prohibido not in destino.name, f"{prohibido!r} en el nombre"
+
+
+def test_el_nombre_no_crece_sin_limite():
+    """Una ruta demasiado larga vuelve a fallar en Windows, por otro sitio."""
+    from app.wa.sesion import _para_nombre
+
+    largo = _para_nombre({"reason": "x" * 300})
+    assert len(largo) <= 40
+
+
+def test_un_motivo_vacio_no_deja_la_carpeta_sin_nombre():
+    from app.wa.sesion import _para_nombre
+
+    assert _para_nombre("") == "desconocido"
+    assert _para_nombre("{}") == "desconocido"

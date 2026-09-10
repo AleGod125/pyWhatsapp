@@ -439,3 +439,86 @@ describe('Realtime: el estado por identificador', () => {
     expect(componente.chats()[0].historyStatus).toBe('fetching');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Las secciones mandan también en vivo
+// ---------------------------------------------------------------------------
+//
+// El servidor manda el aviso a quien esté suscrito, sin saber qué sección
+// tiene abierta cada uno. Si el panel inserta cualquier fila que llegue, un
+// chat archivado reaparece en la lista normal en cuanto le escriben — y uno
+// RESTRINGIDO se destapa solo, delante de quien esté mirando la pantalla.
+// Esto es lo que decide dónde va cada fila.
+
+describe('Realtime: archivados y restringidos no se cuelan', () => {
+  it('un chat archivado NO entra en la lista normal', () => {
+    const { events, componente } = montar([chat()]);
+
+    events.next({
+      type: 'chat.created',
+      data: { chat: filaDeChat('88', { archived: true }) },
+    });
+
+    expect(componente.chats().some((c) => c.id === '88')).toBe(false);
+  });
+
+  it('un chat RESTRINGIDO tampoco', () => {
+    const { events, componente } = montar([chat()]);
+
+    events.next({
+      type: 'chat.created',
+      data: { chat: filaDeChat('77', { locked: true }) },
+    });
+
+    expect(componente.chats().some((c) => c.id === '77')).toBe(false);
+  });
+
+  it('si archivan uno que estaba en la lista, sale', () => {
+    const { events, componente } = montar([chat({ id: '5' })]);
+
+    events.next({
+      type: 'chat.updated',
+      data: { chat: filaDeChat('5', { archived: true }) },
+    });
+
+    expect(componente.chats().some((c) => c.id === '5')).toBe(false);
+  });
+
+  it('si bloquean el que estaba abierto, se cierra', () => {
+    // Dejarlo abierto sería seguir enseñando la conversación que acaban de
+    // esconder, que es exactamente lo contrario de lo que pidió el usuario.
+    const { events, componente } = montar([chat({ id: '5' })]);
+    componente.select(chat({ id: '5' }));
+
+    events.next({
+      type: 'chat.updated',
+      data: { chat: filaDeChat('5', { locked: true }) },
+    });
+
+    expect(componente.selected()).toBeUndefined();
+  });
+
+  it('un aviso sin el estado se trata como normal', () => {
+    // Compatibilidad: antes de que existieran las secciones ninguna fila
+    // traía estos campos. Perder una conversación por falta de un campo sería
+    // peor que el problema que resuelve.
+    const { events, componente } = montar([chat()]);
+
+    events.next({ type: 'chat.created', data: { chat: filaDeChat('66') } });
+
+    expect(componente.chats().some((c) => c.id === '66')).toBe(true);
+  });
+
+  it('una conversación fijada se queda arriba tras un aviso', () => {
+    const { events, componente } = montar([
+      chat({ id: '1', lastMessageTimestamp: 1000, pinned: true, pinnedAt: 500 } as Partial<Chat>),
+    ]);
+
+    events.next({
+      type: 'chat.created',
+      data: { chat: filaDeChat('2', { last_message_timestamp: 9000 }) },
+    });
+
+    expect(componente.chats()[0].id).toBe('1');
+  });
+});

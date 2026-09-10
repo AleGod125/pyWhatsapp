@@ -24,6 +24,10 @@ import { EVENT_NAMES, SILENCIO_MAXIMO_MS } from './realtime.service';
 const LOS_QUE_MANDA_EL_BACKEND = [
   'session.state',
   'session.qr',
+  // Al vincular una cuenta nueva, el backend la pone activa y avisa. Sin
+  // escucharlo, el selector se queda en la anterior.
+  'account.activated',
+  'account.updated',
   'chat.created',
   'chat.updated',
   'chat.status',

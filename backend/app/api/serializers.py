@@ -110,6 +110,16 @@ def chat_to_json(
         "waiting_seed": getattr(summary, "history_status", None) in SEEDLESS_STATUSES,
         "history_complete": getattr(summary, "history_status", None)
         in COMPLETE_STATUSES,
+        # El estado de la conversacion. `getattr` con respaldo porque hay
+        # serializaciones que reciben un resumen mas pobre (`chat_summary`).
+        "archived": bool(getattr(summary, "archived", False)),
+        "locked": bool(getattr(summary, "locked", False)),
+        "pinned": getattr(summary, "pinned_at", None) is not None,
+        "pinned_at": getattr(summary, "pinned_at", None),
+        # `muted` y `mute_until` no dicen lo mismo: 0 es "silenciado para
+        # siempre", asi que hay que preguntar por el nulo, no por el valor.
+        "muted": getattr(summary, "mute_until", None) is not None,
+        "mute_until": getattr(summary, "mute_until", None),
         "avatar": {
             "initials": initials(summary.display_name),
             "color": avatar_color(summary.jid),

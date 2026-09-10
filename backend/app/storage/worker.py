@@ -108,11 +108,71 @@ class DriveStorageWorker:
                 if ahora - ultimo_barrido >= INTERVALO_BARRIDO:
                     ultimo_barrido = ahora
                     self._barrer_pendientes()
+                    # Y lo que ya esta a salvo en Drive sale del disco.
+                    #
+                    # Va DESPUES de agrupar, no antes: primero se cierra lo
+                    # que falta por subir y luego se libera lo confirmado. Al
+                    # reves se vaciaria contenido que aun no tiene segmento.
+                    self._purgar_lo_confirmado()
+                    self._desalojar_multimedia()
                 hechos = self.procesar_lote()
             except Exception:  # noqa: BLE001 - el trabajador no puede morir
                 log.exception("Fallo inesperado en el trabajador de almacenamiento")
                 hechos = 0
             self._parar.wait(INTERVALO_TRABAJO if hechos else INTERVALO_VACIO)
+
+    def _purgar_lo_confirmado(self) -> None:
+        """Vacia de PostgreSQL el contenido que Drive ya confirmo.
+
+        Es lo que completa el reparto que describe ``app/storage/reader.py``:
+        la base dice QUE mensajes hay y DONDE estan; Drive tiene el contenido.
+        Sin esto el contenido estaba en los dos sitios, y el de la base sin
+        cifrar.
+
+        Nunca lanza: liberar espacio no puede impedir una subida.
+        """
+        from app.storage.purga import purgar_contenido_subido
+
+        try:
+            purgar_contenido_subido(self._database)
+        except Exception:  # noqa: BLE001 - el trabajador no puede morir por esto
+            log.debug("La purga de contenido subido fallo; se reintenta")
+
+    def _desalojar_multimedia(self) -> None:
+        """Saca del disco los adjuntos que Drive ya tiene confirmados.
+
+        `MediaStorage.desalojar` existia, estaba bien hecho -- solo toca lo que
+        esta a salvo en Drive, con su huella comprobada -- y NO LO LLAMABA
+        NADIE. Por eso `data/media` crecio hasta 5,8 GB de fotos, audios y
+        documentos en claro, junto al codigo.
+
+        La copia buena es la de Drive, cifrada. Lo de aqui es cache: si falta,
+        `/media/<id>/file` lo baja de Drive y el navegador no se entera.
+
+        Nunca lanza: liberar disco no puede impedir una subida.
+        """
+        from app.storage.media import MediaStorage
+
+        try:
+            almacen = MediaStorage(self._database, self._settings)
+            resultado = almacen.desalojar(
+                limite_bytes=int(
+                    getattr(self._settings, "local_media_cache_max_gb", 0.5)
+                    * 1024**3
+                ),
+                ttl_horas=int(
+                    getattr(self._settings, "local_media_cache_ttl_hours", 6)
+                ),
+            )
+            if resultado.get("borrados"):
+                log.info(
+                    "[STORAGE] %d adjunto(s) liberados del disco (%d MB); "
+                    "siguen en Drive",
+                    resultado["borrados"],
+                    int(resultado.get("liberados", 0) / 1024 / 1024),
+                )
+        except Exception:  # noqa: BLE001 - el trabajador no puede morir por esto
+            log.debug("El desalojo de multimedia fallo; se reintenta")
 
     def _barrer_pendientes(self) -> None:
         """Agrupa en segmentos lo que todavia no ha salido hacia Drive."""
@@ -162,10 +222,21 @@ class DriveStorageWorker:
             self._avisar("storage.quota", {"code": exc.code, "message": exc.message})
 
         except StorageError as exc:
+            # LAS DOS RAMAS HACIAN LO MISMO
+            # -----------------------------
+            # Antes aqui se llamaba a `reintentar` en los dos casos y lo unico
+            # que cambiaba era escribir "[no reintentable]" delante del motivo.
+            # O sea: se etiquetaba el error como definitivo y acto seguido se
+            # volvia a intentar, doce veces, con espera creciente.
+            #
+            # Se vio con la carpeta de la copia borrada desde Google Drive:
+            # cientos de "Drive respondio 404 (notFound)" en el log, 199
+            # trabajos dando vueltas y ni una subida saliendo. El 404 llevaba
+            # `reintentable=False` desde el principio; nadie lo miraba.
             if exc.reintentable:
                 self._storage.jobs.reintentar(trabajo.id, exc.message)
             else:
-                self._storage.jobs.reintentar(trabajo.id, f"[no reintentable] {exc.message}")
+                self._storage.jobs.rendirse(trabajo.id, exc.message)
 
         except Exception as exc:  # noqa: BLE001
             log.exception("No se pudo completar una subida")
@@ -287,9 +358,13 @@ class DriveStorageWorker:
 
         ruta = self._ruta_local(datos["local_path"])
         if ruta is None or not ruta.exists():
+            # SI se reintenta: normalmente significa que el descargador aun
+            # no ha escrito el archivo, o que el desalojo de cache lo retiro y
+            # se puede volver a bajar. Es una carrera, no un imposible.
             raise StorageError(
                 "MEDIA_FILE_MISSING",
                 "El archivo local ya no esta; no hay nada que subir.",
+                reintentable=True,
             )
 
         tamano = ruta.stat().st_size

@@ -282,3 +282,87 @@ def _resumen(session, cuenta, jid):
         if fila.jid == jid:
             return fila
     return None
+
+# ---------------------------------------------------------------------------
+# Los dos caminos que pintan una fila tienen que decidir igual
+# ---------------------------------------------------------------------------
+
+
+def test_el_listado_y_los_avisos_en_vivo_usan_LA_MISMA_regla(session, cuenta):
+    """El filtro se colaba por la puerta de atras.
+
+    Una fila del sidebar llega por dos sitios: `/chats` y los avisos en vivo,
+    que la mandan ya montada para no obligar a recargar. El listado filtraba y
+    los avisos no, asi que durante una excavacion aparecian "+0" y chats con
+    un solo aviso de cifrado -- justo lo que el filtro existe para evitar.
+    """
+    from app.models import Chat, Message
+
+    creados = {}
+    for jid, tipo in (
+        ("visible@lid", "text"),
+        ("solo-sistema@lid", "system"),
+        ("0@s.whatsapp.net", "text"),
+        ("status@broadcast", "text"),
+    ):
+        chat = Chat(jid=jid, chat_type="individual", whatsapp_account_id=cuenta.id)
+        session.add(chat)
+        session.flush()
+        session.add(
+            Message(
+                chat_id=chat.id,
+                chat_jid=jid,
+                whatsapp_message_id=f"M-{jid}",
+                message_type=tipo,
+                text="x",
+                timestamp=1,
+            )
+        )
+        creados[jid] = chat.id
+    session.flush()
+
+    # El listado, que filtra en SQL.
+    del_listado = {
+        c.jid
+        for c in repo.list_chat_summaries(
+            session, accounts=[cuenta.id], solo_con_mensajes=True
+        )
+    }
+
+    # Y el camino de una sola fila, que es el de los avisos en vivo.
+    de_uno_en_uno = {
+        jid
+        for jid, chat_id in creados.items()
+        if repo.se_lista(repo.chat_summary(session, chat_id))
+    }
+
+    assert de_uno_en_uno == {"visible@lid"}
+    assert del_listado & set(creados) == de_uno_en_uno, (
+        "el listado y los avisos en vivo no filtran igual"
+    )
+
+
+def test_se_lista_cuenta_los_mensajes_REALES(session, cuenta):
+    """Un chat con mil avisos del sistema sigue sin ser una conversacion."""
+    from app.models import Chat, Message
+
+    chat = Chat(jid="ruido@lid", chat_type="individual", whatsapp_account_id=cuenta.id)
+    session.add(chat)
+    session.flush()
+    for i in range(5):
+        session.add(
+            Message(
+                chat_id=chat.id,
+                chat_jid="ruido@lid",
+                whatsapp_message_id=f"S{i}",
+                message_type="system",
+                text="cifrado",
+                timestamp=i,
+            )
+        )
+    session.flush()
+
+    resumen = repo.chat_summary(session, chat.id)
+    assert resumen.message_count == 5
+    assert resumen.real_message_count == 0
+    assert repo.se_lista(resumen) is False

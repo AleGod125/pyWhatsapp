@@ -9,6 +9,12 @@
       (sincronizar)="sincronizar.emit()"
     />
   </header>
+  <!-- QUE WhatsApp se está viendo. Con una sola cuenta también se enseña: no
+       hay nada que elegir, pero decir cuál es sigue siendo información. -->
+  <app-account-switcher
+    (cambiar)="cambiarCuenta.emit($event)"
+    (agregarCuenta)="agregarCuenta.emit()"
+  />
   <div class="search">
     <span>⌕</span
     ><input
@@ -22,13 +28,23 @@
     <button class="active">Todos</button><button disabled>No leídos</button
     ><button disabled>Favoritos</button><button disabled>Grupos</button>
   </div>
+  <!-- «Archivados» y «Chats bloqueados», como en WhatsApp Web: dos entradas
+       encima de la lista con su contador, no un menú escondido. La de
+       bloqueados pide el código antes de entrar, y ese código lo comprueba el
+       servidor -- taparlo solo aquí no sería taparlo. -->
+  <app-secciones-de-chats
+    [vista]="vista()"
+    [archivados]="archivados()"
+    [restringidos]="restringidos()"
+    (ir)="cambiarVista.emit($event)"
+  />
   <!-- Las conversaciones vacías se ocultan, pero se DICEN.
        WhatsApp reparte un aviso de cifrado a contactos con los que nunca se
        ha hablado, y además quedan las que aún no se han excavado: de 205
        traídas, 164 no tenían un solo mensaje escrito y tapaban las 41 de
        verdad. Esconderlas sin contarlas sería indistinguible de una
        extracción que no trajo nada. -->
-  @if (sinMensajes() > 0 || incluyeVacias()) {
+  @if (vista() === 'normal' && (sinMensajes() > 0 || incluyeVacias())) {
     <label class="solo-con-contenido">
       <input
         type="checkbox"
@@ -47,22 +63,10 @@
        las conversaciones afectadas quedan marcadas sin que nadie vuelva a por
        ellas. Este boton las devuelve a la cola. No borra nada: cada una sigue
        desde su ancla, asi que solo llega lo que falta. -->
-  @if (excavando()) {
-    <!-- Mientras dura NO hay boton, solo el aviso: la unica forma de que no
-         se pulse veinte veces es que no exista para pulsarlo. -->
-    <div class="excavando" role="status" aria-live="polite">
-      <div class="barra"><i></i></div>
-      <strong>Excavando el historial completo…</strong>
-      @if (excavacionProgreso()) {
-        <small class="progreso">{{ excavacionProgreso() }}</small>
-      }
-      <small class="aviso">
-        Puede tardar varios minutos y no hace falta que hagas nada:
-        <b>no recargues la página</b>, las conversaciones van apareciendo solas
-        a medida que llegan.
-      </small>
-    </div>
-  } @else {
+  <!-- Mientras dura NO hay boton: la unica forma de que no se pulse veinte
+       veces es que no exista para pulsarlo. Lo que ocurre se cuenta ABAJO, en
+       una linea, no en un bloque que empuja la lista fuera de la pantalla. -->
+  @if (!excavando()) {
     <button
       type="button"
       class="excavar"
@@ -118,6 +122,16 @@
             ><strong [class.provisional]="nombreDe(chat).provisional">{{
               nombreDe(chat).texto
             }}</strong
+            ><span class="marcas"
+              >@if (chat.muted) {
+                <!-- Silenciada. `muteUntil === 0` es «para siempre» y sería
+                     falsy: por eso se mira `muted`, que lo resuelve el
+                     servidor, y no el número. -->
+                <i class="marca" title="Silenciado" aria-label="Silenciado">🔕</i>
+              }
+              @if (chat.pinned) {
+                <i class="marca" title="Fijado" aria-label="Fijado">📌</i>
+              }</span
             ><time>{{ chat.lastMessageAt | date: 'HH:mm' }}</time></span
           ><span class="bottom"
             ><span>{{ preview(chat) }}</span>
@@ -131,5 +145,21 @@
         >
       </button></cdk-virtual-scroll-viewport
     >
+  }
+
+  <!-- LA EXCAVACION SE CUENTA AQUI, EN UNA LINEA.
+       Antes era un bloque de cuatro lineas encima de la lista. Ocupaba la
+       mitad de la pantalla en un portatil y empujaba las conversaciones hacia
+       abajo justo cuando el usuario quiere verlas aparecer: el aviso tapaba
+       aquello de lo que avisaba. Aqui no le quita sitio a nada, y sigue
+       diciendo lo mismo. -->
+  @if (excavando()) {
+    <div class="excavando-pie" role="status" aria-live="polite">
+      <span class="punto" aria-hidden="true"></span>
+      <span class="que">Excavando el historial…</span>
+      @if (excavacionProgreso()) {
+        <span class="cuanto">{{ excavacionProgreso() }}</span>
+      }
+    </div>
   }
 </aside>

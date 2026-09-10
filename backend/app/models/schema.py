@@ -209,6 +209,27 @@ class Chat(Base):
     name: Mapped[str | None] = mapped_column(Text, nullable=True)
     chat_type: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
 
+    # -- Estado de la conversacion, tal y como lo declara WhatsApp ----------
+    #
+    # Los cuatro vienen en `proto.Conversation`, dentro de cada lote de
+    # historial. El traductor los descartaba y por eso no habia forma de
+    # separar los archivados ni de saber cuales estan restringidos.
+    archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    #: Los "chats restringidos". Se guarda aunque no se puedan abrir: sin el
+    #: dato no se pueden sacar del listado normal, que es donde WhatsApp NO
+    #: los ensena.
+    locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    #: Marca de tiempo, NO booleano: entre varios fijados el orden es el de
+    #: cuando se fijaron. Nulo es "no fijado".
+    pinned_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    #: Hasta cuando esta silenciado. WhatsApp usa 0 para "para siempre", asi
+    #: que no se puede comparar con la hora actual sin mirar antes ese caso.
+    mute_until: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     last_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Epoch en segundos, igual que messages.timestamp.
     last_message_timestamp: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -238,6 +259,12 @@ class Chat(Base):
             "last_message_timestamp",
             postgresql_using="btree",
         ),
+        # El panel pide "los archivados de ESTA cuenta" y "los restringidos de
+        # ESTA cuenta". Sin ellos son dos recorridos completos por cada cambio
+        # de seccion. Existen desde la migracion `d4e5f6a7b8c9`; se declaran
+        # aqui para que el autogenerado no proponga borrarlos.
+        Index("ix_chats_cuenta_archivado", "whatsapp_account_id", "archived"),
+        Index("ix_chats_cuenta_restringido", "whatsapp_account_id", "locked"),
     )
 
     def __repr__(self) -> str:
@@ -375,7 +402,11 @@ class ChatHistoryState(Base):
     # NO unico: `chat_id` ya lo es y da la cuenta a traves de `chats`. Forzar
     # un solo estado por jid impedia que dos cuentas tuvieran la misma
     # conversacion, cada una con su propio progreso.
-    chat_jid: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # Sin `index=True`: el indice se declara abajo CON SU NOMBRE. Dejandolo
+    # aqui, SQLAlchemy lo llama `ix_chat_history_state_chat_jid` y en la base
+    # se llama `ix_chat_history_state_jid`, asi que el autogenerado proponia
+    # borrar el que existe y crear otro igual con otro nombre.
+    chat_jid: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # Ancla mas antigua UTILIZABLE (ID real de WhatsApp). Puede no coincidir
     # con el mensaje mas antiguo almacenado: ver get_oldest_valid_history_cursor.
@@ -445,6 +476,9 @@ class ChatHistoryState(Base):
     __table_args__ = (
         _enum_check("history_status", HISTORY_STATUSES, "ck_history_state_status"),
         Index("ix_history_state_status", "history_status"),
+        Index("ix_chat_history_state_jid", "chat_jid"),
+        # Lo usa la cola de reintentos para elegir a quien le toca.
+        Index("ix_history_state_next_retry", "next_retry_at"),
     )
 
     def __repr__(self) -> str:
@@ -523,6 +557,21 @@ class MediaFile(Base):
     chat_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("chats.id", ondelete="CASCADE"), nullable=False
     )
+    #: De que cuenta de WhatsApp es este adjunto.
+    #:
+    #: Se puede deducir por `chat_id` -> `chats.whatsapp_account_id`, y asi
+    #: estaba. Funciona, pero obliga a que TODA consulta de multimedia se
+    #: acuerde de unir con `chats`: la que no lo haga no sabe de quien es lo
+    #: que devuelve, y no hay nada que se lo recuerde.
+    #:
+    #: Aqui, en cambio, filtrar por cuenta es imposible de olvidar. Es
+    #: redundante a proposito -- la clave ajena a `chats` sigue siendo la
+    #: verdad, esto es la misma verdad puesta a mano.
+    whatsapp_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     whatsapp_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     media_type: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
@@ -592,6 +641,8 @@ class MediaFile(Base):
         # Deduplicacion del archivo fisico entre mensajes distintos.
         Index("ix_media_files_file_sha256", "file_sha256"),
         Index("ix_media_files_chat_id", "chat_id"),
+        # Los listados de multimedia filtran siempre por cuenta.
+        Index("ix_media_files_account", "whatsapp_account_id"),
     )
 
     def __repr__(self) -> str:

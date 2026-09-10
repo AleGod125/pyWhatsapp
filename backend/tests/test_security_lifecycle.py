@@ -104,6 +104,11 @@ def rechazable():
     from app.core.runtime import AppRuntime
 
     _RuntimeFalso._sesion_rechazada = AppRuntime._sesion_rechazada
+    # `_es_desvinculacion` se toma del real, no se imita: es lo que decide si
+    # un rechazo es definitivo, y una copia en el doble podria decir que si
+    # donde el producto dice que no. La prueba dejaria de medir el producto.
+    _RuntimeFalso.MOTIVOS_DE_DESVINCULACION = AppRuntime.MOTIVOS_DE_DESVINCULACION
+    _RuntimeFalso._es_desvinculacion = AppRuntime._es_desvinculacion
     return _RuntimeFalso
 
 
@@ -235,3 +240,62 @@ def test_un_fichero_dentro_del_directorio_si_se_sirve(settings, tmp_path, monkey
         assert routes._archivo_local({"id": 1, "local_path": str(dentro)}) == dentro
     finally:
         dentro.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# La desvinculacion es definitiva; un 401 pelado NO
+# ---------------------------------------------------------------------------
+#
+# Estas dos van juntas a proposito: son los dos lados de la misma decision, y
+# equivocarse en cualquiera de ellos rompe algo grave.
+#
+# Se intento apartar la sesion tambien al pedir codigo, cuando su huella
+# coincidia con la ultima rechazada. Parecia razonable --no repetir una
+# pregunta ya contestada-- pero esa condicion tambien es cierta tras un 401
+# pelado, asi que tiraba una vinculacion buena al primer tropiezo de red. Lo
+# cazaron `test_los_dos_primeros_rechazos_reintentan` y compania.
+
+
+def test_loggedOut_archiva_a_la_PRIMERA(rechazable, monkeypatch):
+    """El bucle del usuario: pedia codigo y no se generaba ninguno.
+
+    Con `loggedOut` no hay ambiguedad -- es el telefono diciendo que quito
+    este dispositivo. Esperar a tres rechazos solo gastaba un minuto largo sin
+    ensenar ningun codigo.
+    """
+    from app.core.runtime import AppRuntime
+
+    descartadas = []
+    monkeypatch.setattr(
+        _RuntimeFalso,
+        "_descartar_sesion_revocada",
+        lambda self, motivo: descartadas.append(motivo),
+        raising=False,
+    )
+
+    rt = rechazable("huella-1")
+    rt._sesion_rechazada({"reason": "loggedOut"})
+
+    assert rt._rechazos_seguidos == 1
+    assert descartadas, "no se archivo: el usuario seguiria sin ver ningun QR"
+
+
+def test_un_401_pelado_NO_archiva_al_primero(rechazable, monkeypatch):
+    """La otra mitad, y la que mas cara sale si se rompe.
+
+    Un corte de red no es una desvinculacion. Tirar la sesion por uno produjo
+    el peor incidente del proyecto: 74 logins y 61 codigos QR en segundos, con
+    99 carpetas de sesion vacias detras.
+    """
+    descartadas = []
+    monkeypatch.setattr(
+        _RuntimeFalso,
+        "_descartar_sesion_revocada",
+        lambda self, motivo: descartadas.append(motivo),
+        raising=False,
+    )
+
+    rt = rechazable("huella-1")
+    rt._sesion_rechazada("401")
+
+    assert descartadas == [], "tiro una vinculacion buena por un 401 transitorio"

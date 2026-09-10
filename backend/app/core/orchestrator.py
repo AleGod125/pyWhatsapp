@@ -42,6 +42,7 @@ hay tres minutos de pantalla congelada.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -49,6 +50,26 @@ from typing import Any, Callable
 from app.core.logging_setup import get_logger
 
 log = get_logger("APP")
+
+#: El mantenimiento reconcilia la base entera, asi que basta una vez por
+#: proceso. Con un runtime por cuenta, sin esto se lanzaban N a la vez y se
+#: bloqueaban entre si en PostgreSQL. Ver `Orchestrator.run_maintenance`.
+_CANDADO_MANTENIMIENTO = threading.Lock()
+_MANTENIMIENTO_HECHO = False
+
+
+def reiniciar_mantenimiento() -> None:
+    """Olvida que el mantenimiento ya corrio. Para las pruebas.
+
+    La bandera es de PROCESO, y en la suite el proceso es uno solo para todas
+    las pruebas: sin esto, la primera que reconcilia deja a las demas mirando
+    una bandera puesta y recibiendo ``None``. Un fallo asi no se lee como lo
+    que es -- parece que el mantenimiento se rompio, cuando lo que pasa es que
+    ya lo hizo otra prueba.
+    """
+    global _MANTENIMIENTO_HECHO
+    with _CANDADO_MANTENIMIENTO:
+        _MANTENIMIENTO_HECHO = False
 
 
 # ---------------------------------------------------------------------------
@@ -201,13 +222,64 @@ class Orchestrator:
             log.warning("Health check: %s", problema)
         return report
 
-    def run_maintenance(self) -> Any:
-        """Reconciliacion segura. NUNCA destructiva."""
+    def run_maintenance(self, *, forzar: bool = False) -> Any:
+        """Reconciliacion segura. NUNCA destructiva.
+
+        UNA VEZ POR PROCESO, aunque haya diez runtimes.
+        ------------------------------------------------
+        `run_all` reconcilia la base ENTERA: no esta acotado por cuenta.
+        Pero lo llama `prepare()`, y `prepare()` lo llama CADA
+        `AppRuntime.start()` -- uno por cuenta. Con dos cuentas eran dos
+        reconciliaciones completas a la vez, escribiendo las mismas filas.
+
+        No es solo trabajo repetido: se bloqueaban entre si. Volcando las
+        pilas durante un arranque colgado, los dos hilos estaban en la misma
+        linea::
+
+            hilo del runtime base   -> run_all -> reconcile_stuck_fetching
+            levantar_las_demas      -> run_all -> reconcile_stuck_fetching
+                                       ambos esperando a PostgreSQL
+
+        Y la API nunca llegaba a escuchar, porque el arranque no terminaba.
+
+        DOS COSAS, Y HACEN FALTA LAS DOS
+        --------------------------------
+        1. **El candado**, que impide que dos reconciliaciones corran a la
+           vez. Es lo que rompe el bloqueo, y vale igual para el mantenimiento
+           periodico: dos cuentas con el mismo intervalo acaban coincidiendo.
+        2. **La bandera**, que ademas evita repetir el trabajo en el arranque.
+           Sin ella la segunda cuenta esperaria a la primera y volveria a
+           reconciliar la misma base, ya reconciliada.
+
+        `forzar` es para las llamadas que SI tienen que volver a pasar --tras
+        ingerir historial, tras reconectar, tras el backfill, y el bucle
+        periodico--. Siguen pasando por el candado: forzar quiere decir
+        "vuelve a hacerlo", no "hazlo a la vez que otro".
+
+        Devuelve ``None`` cuando se salta. Quien lea campos del informe tiene
+        que llamar con `forzar=True` o aguantar el nulo.
+        """
         from app.services.maintenance_service import MaintenanceService
 
-        if self.maintenance is None:
-            self.maintenance = MaintenanceService(self._database, self._settings)
-        informe = self.maintenance.run_all()
+        global _MANTENIMIENTO_HECHO
+
+        # Sin candado: la bandera solo va de False a True, asi que leerla de
+        # mas solo cuesta entrar y volver a mirarla dentro.
+        if not forzar and _MANTENIMIENTO_HECHO:
+            return None
+
+        with _CANDADO_MANTENIMIENTO:
+            if not forzar and _MANTENIMIENTO_HECHO:
+                log.debug(
+                    "Mantenimiento ya ejecutado en este proceso; este runtime "
+                    "no lo repite"
+                )
+                return None
+            _MANTENIMIENTO_HECHO = True
+
+            if self.maintenance is None:
+                self.maintenance = MaintenanceService(self._database, self._settings)
+            informe = self.maintenance.run_all()
 
         # Un chat puede haber despertado aqui: tenia una semilla real y seguia
         # marcado como dormido. Se avisa para que se le pida SU historial sin
@@ -333,7 +405,8 @@ class Orchestrator:
             await nombres
 
         # 4) Reconciliar con lo que acabe de entrar.
-        self.run_maintenance()
+        #    Forzada: acaba de llegar historial, hay algo nuevo que reconciliar.
+        self.run_maintenance(forzar=True)
 
         # 4 quater) Una linea con la situacion del historial. Es lo primero
         #           que se mira al arrancar, y antes habia que deducirlo de
@@ -420,7 +493,7 @@ class Orchestrator:
 
         log.info("[LIVE] reconexion: reconciliando lo reciente")
         try:
-            informe = await asyncio.to_thread(self.run_maintenance)
+            informe = await asyncio.to_thread(self.run_maintenance, forzar=True)
             log.info("[LIVE] reconciliacion tras reconectar: %s", informe)
         except Exception:  # noqa: BLE001 - reconciliar no puede tumbar la sesion
             log.exception("La reconciliacion tras reconectar fallo; la sesion sigue")
@@ -583,7 +656,7 @@ class Orchestrator:
         self._publish("backfill_done", str(self.backfill.stats))
 
         # Lo que acaba de llegar cambia contadores, cursores y previas.
-        self.run_maintenance()
+        self.run_maintenance(forzar=True)
         self._publish("history_ingested", "backfill completado")
 
         # Y se deja el recuento medido en el log, para poder juzgar una prueba
@@ -605,7 +678,7 @@ class Orchestrator:
             try:
                 while True:
                     await asyncio.sleep(intervalo)
-                    informe = self.run_maintenance()
+                    informe = self.run_maintenance(forzar=True)
                     if informe.changed:
                         self._publish("maintenance_done", str(informe))
                     # Una linea con lo que ha pasado por el receptor desde el

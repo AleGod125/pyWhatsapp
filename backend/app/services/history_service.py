@@ -122,6 +122,15 @@ def ingest_history_sync(
             chat_type=classify_chat(conversation.jid),
             last_message_timestamp=conversation.last_message_timestamp,
             whatsapp_account_id=whatsapp_account_id,
+            # El estado llega en CADA `proto.Conversation` y hasta ahora se
+            # tiraba. Es lo unico que permite separar los archivados y saber
+            # cuales son los "chats restringidos": `lockChatAction` es la
+            # unica accion de app-state que Baileys no procesa, asi que el
+            # historial es la unica fuente que hay para `locked`.
+            archived=conversation.archived,
+            locked=conversation.locked,
+            pinned_at=conversation.pinned_at,
+            mute_until=conversation.mute_until,
         )
         result.conversations += 1
         if conversation.jid not in conocidos:
@@ -163,7 +172,9 @@ def ingest_history_sync(
     result.messages_inserted = repo.bulk_upsert_messages(session, chat_ids, incoming)
 
     # -- 3. Media -----------------------------------------------------------
-    result.media_detected = _register_media(session, parsed, chat_ids)
+    result.media_detected = _register_media(
+        session, parsed, chat_ids, whatsapp_account_id
+    )
 
     # -- 4. Contactos y pushnames -------------------------------------------
     for jid, push_name in sync.pushnames:
@@ -201,7 +212,9 @@ def ingest_history_sync(
     # -- 6. Estado de historial ---------------------------------------------
     for chat_jid, chat_id in chat_ids.items():
         repo.get_or_create_history_state(session, chat_id=chat_id, chat_jid=chat_jid)
-        repo.refresh_history_state(session, chat_jid)
+        # CON el chat_id: sin el, el recuento sumaba los mensajes de las dos
+        # conversaciones cuando dos cuentas hablan con el mismo contacto.
+        repo.refresh_history_state(session, chat_jid, chat_id=chat_id)
 
     log.info("HistorySync %s ingerido: %s", sync.sync_type, result)
     return result
@@ -247,7 +260,10 @@ def _to_incoming(
 
 
 def _register_media(
-    session: Session, messages: Iterable[ParsedMessage], chat_ids: dict[str, int]
+    session: Session,
+    messages: Iterable[ParsedMessage],
+    chat_ids: dict[str, int],
+    whatsapp_account_id: Any = None,
 ) -> int:
     """Crea las filas de ``media_files`` en estado ``pending``.
 
@@ -284,6 +300,9 @@ def _register_media(
             {
                 "message_id": message_id,
                 "chat_id": chat_ids[message.chat_jid],
+                # Escrita a mano ademas de deducible por `chat_id`: asi una
+                # consulta de multimedia no puede olvidarse de acotar.
+                "whatsapp_account_id": whatsapp_account_id,
                 "whatsapp_message_id": message.whatsapp_message_id,
                 "media_type": media.media_type,
                 "mime_type": media.mime_type,

@@ -16,8 +16,20 @@ import { AuthService } from '../services/auth.service';
  * de la API. Que un guard falle no expone nada.
  */
 
+/**
+ * A dónde manda cada paso.
+ *
+ * `login` apunta a la PORTADA, no al formulario. Quien no ha entrado y escribe
+ * `/dashboard` a mano acaba en una página que le explica qué es esto, con un
+ * botón que lleva al acceso —en vez de en dos campos sin contexto. Es lo que
+ * hace que la portada sea el primer sitio al que se llega, no una página que
+ * hay que buscar.
+ *
+ * El formulario sigue estando en `/login` y la portada lleva a él, así que
+ * quien ya sabe lo que quiere no da ninguna vuelta de más.
+ */
 const RUTA_DE_PASO: Record<OnboardingStep, string> = {
-  login: '/login',
+  login: '/',
   connect_google: '/connect-google',
   pairing: '/pairing',
   dashboard: '/dashboard',

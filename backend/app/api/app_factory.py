@@ -80,6 +80,20 @@ def create_app(runtime: Any, *, cors_origin: str | None = None) -> Flask:
 
     app.register_blueprint(preferences_api, url_prefix=API_PREFIX)
 
+    # Las cuentas de WhatsApp del usuario: listar, anadir, renombrar y cambiar
+    # cual esta mirando. Sin esto no hay forma de elegir, y sin forma de
+    # elegir varias cuentas solo producen estados que nadie puede resolver.
+    from app.api.accounts_routes import accounts as accounts_api
+
+    app.register_blueprint(accounts_api, url_prefix=API_PREFIX)
+
+    # El codigo de acceso de los chats restringidos. Es LOCAL: no es el codigo
+    # secreto de WhatsApp y no puede serlo --WhatsApp manda un derivado opaco,
+    # no el codigo-- pero tapa la seccion igual que WhatsApp Web tapa la suya.
+    from app.api.chat_lock_routes import chat_lock as chat_lock_api
+
+    app.register_blueprint(chat_lock_api, url_prefix=API_PREFIX)
+
     # Las peticiones que cambian estado necesitan token CSRF. Se instala aqui
     # y no en cada ruta: una ruta nueva queda protegida por omision, que es
     # justo al reves de tener que acordarse de protegerla.
@@ -144,6 +158,14 @@ def _configurar_cors(app: Flask, origen: str) -> None:
         # enviarla en las peticiones entre origenes. Exige un origen concreto:
         # credenciales y ``*`` son incompatibles por especificacion.
         supports_credentials=True,
-        allow_headers=["Content-Type", "X-CSRF-Token"],
+        # TODA cabecera propia tiene que estar aqui, y el fallo no se parece a
+        # un fallo de CORS.
+        #
+        # Se midio: al empezar a mandar `X-WhatsApp-Account` sin anadirla, el
+        # navegador rechazo el preflight y bloqueo TODAS las peticiones antes
+        # de enviarlas. El servidor no registro ni una --no llegaron-- y el
+        # frontend, viendo que todo fallaba, se comporto como si no hubiera
+        # sesion y mandaba al login. Ni un error en el log del backend.
+        allow_headers=["Content-Type", "X-CSRF-Token", "X-WhatsApp-Account"],
     )
     log.info("CORS habilitado para %s", origen)

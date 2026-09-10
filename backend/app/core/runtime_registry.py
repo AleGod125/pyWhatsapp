@@ -107,10 +107,31 @@ class RuntimeRegistry:
         Asi que el registro lo ADOPTA en vez de rehacerlo: la cuenta que ya
         funcionaba sigue exactamente igual, y las nuevas nacen con su carpeta
         propia. Nadie tiene que volver a escanear nada.
+
+        Y SE LE DICE DE QUE CUENTA ES
+        -----------------------------
+        Esto faltaba, y no se veia hasta tener dos cuentas. El runtime del
+        proceso se construye ANTES de saber que cuenta es --el arranque no lo
+        sabe todavia--, asi que sus servicios nacen sin ella. Adoptarlo sin
+        decirselo los dejaba asi para siempre, y el de mensajes en vivo
+        acababa llamando a ``upsert_chat`` sin cuenta::
+
+            ValueError: upsert_chat necesita whatsapp_account_id: un chat sin
+            cuenta no lo ve nadie y se duplica en silencio
+
+        Cada mensaje que llegaba por esa via se perdia. Se anota la cuenta y
+        se propaga a las piezas ya construidas.
         """
         if account_id is None or runtime is None:
             return None
         clave = str(account_id)
+        runtime.runtime_owner_account_id = account_id
+        propagar = getattr(runtime, "_propagar_dueno", None)
+        if propagar is not None:
+            try:
+                propagar()
+            except Exception:  # noqa: BLE001 - adoptar no puede fallar hacia fuera
+                log.exception("[APP] no se pudo propagar la cuenta al adoptar")
         with self._candado:
             self._runtimes[clave] = runtime
         log.info("[APP] runtime existente adoptado para la cuenta %s", clave[:8])

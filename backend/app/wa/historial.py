@@ -63,6 +63,22 @@ class HistoryConversation:
     # que NO significa terminar: quedan mensajes en el telefono.
     end_of_history_type: int | None = None
     end_of_history: bool = False
+    # -- Estado de la conversacion, tal y como lo declara WhatsApp ----------
+    #
+    # Los cuatro vienen en `proto.Conversation` y se estaban tirando. Por eso
+    # no habia forma de separar los archivados ni de saber cuales son los
+    # "chats restringidos".
+    #
+    # NULO NO ES `False`. Un lote puede traer una conversacion solo por sus
+    # mensajes, sin su `proto.Conversation`; entonces no se sabe nada de su
+    # estado y hay que decirlo, porque `False` se escribe en la base y pisa lo
+    # que si se sabia. Por defecto `None`: quien no diga nada, no cambia nada.
+    archived: bool | None = None
+    locked: bool | None = None
+    #: Marca de tiempo, no booleano. Nulo es "no fijado".
+    pinned_at: int | None = None
+    #: WhatsApp usa 0 para "para siempre".
+    mute_until: int | None = None
 
 
 @dataclass
@@ -239,6 +255,16 @@ def parse_full(raw: bytes) -> FullHistorySync:
     )
 
 
+def _o_nulo(valor: Any) -> bool | None:
+    """``None`` se queda en ``None``; lo demas se convierte a booleano.
+
+    Los tres estados importan: ``True`` y ``False`` son datos que el receptor
+    escribe, y ``None`` es "no lo se", que el receptor respeta dejando lo
+    guardado como estaba.
+    """
+    return None if valor is None else bool(valor)
+
+
 def parse_full_json(datos: dict[str, Any]) -> FullHistorySync:
     """El mismo blob, pero como lo entrega Baileys: JSON, no protobuf.
 
@@ -276,6 +302,15 @@ def parse_full_json(datos: dict[str, Any]) -> FullHistorySync:
                 messages=mensajes,
                 end_of_history_type=c.get("end_of_history_type"),
                 end_of_history=bool(c.get("end_of_history")),
+                # `bool(None)` es `False`, y aqui esa conversion mentia: el
+                # traductor manda nulo cuando la conversacion llego SIN sus
+                # metadatos, y convertirlo en `False` afirmaba "no esta
+                # archivado" sobre algo que no se sabia. Ese `False` llegaba a
+                # `upsert_chat` y pisaba el `True` de un lote anterior.
+                archived=_o_nulo(c.get("archived")),
+                locked=_o_nulo(c.get("locked")),
+                pinned_at=c.get("pinned_at"),
+                mute_until=c.get("mute_until"),
             )
         )
     return FullHistorySync(

@@ -42,12 +42,19 @@ def registro() -> Any:
     return current_app.config.get("RUNTIME_REGISTRY")
 
 
-def cuenta_del_usuario_actual(*, crear: bool = False) -> Any:
-    """La cuenta de WhatsApp de quien hace esta peticion.
+def cuenta_del_usuario_actual(*, crear: bool = False, pedida: Any = None) -> Any:
+    """La cuenta de WhatsApp sobre la que va esta peticion.
 
     :param crear: si no tiene ninguna, crearla. Solo para el emparejamiento:
         el resto de rutas debe encontrarla ya hecha, y si no la hay la
         respuesta correcta es "vincula", no "toma la de otro".
+    :param pedida: identificador que llega del cliente. Se COMPRUEBA contra
+        sus membresias; si no es suya se ignora y se sigue con la activa. No
+        se responde un error distinto porque eso confirmaria que esa cuenta
+        existe, y con eso se pueden ir tanteando identificadores.
+
+    Sin ``pedida``, la ACTIVA. Con varias cuentas, "la primera que salga"
+    haria que el usuario abriera un WhatsApp u otro segun el humor del motor.
     """
     from app.api.routes import runtime as runtime_base
     from app.auth.web import usuario_actual
@@ -61,9 +68,18 @@ def cuenta_del_usuario_actual(*, crear: bool = False) -> Any:
     if cuentas is None or rt.database is None:
         return None
 
-    from app.auth.memberships import cuenta_efectiva_de
+    from app.auth.memberships import cuenta_efectiva_de, tiene_acceso
+    from app.models import WhatsAppAccount
+
+    if pedida is None:
+        pedida = _cuenta_pedida_en_la_peticion()
 
     with rt.database.transaction() as sesion:
+        if pedida is not None and tiene_acceso(sesion, yo.id, pedida):
+            fila = sesion.get(WhatsAppAccount, pedida)
+            if fila is not None:
+                sesion.expunge(fila)
+                return fila
         mia = cuenta_efectiva_de(sesion, yo.id)
         if mia is not None:
             return mia
@@ -74,8 +90,32 @@ def cuenta_del_usuario_actual(*, crear: bool = False) -> Any:
     return cuentas.asegurar_cuenta(yo.id)
 
 
-def runtime_de_mi_cuenta(*, crear: bool = False) -> Any:
-    """El runtime de la cuenta de quien hace esta peticion.
+def _cuenta_pedida_en_la_peticion() -> Any:
+    """``?account_id=`` o ``X-WhatsApp-Account``, si hay peticion HTTP.
+
+    Los dos sitios porque no todo se puede parametrizar: el canal de eventos
+    se abre con ``EventSource``, que no deja poner cabeceras, y una imagen se
+    pide con una etiqueta ``<img>``. Con los dos, cualquier via puede decir de
+    que cuenta habla.
+
+    Fuera de una peticion --tareas de fondo, arranque-- devuelve ``None`` sin
+    quejarse: ahi no hay navegador que pueda pedir nada.
+    """
+    try:
+        from flask import has_request_context, request
+    except Exception:  # noqa: BLE001 - sin Flask no hay peticion
+        return None
+    if not has_request_context():
+        return None
+    return (
+        request.args.get("account_id")
+        or request.headers.get("X-WhatsApp-Account")
+        or None
+    )
+
+
+def runtime_de_mi_cuenta(*, crear: bool = False, pedida: Any = None) -> Any:
+    """El runtime de la cuenta sobre la que va esta peticion.
 
     Devuelve ``None`` cuando esa persona todavia no tiene cuenta -- y eso
     significa "hay que vincular", nunca "usa la de al lado".
@@ -86,7 +126,7 @@ def runtime_de_mi_cuenta(*, crear: bool = False) -> Any:
     """
     from app.api.routes import runtime as runtime_base
 
-    cuenta = cuenta_del_usuario_actual(crear=crear)
+    cuenta = cuenta_del_usuario_actual(crear=crear, pedida=pedida)
     if cuenta is None:
         return None
 
@@ -294,8 +334,64 @@ def levantar_las_demas(app: Any) -> list[Any]:
     reg = app.config.get("RUNTIME_REGISTRY")
     if reg is None:
         return []
+
+    # ANTES de levantar nada: que la base diga lo que dicen las credenciales.
+    #
+    # `levantar_las_vinculadas` elige por `session_status`. Una cuenta que
+    # vinculo de verdad pero quedo anotada como `never_linked` no se levanta,
+    # no aparece en el selector, y el usuario ve una sola cuenta cuando tiene
+    # dos. Paso: el telefono de Ale estaba en una fila `never_linked` con sus
+    # credenciales completas al lado.
+    _reetiquetar_desde_las_credenciales(reg)
+
     try:
         return reg.levantar_las_vinculadas()
     except Exception:  # noqa: BLE001 - el arranque no se cae por esto
         log.exception("[APP] fallo levantando los runtimes de las cuentas")
         return []
+
+
+def _reetiquetar_desde_las_credenciales(reg: Any) -> None:
+    """Corrige el numero, el nombre y el estado de cada cuenta. Nunca lanza.
+
+    Es barato --leer un JSON pequeno por cuenta-- y se hace una vez por
+    arranque. Ver `app/auth/atribucion.py` para el fallo que cierra.
+    """
+    try:
+        from app.auth.atribucion import reconciliar_con_las_credenciales
+
+        base = getattr(reg, "_database", None)
+        ajustes = getattr(reg, "_settings", None)
+        if base is None or ajustes is None:
+            return
+        # PRIMERO barrer las huerfanas, y no es cosmetico.
+        #
+        # `identidad_de_la_cuenta` solo atribuye la carpeta del runtime base
+        # si hay UNA candidata sin credenciales propias. Cada intento de
+        # vinculacion abandonado deja una fila mas, y con varias se niega a
+        # adivinar: la cuenta se sella entonces sin nombre ni numero y el
+        # selector la enseña como "Cuenta sin vincular" mientras extrae chats.
+        from app.auth.atribucion import barrer_cuentas_huerfanas
+        from app.models import WhatsAppAccount
+
+        with base.transaction() as sesion:
+            duenos = {
+                str(f[0])
+                for f in sesion.execute(select(WhatsAppAccount.user_id).distinct())
+            }
+        for dueno in duenos:
+            barrer_cuentas_huerfanas(base, ajustes, user_id=dueno)
+
+        informe = reconciliar_con_las_credenciales(base, ajustes)
+        if informe.duplicadas:
+            for telefono, cuentas in informe.duplicadas.items():
+                log.error(
+                    "[APP] El telefono %s esta vinculado en %d cuentas (%s). "
+                    "Sus conversaciones estan guardadas por duplicado; hay "
+                    "que quedarse con una sola.",
+                    telefono,
+                    len(cuentas),
+                    ", ".join(cuentas),
+                )
+    except Exception:  # noqa: BLE001 - reetiquetar no puede impedir el arranque
+        log.exception("[APP] no se pudo reetiquetar las cuentas")

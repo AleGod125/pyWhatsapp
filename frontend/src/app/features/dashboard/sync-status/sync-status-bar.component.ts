@@ -50,6 +50,19 @@ import { SyncStatus } from '../../../core/models/api.models';
           <span class="status-bar__sep">·</span>
           {{ tiempoTranscurrido() }}
         </span>
+      } @else if (subiendoADrive()) {
+        <!-- EXTRAER Y SUBIR SON DOS CARRILES, y terminan en momentos
+             distintos. El excavador no espera a Drive --nunca lo hizo: el
+             trabajador de subida corre en su propio hilo-- así que la
+             extracción acaba antes. Decir «completada» ahí es cierto y
+             engañoso a la vez: quedan miles de mensajes sin copiar. -->
+        <span class="status-bar__dot" aria-hidden="true"></span>
+        <span>
+          Extracción completa
+          <span class="status-bar__sep">·</span>
+          Subiendo a Drive
+          <strong>{{ driveHechos() | number }} / {{ driveTotal() | number }}</strong>
+        </span>
       } @else if (mostrarCompletado()) {
         <span class="status-bar__dot status-bar__dot--fijo" aria-hidden="true"></span>
         <span>Sincronización completada @if (finalizadaEn(); as fecha) { · {{ fecha }} }</span>
@@ -143,7 +156,35 @@ export class SyncStatusBarComponent implements OnDestroy {
   readonly excavando = computed(() => this.status()?.state === 'running');
   readonly chatsProcesados = computed(() => this.status()?.chatsProcessed ?? 0);
   readonly chatsTotal = computed(() => this.status()?.chatsTotal || undefined);
-  readonly mensajes = computed(() => this.status()?.messagesNew ?? 0);
+  /**
+   * Los mensajes que lleva traídos esta corrida.
+   *
+   * Se prefiere `messagesInRun`, que sale de contar filas en la base. El
+   * `messagesNew` de antes dependía de que el blob llegara mientras un
+   * observador estaba abierto, y llega después: la barra decía «0 mensajes»
+   * durante veinte minutos con 6314 ya guardados. Se conserva como respaldo
+   * para un backend que todavía no mande el campo nuevo.
+   */
+  readonly mensajes = computed(() => {
+    const estado = this.status();
+    return estado?.messagesInRun ?? estado?.messagesNew ?? 0;
+  });
+
+  /** Lo que ya está confirmado en Drive, y el total al que va. */
+  readonly driveHechos = computed(() => this.status()?.driveDone ?? 0);
+  readonly driveTotal = computed(
+    () => this.driveHechos() + (this.status()?.drivePending ?? 0),
+  );
+
+  /**
+   * Ya no se excava, pero Drive sigue.
+   *
+   * Solo se anuncia cuando de verdad falta algo: con la cola vacía esto no
+   * aparece y la barra dice «completada», que entonces sí es toda la verdad.
+   */
+  readonly subiendoADrive = computed(
+    () => !this.excavando() && (this.status()?.drivePending ?? 0) > 0,
+  );
 
   /** "Sincronización completada" / "detenida", solo unos segundos. */
   private readonly mostrarCompletadoHasta = signal(0);

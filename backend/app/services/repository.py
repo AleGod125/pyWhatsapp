@@ -11,6 +11,7 @@ aplican en todo el modulo:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -50,7 +51,9 @@ def is_valid_history_cursor_id(message_id: str | None) -> bool:
     return not any(lowered.startswith(prefix) for prefix in SYNTHETIC_PREFIXES)
 
 
-def get_oldest_valid_history_cursor(session: Session, chat_jid: str) -> HistoryCursor | None:
+def get_oldest_valid_history_cursor(
+    session: Session, chat_jid: str, *, chat_id: int | None = None
+) -> HistoryCursor | None:
     """Mensaje mas antiguo del chat QUE TENGA UN ID REAL DE WHATSAPP.
 
     Ojo con la distincion, que es la causa de un bug historico:
@@ -66,11 +69,18 @@ def get_oldest_valid_history_cursor(session: Session, chat_jid: str) -> HistoryC
 
     Devuelve ``None`` si el chat no tiene ningun mensaje con ID utilizable;
     ese chat es ``no_valid_cursor``, no un error.
+
+    ``chat_id`` acota a UNA conversacion. Sin el se buscan los mensajes por
+    ``chat_jid``, que se repite en cuanto dos cuentas hablan con el mismo
+    contacto: el ancla saldria de la conversacion de otra persona, y ON_DEMAND
+    pediria historial anclado en un mensaje que este telefono no conoce.
     """
     stmt = (
         select(Message.whatsapp_message_id, Message.timestamp)
         .where(
-            Message.chat_jid == chat_jid,
+            Message.chat_id == chat_id
+            if chat_id is not None
+            else Message.chat_jid == chat_jid,
             Message.whatsapp_message_id.is_not(None),
             Message.whatsapp_message_id != "",
         )
@@ -106,12 +116,31 @@ def upsert_chat(
     last_message_timestamp: int | None = None,
     raw_metadata: dict[str, Any] | None = None,
     whatsapp_account_id: Any = None,
+    archived: bool | None = None,
+    locked: bool | None = None,
+    pinned_at: int | None = None,
+    mute_until: int | None = None,
 ) -> int:
     """Inserta o actualiza un chat y devuelve su ``id``.
 
     Los campos que llegan como ``None`` NO pisan lo que ya hubiera: History
     Sync y los mensajes live traen informacion parcial distinta y un update
     ciego borraria el nombre que ya se habia resuelto.
+
+    EL ESTADO DE LA CONVERSACION VIAJA JUNTO
+    ----------------------------------------
+    ``archived``, ``locked``, ``pinned_at`` y ``mute_until`` son una excepcion
+    a la regla de arriba, y tienen que serlo: aqui ``False`` y ``NULL`` son
+    datos, no ausencias. Desarchivar un chat es exactamente mandar
+    ``archived=False``, y dejar de fijarlo es mandar ``pinned_at=None``; si se
+    ignorara lo vacio, un chat archivado no podria volver nunca a la lista
+    normal.
+
+    Por eso los cuatro llegan juntos o no llega ninguno. Quien los sabe --el
+    historial, que los recibe en cada ``proto.Conversation``-- los manda todos;
+    quien no --un mensaje en vivo, que solo trae texto y hora-- no manda
+    ninguno y el estado guardado se queda como estaba. ``archived`` es el que
+    marca la diferencia entre los dos casos.
 
     ``whatsapp_account_id`` dice DE QUIEN es el chat. Sin el, el chat queda
     sin dueno y el filtro de propiedad lo excluye de la lista: existe en la
@@ -152,6 +181,20 @@ def upsert_chat(
         if value is not None:
             values[column] = value
 
+    # El estado de la conversacion, TAL CUAL, vacios incluidos. Tiene que ir
+    # antes de construir el INSERT: `values` ya no se relee despues.
+    estado = (
+        {
+            "archived": bool(archived),
+            "locked": bool(locked),
+            "pinned_at": pinned_at,
+            "mute_until": mute_until,
+        }
+        if archived is not None
+        else {}
+    )
+    values.update(estado)
+
     stmt = insert(Chat).values(**values)
     updates = {
         column: func.coalesce(stmt.excluded[column], Chat.__table__.c[column])
@@ -176,11 +219,93 @@ def upsert_chat(
             stmt.excluded.last_message_timestamp,
         )
 
+    # `coalesce` no vale aqui: dejaria de fijar un chat imposible, porque
+    # NULL significa "ya no esta fijado", no "no lo se".
+    updates.update({columna: stmt.excluded[columna] for columna in estado})
+
     # El destino del conflicto sale de un solo sitio.
     stmt = stmt.on_conflict_do_update(
         index_elements=destino_de_conflicto(Chat, "jid"), set_=updates
     ).returning(Chat.id)
     return session.execute(stmt).scalar_one()
+
+
+def marcar_estado_de_chat(
+    database: Any,
+    jid: str,
+    *,
+    whatsapp_account_id: Any,
+    archived: bool | None = None,
+    pinned: Any = None,
+    muted: Any = None,
+) -> bool:
+    """Archiva, fija o silencia un chat que YA existe. Devuelve si cambio algo.
+
+    POR QUE NO PASA POR ``upsert_chat``
+    -----------------------------------
+    Esto llega de ``chats.update``, que avisa de un cambio sobre una
+    conversacion que el telefono ya conoce. Si el chat no esta en la base, no
+    hay que crearlo: crearlo aqui produciria una fila sin nombre, sin mensajes
+    y sin tipo, solo para anotar que esta archivada. Se ignora y ya.
+
+    LO QUE LLEGA Y LO QUE SE GUARDA NO ES LO MISMO
+    ----------------------------------------------
+    El evento dice "fijado si/no"; la columna guarda CUANDO se fijo, porque
+    entre varios fijados el orden es ese. Cuando el evento trae la marca de
+    tiempo se usa; cuando solo trae el si/no --versiones viejas del worker--
+    se usa la hora actual, que es una aproximacion honesta: el chat se acaba
+    de fijar.
+
+    Con el silencio pasa lo mismo, y ahi hay una trampa: WhatsApp usa 0 para
+    "silenciado para siempre". Colapsar 0 con "sin silenciar" haria que un
+    chat silenciado indefinidamente apareciera como normal.
+
+    ``locked`` NO esta aqui: Baileys no procesa ``lockChatAction``, asi que no
+    existe el evento en vivo. Los chats restringidos solo los sabe el
+    historial.
+    """
+    valores: dict[str, Any] = {}
+    if archived is not None:
+        valores["archived"] = bool(archived)
+    if pinned is not None:
+        valores["pinned_at"] = _marca_de_fijado(pinned)
+    if muted is not None:
+        valores["mute_until"] = _marca_de_silencio(muted)
+    if not valores:
+        return False
+
+    with database.transaction() as session:
+        filas = session.execute(
+            update(Chat)
+            .where(Chat.jid == jid, Chat.whatsapp_account_id == whatsapp_account_id)
+            .values(**valores)
+        ).rowcount
+    return bool(filas)
+
+
+def _marca_de_fijado(pinned: Any) -> int | None:
+    """La marca de tiempo en que se fijo, o ``None`` si dejo de estarlo."""
+    if pinned is False or pinned is None:
+        return None
+    if pinned is True:
+        return int(time.time())
+    try:
+        return int(pinned) or int(time.time())
+    except (TypeError, ValueError):
+        return int(time.time())
+
+
+def _marca_de_silencio(muted: Any) -> int | None:
+    """Hasta cuando esta silenciado. ``None`` es "no lo esta"; 0 es "siempre"."""
+    if muted is False or muted is None:
+        return None
+    if muted is True:
+        # Sin fecha de fin, "silenciado" solo puede significar indefinido.
+        return 0
+    try:
+        return int(muted)
+    except (TypeError, ValueError):
+        return 0
 
 
 def upsert_contact(
@@ -394,9 +519,19 @@ def _row(message: IncomingMessage, chat_id: int) -> dict[str, Any]:
     }
 
 
-def count_messages(session: Session, chat_jid: str | None = None) -> int:
+def count_messages(
+    session: Session, chat_jid: str | None = None, *, chat_id: int | None = None
+) -> int:
+    """Cuantos mensajes hay. Con ``chat_id`` se cuenta UNA conversacion.
+
+    ``chat_jid`` sigue admitiendose porque hay llamadas que solo lo tienen,
+    pero cuenta los de TODAS las cuentas que hablen con ese contacto: para un
+    recuento por conversacion hay que pasar ``chat_id``.
+    """
     stmt = select(func.count()).select_from(Message)
-    if chat_jid is not None:
+    if chat_id is not None:
+        stmt = stmt.where(Message.chat_id == chat_id)
+    elif chat_jid is not None:
         stmt = stmt.where(Message.chat_jid == chat_jid)
     return session.execute(stmt).scalar_one()
 
@@ -511,11 +646,22 @@ class ChatSummary:
     last_message: str | None
     last_message_timestamp: int | None
     message_count: int
+    # Los que NO son avisos del sistema. Es lo que decide si esta
+    # conversacion se lista: WhatsApp reparte "este chat pasa a estar cifrado"
+    # a contactos con los que nunca se ha hablado, y eso no es un chat.
+    real_message_count: int = 0
     # El estado del historial viaja CON la fila del sidebar. Sin el, el
     # frontend no puede distinguir "no se pudo interpretar el mensaje" de
     # "todavia no hay una referencia para pedir el historial", y acaba
     # pintando "Mensaje no compatible" sobre chats que solo esperan semilla.
     history_status: str | None = None
+    # El estado de la conversacion. Viaja con la fila porque el sidebar lo
+    # pinta --el altavoz tachado, la chincheta-- y porque el orden de la lista
+    # normal depende de `pinned_at`.
+    archived: bool = False
+    locked: bool = False
+    pinned_at: int | None = None
+    mute_until: int | None = None
 
 
 def display_name_for(
@@ -566,8 +712,25 @@ def list_chat_summaries(
     limit: int = 500,
     accounts: list | None = None,
     solo_con_mensajes: bool = False,
+    vista: str = "normal",
 ) -> list[ChatSummary]:
     """Chats para el sidebar con nombre resuelto y numero de mensajes.
+
+    ``vista`` elige QUE seccion se pide, como en WhatsApp Web:
+
+    ``normal``
+        Lo que se ve al abrir. Deja fuera los archivados y los restringidos:
+        el sentido de las dos cosas es justamente no aparecer aqui.
+    ``archivados``
+        Los archivados que no esten ademas restringidos. Un chat restringido
+        y archivado pertenece a los restringidos, que es la seccion mas
+        cerrada de las dos.
+    ``restringidos``
+        Los "chats bloqueados". Se listan esten archivados o no.
+
+    Un valor que no sea ninguno de los tres se trata como ``normal``: es lo
+    que llega de la URL, y un parametro mal escrito no puede acabar
+    ensenando lo que estaba escondido.
 
     ``solo_con_mensajes`` deja fuera las conversaciones donde no se ha escrito
     nada: las que solo tienen avisos del sistema y las que aun no se han
@@ -621,6 +784,10 @@ def list_chat_summaries(
             func.coalesce(message_counts.c.total, 0),
             ChatHistoryState.history_status,
             func.coalesce(message_counts.c.reales, 0),
+            Chat.archived,
+            Chat.locked,
+            Chat.pinned_at,
+            Chat.mute_until,
         )
         .outerjoin(Contact, (
                 (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
@@ -628,7 +795,13 @@ def list_chat_summaries(
             & (Contact.whatsapp_account_id == Chat.whatsapp_account_id))
         .outerjoin(message_counts, message_counts.c.chat_id == Chat.id)
         .outerjoin(ChatHistoryState, ChatHistoryState.chat_id == Chat.id)
-        .order_by(Chat.last_message_timestamp.desc().nulls_last(), Chat.id.desc())
+        .order_by(
+            # Los fijados van arriba, y entre ellos manda CUANDO se fijaron.
+            # `nulls_last` es lo que deja abajo a los que no lo estan.
+            Chat.pinned_at.desc().nulls_last(),
+            Chat.last_message_timestamp.desc().nulls_last(),
+            Chat.id.desc(),
+        )
         .limit(limit)
     )
 
@@ -650,6 +823,14 @@ def list_chat_summaries(
         Chat.jid.notin_(["0@s.whatsapp.net", "status@broadcast"]),
         func.split_part(Chat.jid, "@", 1).notin_(["", "0"]),
     )
+
+    # LA SECCION. Por defecto, la lista normal.
+    if vista == "archivados":
+        stmt = stmt.where(Chat.archived.is_(True), Chat.locked.is_(False))
+    elif vista == "restringidos":
+        stmt = stmt.where(Chat.locked.is_(True))
+    else:
+        stmt = stmt.where(Chat.archived.is_(False), Chat.locked.is_(False))
 
     if solo_con_mensajes:
         stmt = stmt.where(func.coalesce(message_counts.c.reales, 0) > 0)
@@ -678,7 +859,11 @@ def list_chat_summaries(
             contact_jid,
             total,
             history_status,
-            _reales,
+            reales,
+            archivado,
+            restringido,
+            fijado_en,
+            silenciado_hasta,
         ) = row
         summaries.append(
             ChatSummary(
@@ -691,10 +876,45 @@ def list_chat_summaries(
                 last_message=last_message,
                 last_message_timestamp=last_timestamp,
                 message_count=total,
+                real_message_count=reales,
                 history_status=history_status,
+                archived=bool(archivado),
+                locked=bool(restringido),
+                pinned_at=fijado_en,
+                mute_until=silenciado_hasta,
             )
         )
     return summaries
+
+
+#: Identificadores que NUNCA son una conversacion.
+#:
+#: ``0@s.whatsapp.net`` es la cuenta de servicio de WhatsApp --por ahi entran
+#: los avisos del propio sistema-- y en el panel salia como un contacto
+#: llamado "+0". ``status@broadcast`` son los estados.
+JIDS_QUE_NO_SON_CHAT = frozenset({"0@s.whatsapp.net", "status@broadcast"})
+
+
+def se_lista(resumen: "ChatSummary") -> bool:
+    """Si esta conversacion tiene sitio en el panel.
+
+    LA MISMA REGLA PARA LOS DOS CAMINOS
+    -----------------------------------
+    Una fila del sidebar llega por dos sitios: el listado (``/chats``) y los
+    avisos en vivo, que la mandan ya montada para no obligar a recargar.
+
+    El listado filtraba y los avisos no, asi que durante una excavacion se
+    colaban por la puerta de atras las conversaciones que el listado dejaba
+    fuera -- y el usuario veia aparecer "+0" y chats con un solo aviso de
+    cifrado, justo lo que el filtro existe para evitar. Con la regla aqui, los
+    dos caminos deciden igual.
+    """
+    if resumen.jid in JIDS_QUE_NO_SON_CHAT:
+        return False
+    usuario = resumen.jid.split("@")[0]
+    if usuario in ("", "0"):
+        return False
+    return resumen.real_message_count > 0
 
 
 def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
@@ -716,6 +936,18 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
             Contact.display_name,
             Contact.push_name,
             Contact.jid,
+            # EL ESTADO VIAJA TAMBIEN AQUI, y no es opcional.
+            #
+            # Esta fila es la que manda el canal en vivo en `chat.updated`. Sin
+            # estas columnas llegaria con `archived=False` y `locked=False` por
+            # omision, y el panel colocaria en la lista normal un chat que el
+            # usuario habia archivado --o, peor, uno RESTRINGIDO-- en cuanto
+            # recibiera un mensaje. Destapar un chat restringido con solo
+            # escribirle es exactamente lo que la funcion existe para impedir.
+            Chat.archived,
+            Chat.locked,
+            Chat.pinned_at,
+            Chat.mute_until,
         )
         .outerjoin(Contact, (
                 (Contact.jid == Chat.jid) | (Contact.lid == Chat.jid)
@@ -727,12 +959,18 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
     if fila is None:
         return None
 
-    total = session.execute(
-        select(func.count()).select_from(Message).where(Message.chat_id == chat_id)
-    ).scalar_one()
+    total, reales = session.execute(
+        select(
+            func.count(),
+            func.count().filter(Message.message_type != "system"),
+        )
+        .select_from(Message)
+        .where(Message.chat_id == chat_id)
+    ).one()
     (
         row_id, jid, name, chat_type, last_message, last_timestamp,
         contact_name, push_name, contact_jid,
+        archivado, restringido, fijado_en, silenciado_hasta,
     ) = fila
     return ChatSummary(
         id=row_id,
@@ -744,6 +982,11 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
         last_message=last_message,
         last_message_timestamp=last_timestamp,
         message_count=total,
+        real_message_count=reales,
+        archived=bool(archivado),
+        locked=bool(restringido),
+        pinned_at=fijado_en,
+        mute_until=silenciado_hasta,
     )
 
 
@@ -757,8 +1000,22 @@ def chat_summary(session: Session, chat_id: int) -> ChatSummary | None:
 def get_or_create_history_state(
     session: Session, *, chat_id: int, chat_jid: str
 ) -> ChatHistoryState:
+    """El estado de historial de ESA conversacion, creandolo si no existe.
+
+    POR ``chat_id``, NUNCA por ``chat_jid``.
+    ---------------------------------------
+    El jid deja de ser unico en cuanto dos cuentas hablan con el mismo
+    contacto: hay una conversacion por cuenta, cada una con su estado. Buscar
+    por jid devolvia DOS filas y `scalar_one_or_none()` reventaba con
+    "Multiple rows were found", tumbando la ingesta entera del blob.
+
+    Se midio en cuanto existieron dos cuentas: todos los History Sync
+    fallaban, y con ellos la excavacion y los mensajes en vivo.
+
+    El ``chat_id`` ya viene, y es unico: apunta a un chat que tiene cuenta.
+    """
     state = session.execute(
-        select(ChatHistoryState).where(ChatHistoryState.chat_jid == chat_jid)
+        select(ChatHistoryState).where(ChatHistoryState.chat_id == chat_id)
     ).scalar_one_or_none()
     if state is None:
         state = ChatHistoryState(chat_id=chat_id, chat_jid=chat_jid, history_status="pending")
@@ -767,24 +1024,43 @@ def get_or_create_history_state(
     return state
 
 
-def refresh_history_state(session: Session, chat_jid: str) -> None:
-    """Recalcula contadores y cursor del chat a partir de los mensajes."""
+def refresh_history_state(
+    session: Session, chat_jid: str, *, chat_id: int | None = None
+) -> None:
+    """Recalcula contadores y cursor del chat a partir de sus mensajes.
+
+    ``chat_id`` no es un adorno: sin el, tanto la fila de estado como los
+    contadores se buscan por ``chat_jid``, que se repite en cuanto dos cuentas
+    hablan con el mismo contacto. El resultado eran dos cosas a la vez:
+    `scalar_one_or_none()` reventando, y --cuando no reventaba-- un recuento
+    que sumaba los mensajes de LAS DOS conversaciones.
+    """
+    if chat_id is None:
+        # Ultimo recurso para las llamadas que aun no lo saben. Si el jid da
+        # mas de un chat no se elige: se deja como estaba, que es mejor que
+        # mezclar dos conversaciones en un contador.
+        from app.services.account_scope import chat_id_de
+
+        chat_id = chat_id_de(session, chat_jid)
+        if chat_id is None:
+            return
+
     state = session.execute(
-        select(ChatHistoryState).where(ChatHistoryState.chat_jid == chat_jid)
+        select(ChatHistoryState).where(ChatHistoryState.chat_id == chat_id)
     ).scalar_one_or_none()
     if state is None:
         return
 
-    cursor = get_oldest_valid_history_cursor(session, chat_jid)
+    cursor = get_oldest_valid_history_cursor(session, chat_jid, chat_id=chat_id)
     newest = session.execute(
-        select(func.max(Message.timestamp)).where(Message.chat_jid == chat_jid)
+        select(func.max(Message.timestamp)).where(Message.chat_id == chat_id)
     ).scalar_one_or_none()
 
     session.execute(
         update(ChatHistoryState)
         .where(ChatHistoryState.id == state.id)
         .values(
-            message_count=count_messages(session, chat_jid),
+            message_count=count_messages(session, chat_id=chat_id),
             oldest_message_id=cursor.message_id if cursor else None,
             oldest_message_timestamp=cursor.timestamp if cursor else None,
             newest_message_timestamp=newest,

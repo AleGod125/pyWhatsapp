@@ -512,29 +512,46 @@ def _whatsapp_vinculado(rt: Any, usuario: Any) -> bool:
     # Con el estado vivo diciendo que no hay vinculacion utilizable, no se
     # puede contestar que la hay. La columna se corregira cuando se archive;
     # el enrutado no puede esperar a eso.
-    if _sin_vinculacion_utilizable(rt, usuario):
+    if _sin_vinculacion_utilizable(rt, usuario) and not _tiene_otra_utilizable(
+        rt, usuario
+    ):
         return False
 
-    # La cuenta se resuelve por MEMBRESIA. `whatsapp_accounts.user_id` dice
-    # quien CREO la vinculacion; la membresia dice quien puede usarla, y son
-    # cosas distintas en cuanto una cuenta se comparte entre varias personas.
+    # LA PREGUNTA ES POR EL USUARIO, NO POR LA CUENTA ACTIVA.
     #
-    # Se conserva la lectura por `user_id` como respaldo: mientras una
-    # vinculacion se esta completando puede existir la fila de cuenta y aun no
-    # la de membresia, y perder el acceso en ese hueco mandaria al usuario a
-    # escanear otra vez algo que acaba de escanear.
-    from app.auth.memberships import cuenta_efectiva_de
+    # Antes se miraba solo `cuenta_efectiva_de` --la activa-- y se contestaba
+    # por ella. Con varias cuentas eso encierra al usuario:
+    #
+    #   * agrega una cuenta nueva: nace `never_linked` y se vuelve la activa,
+    #     asi que el onboarding contesta "pairing" y el guard lo saca del
+    #     panel... donde esta el selector con el que volveria a la buena;
+    #   * o desvincula una desde el telefono estando esa activa, y pasa igual
+    #     aunque las otras funcionen perfectamente.
+    #
+    # Medido en la base del usuario: tenia dos cuentas vinculadas y una tercera
+    # recien creada como activa. El onboarding decia "pairing", el pairing
+    # decia "conexion confirmada" y navegaba al panel, y el guard lo devolvia
+    # al pairing. Un bucle sin salida sobre una cuenta que si funcionaba.
+    #
+    # "Ya vinculo" significa que tiene AL MENOS UNA utilizable. Cual mira es
+    # cosa del selector, y el selector vive en el panel.
+    from app.auth.memberships import cuentas_de_usuario
 
     with rt.database.transaction() as session_db:
-        mia = cuenta_efectiva_de(session_db, usuario.id)
-        if mia is not None:
-            return mia.session_status in LINKED_STATUSES
+        suyas = cuentas_de_usuario(session_db, usuario.id)
+        estados = [c.session_status for c in suyas]
 
-        estados = session_db.execute(
-            select(WhatsAppAccount.session_status).where(
-                WhatsAppAccount.user_id == usuario.id
-            )
-        ).scalars().all()
+    if not estados:
+        # Respaldo por la via antigua: durante una vinculacion a medias puede
+        # existir la fila de cuenta y todavia no la de membresia, y mandar a
+        # escanear otra vez lo que se acaba de escanear seria el peor momento.
+        with rt.database.transaction() as session_db:
+            estados = session_db.execute(
+                select(WhatsAppAccount.session_status).where(
+                    WhatsAppAccount.user_id == usuario.id
+                )
+            ).scalars().all()
+
     return any(e in LINKED_STATUSES for e in estados)
 
 
@@ -569,6 +586,28 @@ def _sin_vinculacion_utilizable(rt: Any, usuario: Any) -> bool:
     return dueno == usuario.id
 
 
+def _tiene_otra_utilizable(rt: Any, usuario: Any) -> bool:
+    """Si le queda alguna cuenta ademas de la que el runtime da por perdida.
+
+    El runtime consultado es el de UNA cuenta. Que esa este muerta no puede
+    sacar del panel a quien tiene otra funcionando: lo que hay que hacer
+    entonces es cambiar de cuenta, y eso se hace desde el panel.
+    """
+    from app.auth.memberships import cuentas_de_usuario
+    from app.models.accounts import LINKED_STATUSES
+
+    esta = getattr(rt, "runtime_owner_account_id", None)
+    try:
+        with rt.database.transaction() as sesion:
+            return any(
+                c.session_status in LINKED_STATUSES
+                and (esta is None or str(c.id) != str(esta))
+                for c in cuentas_de_usuario(sesion, usuario.id)
+            )
+    except Exception:  # noqa: BLE001 - ante la duda, no se inventa una cuenta
+        return False
+
+
 def _reconciliar_si_hace_falta(rt: Any, usuario: Any) -> None:
     """Corrige la base cuando el runtime dice conectado y ella no.
 
@@ -582,7 +621,23 @@ def _reconciliar_si_hace_falta(rt: Any, usuario: Any) -> None:
     if rt.runtime_owner_user_id is None or rt.runtime_owner_user_id != usuario.id:
         return
     try:
-        cuentas.marcar_vinculada(usuario.id, pn=None, lid=None)
-        log.info("[APP] Cuenta del runtime reconciliada como vinculada")
+        # LA CUENTA DEL RUNTIME, no "la primera del usuario". Con dos
+        # cuentas, reconciliar sin decir cual marcaria como vinculada la
+        # mas antigua aunque la que acaba de conectar sea la otra.
+        sellada = cuentas.marcar_vinculada(
+            usuario.id,
+            pn=None,
+            lid=None,
+            account_id=rt.runtime_owner_account_id,
+        )
+        if sellada:
+            log.info(
+                "[APP] Cuenta %s reconciliada como vinculada",
+                str(rt.runtime_owner_account_id)[:8],
+            )
+        # Si no se sello, `marcar_vinculada` ya dijo por que. Aqui NO se
+        # escribe nada: esta funcion se llama en cada peticion de sesion, y
+        # antes dejaba una linea "reconciliada como vinculada" cada pocos
+        # segundos sobre una cuenta que seguia sin numero.
     except Exception:  # noqa: BLE001 - reconciliar no puede tumbar el estado
         log.debug("No se pudo reconciliar la cuenta del runtime")

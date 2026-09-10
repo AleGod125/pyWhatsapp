@@ -226,7 +226,24 @@ def setup_logging(
 
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        # EL LOG ROTA. Antes era un `FileHandler` a secas, en DEBUG y sin
+        # tope: crecia mientras el servicio estuviera vivo. Se midio en 106 MB
+        # --el fichero mas grande del proyecto despues del entorno virtual--
+        # y con el una consulta tan simple como "que paso hace un rato" habia
+        # que hacerla sobre cien megas de texto.
+        #
+        # Cinco tandas de 20 MB: 100 MB de tope duro, y el historial que hace
+        # falta de verdad --las ultimas horas-- sigue entero. `delay` evita
+        # crear el fichero hasta que haya algo que escribir.
+        from logging.handlers import RotatingFileHandler
+
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+            delay=True,
+        )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(
             logging.Formatter(

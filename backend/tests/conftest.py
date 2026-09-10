@@ -25,8 +25,31 @@ from app.core.database import Database, DatabaseError  # noqa: E402
 
 
 @pytest.fixture(scope="session")
-def settings() -> Settings:
-    return load_settings()
+def settings(tmp_path_factory) -> Settings:
+    """Los ajustes de verdad, pero con la carpeta de sesion APARTE.
+
+    POR QUE NO SE USA `backend/session` A SECAS
+    -------------------------------------------
+    Porque ahi vive la sesion REAL del usuario: sus credenciales de Baileys,
+    su Signal Store, su identidad. Y las pruebas escriben en ella sin querer:
+    `ajustes_de_cuenta` hace `mkdir` de la carpeta de la cuenta, asi que basta
+    llamarlo con un uuid inventado para dejar una carpeta de una cuenta que no
+    existe dentro de la sesion viva.
+
+    Se midio: tras una pasada de la suite quedaban quince carpetas asi, y una
+    prueba que leia `creds.json` de la carpeta base acababa leyendo las
+    credenciales del telefono que estuviera vinculado en ese momento --con lo
+    que pasaba o fallaba segun si habia alguien conectado.
+
+    Con la carpeta aparte, la suite no puede tocar la sesion del usuario ni
+    depender de ella. Es de sesion --no de funcion-- porque `database`
+    tambien lo es y pytest no deja que una dependa de la otra al reves.
+    """
+    import dataclasses
+
+    return dataclasses.replace(
+        load_settings(), session_dir=tmp_path_factory.mktemp("session")
+    )
 
 
 @pytest.fixture(scope="session")
@@ -38,6 +61,24 @@ def database(settings: Settings) -> Iterator[Database]:
         pytest.skip(f"PostgreSQL no disponible: {exc}")
     yield db
     db.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _mantenimiento_sin_memoria_entre_pruebas():
+    """El mantenimiento corre UNA VEZ POR PROCESO, y la suite es un proceso.
+
+    `Orchestrator.run_maintenance` recuerda en una bandera de modulo que ya
+    reconcilio, para que arrancar dos cuentas no lance dos reconciliaciones
+    de la base entera a la vez. En la suite esa bandera sobrevive de una
+    prueba a la siguiente: sin este reinicio, la primera que reconcilia deja
+    a las demas recibiendo ``None`` -- y el fallo parece del mantenimiento
+    cuando es del orden de las pruebas.
+    """
+    from app.core.orchestrator import reiniciar_mantenimiento
+
+    reiniciar_mantenimiento()
+    yield
+    reiniciar_mantenimiento()
 
 
 @pytest.fixture(autouse=True)

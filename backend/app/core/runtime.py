@@ -410,6 +410,9 @@ class AppRuntime:
                 # Hay una vinculacion guardada: se retoma. El dueno se
                 # recupera de la base, no se inventa.
                 self._recuperar_dueno()
+                # La cuenta AL CLIENTE antes de arrancarlo: el worker la
+                # necesita para firmar, y se niega a arrancar sin ella.
+                self._propagar_dueno()
                 self.client.start()
             else:
                 # SIN sesion NO se vincula solo.
@@ -458,6 +461,28 @@ class AppRuntime:
         if vivo is not None:
             vivo.whatsapp_account_id = self.runtime_owner_account_id
 
+        # Y AL CLIENTE, que se la pasa al worker de Node para que firme cada
+        # evento. Es lo que permite comprobar la atribucion en vez de
+        # suponerla: ver `BaileysClient._firma_correcta`.
+        cliente = getattr(self, "client", None)
+        if cliente is not None:
+            try:
+                cliente.whatsapp_account_id = self.runtime_owner_account_id
+            except Exception:  # noqa: BLE001 - un doble de pruebas puede no tenerlo
+                log.debug("El cliente no admite cuenta; se sigue")
+
+        # Y AL BACKFILL, que la captura en su constructor.
+        #
+        # `_wire_services()` lo construye durante `start()`, y en una cuenta
+        # que aun no ha vinculado eso pasa ANTES de que se sepa el dueno: se
+        # quedaba con `None` para siempre. Con `None`, `chats_to_process` no
+        # filtra por cuenta -- o sea que el motor de un telefono cogeria las
+        # conversaciones del otro y le pediria historial de chats que no
+        # conoce. Es la misma familia de fallo que la atribucion de eventos.
+        excavador = getattr(self, "backfill", None)
+        if excavador is not None:
+            excavador.whatsapp_account_id = self.runtime_owner_account_id
+
         colector = getattr(self, "seed_collector", None)
         if colector is not None:
             colector.user_id = self.runtime_owner_user_id
@@ -492,11 +517,191 @@ class AppRuntime:
 
         pn, lid = self._identificadores_propios()
         try:
-            cuentas.marcar_vinculada(dueno, pn=pn, lid=lid)
+            # LA CUENTA, explicita. Sin ella habria que adivinar cual de las
+            # del usuario se acaba de vincular, y con dos la eleccion seria
+            # una cualquiera: la que aparece como vinculada podria no ser la
+            # que se escaneo.
+            sellada = cuentas.marcar_vinculada(
+                dueno,
+                pn=pn,
+                lid=lid,
+                account_id=self.runtime_owner_account_id,
+                profile_name=self._nombre_del_perfil(),
+            )
         except Exception:  # noqa: BLE001 - no poder anotarlo no tira la sesion
             log.exception("No se pudo anotar la vinculacion en la base")
             return
-        log.info("[AUTH] Cuenta de WhatsApp marcada como vinculada")
+        if not sellada:
+            # El motivo lo ha escrito `marcar_vinculada`, que es quien lo sabe.
+            log.warning(
+                "[AUTH] La vinculacion NO quedo anotada para la cuenta %s. La "
+                "sesion funciona, pero esa cuenta no aparecera en el selector.",
+                str(self.runtime_owner_account_id)[:8]
+                if self.runtime_owner_account_id
+                else "(sin cuenta)",
+            )
+            return
+
+        # LO QUE SE SELLO PUEDE NO SER LO QUE SE PIDIO.
+        #
+        # Si en la carpeta de esta cuenta habia la sesion de otro telefono,
+        # `marcar_vinculada` sella la cuenta de ESE telefono --la suya, o una
+        # nueva-- y devuelve esa. Sin mirarlo, el runtime seguiria apuntando a
+        # la cuenta anterior y todo lo que entre por este socket iria a ella:
+        # justo lo que la deteccion venia a evitar.
+        if str(sellada) != str(self.runtime_owner_account_id):
+            self._traspasar_a(sellada)
+        log.info(
+            "[AUTH] Cuenta de WhatsApp %s marcada como vinculada",
+            str(self.runtime_owner_account_id)[:8],
+        )
+        self._activar_la_recien_vinculada(dueno)
+
+    def _traspasar_a(self, nueva_cuenta: Any) -> None:
+        """Este runtime pasa a ser el de OTRA cuenta, con su sesion.
+
+        Pasa cuando se escanea un telefono distinto en el flujo de una cuenta
+        ya registrada: las credenciales que hay en la carpeta son del telefono
+        nuevo, asi que la carpeta le pertenece a el.
+
+        SE PARA EL CLIENTE PARA MOVERLA. Baileys tiene esos ficheros abiertos
+        --creds, prekeys, el Signal Store-- y en Windows moverlos en caliente
+        falla; peor aun, podria dejar la identidad a medias entre dos carpetas,
+        que es como se fabrica una sesion que no descifra nada. Se para, se
+        mueve entera, y se vuelve a arrancar: para Baileys es un reinicio
+        normal y vuelve a entrar con las mismas credenciales.
+
+        Si el movimiento falla, NO se reasigna: mejor una cuenta sin sellar
+        --visible, con su aviso en el log-- que un runtime apuntando a una
+        cuenta cuya sesion esta en otra carpeta.
+        """
+        import shutil
+
+        from app.core.session_paths import carpeta_de_cuenta
+
+        anterior = self.runtime_owner_account_id
+        origen = carpeta_de_cuenta(self.settings, anterior)
+        destino = carpeta_de_cuenta(self.settings, nueva_cuenta)
+        log.warning(
+            "[APP] Traspasando la sesion de %s a %s: el telefono que se "
+            "escaneo es el de esta ultima.",
+            str(anterior)[:8],
+            str(nueva_cuenta)[:8],
+        )
+
+        try:
+            self.client.stop()
+        except Exception:  # noqa: BLE001 - se sigue igual: hay que mover
+            log.debug("El cliente no se pudo parar limpiamente")
+
+        try:
+            if origen.exists():
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                if destino.exists():
+                    shutil.rmtree(destino, ignore_errors=True)
+                shutil.move(str(origen), str(destino))
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "No se pudo mover la sesion de %s a %s. El runtime NO se "
+                "reasigna: vincula ese telefono como cuenta nueva desde el "
+                "selector.",
+                str(anterior)[:8],
+                str(nueva_cuenta)[:8],
+            )
+            return
+
+        self.runtime_owner_account_id = nueva_cuenta
+        # La carpeta cambio, asi que los ajustes de este runtime tambien.
+        try:
+            from app.core.session_paths import ajustes_de_cuenta
+
+            self.settings = ajustes_de_cuenta(self.settings, nueva_cuenta)
+        except Exception:  # noqa: BLE001
+            log.exception("No se pudieron reapuntar los ajustes de sesion")
+        self._propagar_dueno()
+
+        try:
+            self.client.start()
+        except Exception:  # noqa: BLE001 - el vigilante lo reintentara
+            log.exception("No se pudo rearrancar el cliente tras el traspaso")
+
+        log.info(
+            "[APP] Traspaso completado: este runtime es ahora el de %s",
+            str(nueva_cuenta)[:8],
+        )
+
+    def _activar_la_recien_vinculada(self, user_id: Any) -> None:
+        """Quien acaba de escanear un QR quiere ver ESA cuenta.
+
+        Sin esto, se vinculaba el segundo telefono y el selector seguia en el
+        primero: la cuenta nueva estaba perfectamente vinculada y habia que
+        ir a buscarla a mano, con la lista de otra delante.
+
+        Cuenta como eleccion de la persona --escanear un QR es una accion
+        deliberada, no un valor por defecto-- y por eso se marca como tal: a
+        partir de aqui, nada la cambia sola.
+
+        Nunca lanza: no poder cambiar el selector no puede tirar una sesion
+        que acaba de establecerse.
+        """
+        cuenta = self.runtime_owner_account_id
+        if cuenta is None or user_id is None or self.database is None:
+            return
+        try:
+            from app.auth.memberships import activar_cuenta
+
+            with self.database.transaction() as sesion:
+                activar_cuenta(
+                    sesion,
+                    user_id=user_id,
+                    account_id=cuenta,
+                    por_el_usuario=True,
+                )
+            # Para que el selector cambie sin recargar la pagina.
+            self.bus.publish(
+                "account.activated",
+                {"account_id": str(cuenta)},
+            )
+        except Exception:  # noqa: BLE001 - el selector no vale una sesion
+            log.exception(
+                "No se pudo poner como activa la cuenta recien vinculada"
+            )
+        self._preparar_carpeta_en_drive(user_id, cuenta)
+
+    def _preparar_carpeta_en_drive(self, user_id: Any, account_id: Any) -> None:
+        """Crea YA la carpeta de esta cuenta en Drive. Nunca lanza.
+
+        POR QUE NO SE ESPERA AL PRIMER MENSAJE
+        --------------------------------------
+        La carpeta se creaba cuando el trabajador de almacenamiento tenia algo
+        que subir. Con la excavacion por delante eso puede tardar minutos --se
+        midio una que aparecio NUEVE despues de vincular-- y mientras tanto el
+        usuario abre su Drive, no ve nada, y no tiene forma de saber si la
+        copia esta funcionando.
+
+        Y hay una razon mejor: el NOMBRE. La carpeta se llama como la persona,
+        leyendolo de la cuenta. Creandola ahora, justo despues de sellar la
+        vinculacion, sale con el nombre que acaba de llegar del telefono;
+        creandola nueve minutos despues sale con lo que hubiera entonces, que
+        es como aparecio una "WhatsApp +573008927374" en vez de con su nombre.
+
+        No es critico: si falla, el trabajador la creara igual al subir. Por
+        eso no se propaga el error.
+        """
+        try:
+            almacen = self.storage_para(user_id)
+            almacen.ensure_user_storage()
+            almacen.ensure_account_storage(str(account_id))
+            log.info(
+                "[DRIVE] Carpeta de la cuenta %s lista en Drive",
+                str(account_id)[:8],
+            )
+        except Exception:  # noqa: BLE001 - el trabajador la creara al subir
+            log.warning(
+                "No se pudo crear ya la carpeta de Drive de la cuenta %s; se "
+                "creara con la primera subida",
+                str(account_id)[:8],
+            )
 
     def de_quien_soy(self) -> str:
         """A que cuenta y a que usuario pertenece este runtime.
@@ -521,9 +726,128 @@ class AppRuntime:
         if cuentas is None or self.runtime_owner_user_id is None:
             return
         try:
-            cuentas.marcar_estado(self.runtime_owner_user_id, "disconnected")
+            cuentas.marcar_estado(
+                self.runtime_owner_user_id,
+                "disconnected",
+                account_id=self.runtime_owner_account_id,
+            )
         except Exception:  # noqa: BLE001
             log.debug("No se pudo anotar la desconexion")
+
+    def _marcar_revocada(self) -> None:
+        """La vinculacion ya no existe. Distinto de "el socket se cayo".
+
+        `disconnected` cuenta como vinculada --y debe contar: una caida de red
+        no es una desvinculacion--, asi que anotar eso aqui dejaria a la cuenta
+        pareciendo utilizable. `revoked` es el unico estado que dice la verdad:
+        hace falta escanear otra vez.
+        """
+        cuentas = getattr(self, "whatsapp_accounts", None)
+        if cuentas is None or self.runtime_owner_user_id is None:
+            return
+        try:
+            cuentas.marcar_estado(
+                self.runtime_owner_user_id,
+                "revoked",
+                account_id=self.runtime_owner_account_id,
+            )
+            log.info("[AUTH] Cuenta marcada como revocada: hay que vincular de nuevo")
+        except Exception:  # noqa: BLE001 - anotar no puede abortar el archivado
+            log.debug("No se pudo anotar la revocacion")
+
+    def _nombre_del_perfil(self) -> str | None:
+        """Como se llama este WhatsApp, segun el propio telefono. Nunca lanza."""
+        try:
+            from app.core.identity import nombre_del_perfil
+
+            return nombre_del_perfil(self.settings)
+        except Exception:  # noqa: BLE001 - un nombre no puede tumbar nada
+            return None
+
+    def _la_cuenta_es_de_esta_sesion(self) -> bool:
+        """La cuenta destino, ¿es la del telefono que hay al otro lado?
+
+        Compara el PN del socket con el que dice el ``creds.json`` de la
+        cuenta a la que se va a atribuir lo que llegue. Los dos salen de
+        WhatsApp; si no coinciden, alguien se equivoco de cuenta.
+
+        Es PERMISIVA a proposito cuando falta informacion --sin identidad
+        resuelta todavia, o sin credenciales que consultar-- porque durante el
+        arranque eso es normal y bloquear ahi perderia historial legitimo. Lo
+        que corta es el caso claro: dos telefonos distintos, uno escribiendo
+        en la cuenta del otro.
+        """
+        cuenta = self.runtime_owner_account_id
+        if cuenta is None:
+            return True
+        try:
+            from app.auth.atribucion import identidad_en_disco
+
+            mio, _ = self._identificadores_propios()
+            if not mio:
+                return True
+            mio_corto = str(mio).split("@")[0].split(":")[0]
+
+            # PRIMERO lo que la cuenta tiene REGISTRADO, y solo si no hay, el
+            # fichero.
+            #
+            # El fichero puede haber cambiado bajo los pies: se escanea el QR
+            # de otro telefono en el flujo de esta cuenta y Baileys escribe
+            # SUS credenciales en esta carpeta. Entonces fichero y socket
+            # coinciden --los dos, el telefono nuevo-- y comparar solo con el
+            # fichero no ve nada raro. Lo que no cambia es a quien pertenecen
+            # los chats que esta cuenta ya tiene: eso lo dice `wa_pn`.
+            registrado = self._telefono_registrado(cuenta)
+            if registrado:
+                if mio_corto == registrado:
+                    return True
+                log.error(
+                    "[APP] IDENTIDAD INVERTIDA: este socket es %s y la cuenta "
+                    "%s esta registrada como %s. No se escribe nada: sus "
+                    "conversaciones son de %s.",
+                    mio_corto,
+                    str(cuenta)[:8],
+                    registrado,
+                    registrado,
+                )
+                return False
+
+            real = identidad_en_disco(self.settings, cuenta)
+            if real is None:
+                return True
+            if mio_corto == real.telefono:
+                return True
+            log.error(
+                "[APP] Este socket es %s y la cuenta %s es de %s. No son la "
+                "misma vinculacion.",
+                mio_corto,
+                str(cuenta)[:8],
+                real.telefono,
+            )
+            return False
+        except Exception:  # noqa: BLE001 - comprobar no puede tirar la ingesta
+            log.exception("No se pudo comprobar de quien es esta sesion")
+            return True
+
+    def _telefono_registrado(self, account_id: Any) -> str | None:
+        """El numero al que esta cuenta ESTA registrada, segun la base.
+
+        Es el ancla de identidad: a ese numero pertenecen los chats que la
+        cuenta ya tiene. Un `creds.json` se puede sobrescribir escaneando otro
+        QR; esto no.
+        """
+        base = getattr(self, "database", None)
+        if base is None:
+            return None
+        try:
+            from app.models import WhatsAppAccount
+
+            with base.transaction() as sesion:
+                fila = sesion.get(WhatsAppAccount, account_id)
+                crudo = (getattr(fila, "wa_pn", None) or "") if fila else ""
+            return crudo.split("@")[0].split(":")[0] or None
+        except Exception:  # noqa: BLE001 - no poder leerlo no bloquea nada
+            return None
 
     def _identificadores_propios(self) -> tuple[str | None, str | None]:
         """PN y LID del dispositivo, si ya se conocen.
@@ -697,6 +1021,21 @@ class AppRuntime:
     # no insistir contra un servidor ajeno.
     MAX_RECHAZOS_MISMA_SESION = 3
 
+    #: Motivos en los que el servidor NO esta siendo ambiguo: dice que este
+    #: dispositivo ya no esta vinculado. No hay nada que reintentar.
+    #:
+    #: Los manda Baileys tal cual::
+    #:
+    #:     {'reason': 'loggedOut'}
+    #:     <stream:error code="401"><conflict type="device_removed"/>
+    #:
+    #: Se distinguen de un 401 cualquiera --que si puede ser un corte de red--
+    #: porque tratarlos igual produjo el bucle que se midio: el usuario pedia
+    #: un codigo, `restart_pairing` encontraba el device.json muerto y volvia a
+    #: hacer login con el en vez de generar el QR, el servidor lo rechazaba, y
+    #: vuelta a empezar. Nunca aparecia ningun codigo.
+    MOTIVOS_DE_DESVINCULACION = ("loggedout", "device_removed", "device removed")
+
     def _sesion_rechazada(self, motivo: Any) -> None:
         """El servidor rechazo el login (401).
 
@@ -728,16 +1067,25 @@ class AppRuntime:
             self._huella_rechazada = huella
             self._rechazos_seguidos = 1
 
+        desvinculada = self._es_desvinculacion(motivo)
         log.info(
-            "[401] rechazo %d/%d huella=%s sesion_guardada=%s",
+            "[401] rechazo %d/%d huella=%s sesion_guardada=%s%s",
             self._rechazos_seguidos,
             self.MAX_RECHAZOS_MISMA_SESION,
             (huella or "?")[:8],
             self.session_exists,
+            " (desvinculada desde el telefono)" if desvinculada else "",
         )
         self.pairing.note_unlinked()
 
-        if self._rechazos_seguidos >= self.MAX_RECHAZOS_MISMA_SESION:
+        # UNA VEZ BASTA cuando el motivo no es ambiguo.
+        #
+        # Contar hasta tres tiene sentido con un 401 pelado, que puede ser un
+        # corte. No lo tiene con "loggedOut": eso es el telefono diciendo que
+        # quito este dispositivo, y no va a cambiar de opinion al tercer
+        # intento. Esperar solo servia para gastar un minuto largo sin ensenar
+        # ningun codigo -- que es justo lo que el usuario estaba viendo.
+        if desvinculada or self._rechazos_seguidos >= self.MAX_RECHAZOS_MISMA_SESION:
             self._descartar_sesion_revocada(motivo)
             return
 
@@ -749,6 +1097,19 @@ class AppRuntime:
         )
         self.state.set(AppState.SESSION_INVALID, reason=f"login rechazado {motivo}")
         self.pairing.next_generation()
+
+    @classmethod
+    def _es_desvinculacion(cls, motivo: Any) -> bool:
+        """Si el motivo dice que este dispositivo ya no esta vinculado.
+
+        El motivo llega en varias formas segun por donde entre --un
+        diccionario de Baileys, el texto de un ``stream:error``, un numero
+        suelto-- asi que se busca en su representacion en texto en vez de
+        exigir una estructura concreta. Un motivo que no se reconozca sigue el
+        camino de siempre: contar hasta tres.
+        """
+        texto = str(motivo).lower()
+        return any(clave in texto for clave in cls.MOTIVOS_DE_DESVINCULACION)
 
     def _descartar_sesion_revocada(self, motivo: Any) -> None:
         """La sesion esta muerta segun el servidor: archivar y vincular de nuevo.
@@ -810,6 +1171,15 @@ class AppRuntime:
 
         if archivada is not None:
             log.info("Sesion revocada archivada en %s", archivada.name)
+
+        # Y LA BASE TIENE QUE ENTERARSE.
+        #
+        # Sin esto la columna se quedaba en `linked` para siempre: el usuario
+        # desvinculaba desde el telefono, la sesion se archivaba, y el selector
+        # de cuentas seguia pintando el punto verde de "conectada" sobre una
+        # cuenta que ya no existe. Es lo que el usuario reporto: "la cuenta de
+        # Ale esta desvinculada pero sigue apareciendo ahi igual".
+        self._marcar_revocada()
 
         # Vinculacion nueva: la cuenta de rechazos era de la sesion anterior y
         # los reintentos tambien. Empezar con ellos gastados haria que el
@@ -994,6 +1364,23 @@ class AppRuntime:
         if not self._puede_reintentar():
             return
 
+        # AQUI NO SE DESCARTA NADA, Y ES DELIBERADO.
+        #
+        # Se probo a apartar la sesion guardada cuando su huella coincidia con
+        # la ultima rechazada, para no reintentar algo ya contestado. Dos
+        # pruebas lo tumbaron, y con razon: esa condicion tambien es cierta
+        # tras un 401 PELADO --un corte de red, un rechazo temporal-- y
+        # entonces se tiraba una vinculacion buena al primer tropiezo. Es
+        # exactamente el peor incidente que ha tenido este proyecto: 74 logins
+        # y 61 codigos QR en segundos, y 99 carpetas de sesion vacias.
+        #
+        # El bucle que habia que romper --pedir codigo y no recibir ninguno
+        # porque se reintentaba una sesion revocada-- se cierra en
+        # `_sesion_rechazada`: un motivo de desvinculacion (`loggedOut`,
+        # `device_removed`) archiva a la PRIMERA, asi que cuando se llega aqui
+        # ya no queda `device.json` que reintentar. Cerrarlo por los dos sitios
+        # no anadia cobertura y si quitaba la unica proteccion contra el 401
+        # transitorio.
         generacion = self.pairing.next_generation()
         log.info(
             "Reiniciando la vinculacion para pedir un QR nuevo (generacion %d)",
@@ -1031,6 +1418,9 @@ class AppRuntime:
             )
         else:
             self.state.set(AppState.PAIRING, reason="vinculacion reiniciada")
+        # El cliente se acaba de reconstruir, asi que no sabe de que cuenta es.
+        # Sin esto el worker se negaria a arrancar (`exigirCuenta()`).
+        self._propagar_dueno()
         self.client.start()
 
     def _wire_services(self) -> None:
@@ -1151,6 +1541,49 @@ class AppRuntime:
         )
         self.client.sinks["contact"] = contactos.handle_contact
         self.client.sinks["pushname"] = contactos.handle_pushname
+
+        # -- Archivar, fijar y silenciar, al vuelo --
+        #
+        # Baileys mantiene estos tres desde el app-state (`archiveChatAction`
+        # y compania) y los emitia ya. No los recogia nadie: si el usuario
+        # archivaba un chat en el telefono, el panel seguia ensenandolo en la
+        # lista normal hasta la siguiente sincronizacion completa.
+        #
+        # El cuarto --`locked`, los chats restringidos-- NO esta aqui a
+        # proposito: `lockChatAction` es la unica accion de app-state que
+        # Baileys no procesa, asi que no hay evento en vivo que recoger. Ese
+        # solo puede venir del historial.
+        def cambiar_estado(
+            carga: Any, *, campo: str, clave: str, respaldo: str | None = None
+        ) -> None:
+            from app.services.repository import marcar_estado_de_chat
+
+            datos = carga if isinstance(carga, dict) else getattr(carga, "__dict__", {})
+            jid = datos.get("jid")
+            if not jid:
+                return
+            valor = datos.get(clave)
+            if valor is None and respaldo is not None:
+                valor = datos.get(respaldo)
+            marcar_estado_de_chat(
+                self.database,
+                jid,
+                whatsapp_account_id=self.runtime_owner_account_id,
+                **{campo: valor},
+            )
+
+        # Se prefiere la marca de tiempo (`pinned_at`, `mute_until`) y se cae
+        # al si/no cuando no venga: un worker mas viejo solo manda el booleano
+        # y tiene que seguir funcionando.
+        self.client.sinks["archive"] = lambda c: cambiar_estado(
+            c, campo="archived", clave="archived"
+        )
+        self.client.sinks["pin"] = lambda c: cambiar_estado(
+            c, campo="pinned", clave="pinned_at", respaldo="pinned"
+        )
+        self.client.sinks["mute"] = lambda c: cambiar_estado(
+            c, campo="muted", clave="mute_until", respaldo="muted"
+        )
 
         # -- Barrera del historial inicial --
         # Si esta sesion YA recibio su bootstrap no hay nada que esperar: el
@@ -1287,6 +1720,29 @@ class AppRuntime:
                     len(getattr(full, "conversations", ()) or ()),
                     full.message_count,
                     full.blob_path.name if full.blob_path else "no",
+                )
+                return
+
+            # ESTE SOCKET SOLO ESCRIBE EN SU PROPIA CUENTA.
+            #
+            # `runtime_owner_account_id` dice a que cuenta atribuir lo que
+            # llegue, y se fija en el pairing. Si por lo que sea apunta a una
+            # cuenta cuya sesion es OTRO telefono, lo que entra es el historial
+            # de una persona dentro de la copia de otra -- exactamente lo que
+            # el usuario vio: 195 conversaciones apareciendo en la cuenta
+            # equivocada catorce segundos despues de vincular el segundo movil.
+            #
+            # Se compara la identidad del socket con las credenciales de la
+            # cuenta destino. No cuesta nada --un JSON pequeno-- y es lo unico
+            # que separa "cada cuenta la suya" de "todo junto".
+            if not self._la_cuenta_es_de_esta_sesion():
+                sync_log.error(
+                    "[HISTORY] Blob DESCARTADO: este socket no es el de la "
+                    "cuenta %s. No se escribe el historial de un telefono en "
+                    "la copia de otro.",
+                    str(self.runtime_owner_account_id)[:8]
+                    if self.runtime_owner_account_id
+                    else "(sin cuenta)",
                 )
                 return
 
@@ -1559,13 +2015,77 @@ class AppRuntime:
         Es la recuperacion de los que despertaron mientras la siembra
         automatica no funcionaba: no hace falta pedirle al usuario que vuelva
         a escribir en ellos.
+
+        SOLO LOS DE ESTA CUENTA
+        -----------------------
+        `MaintenanceService.run_all` reconcilia la base ENTERA -- no filtra por
+        cuenta en ningun sitio-- asi que la lista que llega aqui puede traer
+        conversaciones de OTRA. Encolarlas seria pedirle a este WhatsApp el
+        historial de chats que no son suyos.
+
+        Se comprueba contra `chats`, que tiene `UNIQUE (whatsapp_account_id,
+        jid)`: el mismo numero puede estar en dos cuentas, y lo que decide no
+        es el jid sino el par.
         """
         if not chat_jids:
             return
-        self.bus.publish("history.seed_available", {"chats": list(chat_jids)})
+        mios = self._solo_los_de_esta_cuenta(chat_jids)
+        if not mios:
+            return
+        self.bus.publish("history.seed_available", {"chats": mios})
         cola = self.seed_queue
         if cola is not None:
-            cola.enqueue(chat_jids)
+            cola.enqueue(mios)
+
+    def _solo_los_de_esta_cuenta(self, chat_jids: Any) -> list[str]:
+        """Descarta los jids que no pertenecen a la cuenta de este runtime.
+
+        Sin dueno conocido NO se queda con ninguno. Es el mismo criterio que
+        `blob_reingest._es_mia`: adoptar lo que no se puede atribuir es como
+        se colaron 6613 mensajes de otra persona. Aqui no se pierde nada --el
+        mantenimiento periodico vuelve a pasar cuando el dueno ya se sabe.
+        """
+        pedidos = [str(j) for j in chat_jids if j]
+        if not pedidos:
+            return []
+
+        cuenta = self.runtime_owner_account_id
+        if cuenta is None:
+            log.debug(
+                "Se despertaron %d chat(s) pero este runtime aun no sabe de "
+                "que cuenta es; no se encola ninguno",
+                len(pedidos),
+            )
+            return []
+
+        try:
+            from sqlalchemy import select
+
+            from app.models import Chat
+
+            with self.database.transaction() as sesion:
+                mios = set(
+                    sesion.execute(
+                        select(Chat.jid).where(
+                            Chat.whatsapp_account_id == cuenta,
+                            Chat.jid.in_(pedidos),
+                        )
+                    ).scalars()
+                )
+        except Exception:  # noqa: BLE001 - no encolar es preferible a encolar de mas
+            log.exception("No se pudo comprobar de quien son los chats despertados")
+            return []
+
+        ajenos = len(pedidos) - len(mios)
+        if ajenos:
+            log.info(
+                "[MANT] %d chat(s) despertados son de otra cuenta: no se "
+                "excavan desde aqui",
+                ajenos,
+            )
+        # Se respeta el orden en que llegaron: el mantenimiento los devuelve
+        # por antiguedad, y esa es la que interesa excavar antes.
+        return [j for j in pedidos if j in mios]
 
     # -- Eventos -------------------------------------------------------------
 

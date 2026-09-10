@@ -1,0 +1,115 @@
+<div class="landing">
+  <header class="barra">
+    <span class="marca">
+      <span class="logo" aria-hidden="true">W</span>
+      <b>WhatsApp Backup</b>
+    </span>
+    <nav>
+      <!-- El idioma se elige ANTES de entrar, no después. Estaba solo en los
+           ajustes del panel, o sea detrás del registro: quien no entiende la
+           portada no puede leer cómo cambiarla. -->
+      <label class="idioma">
+        <span class="sr-only">{{ 'landing.nav_lang' | t }}</span>
+        <select
+          [value]="i18n.modo()"
+          (change)="cambiarIdioma($any($event.target).value)"
+        >
+          <option value="auto">{{ 'landing.auto' | t }}</option>
+          @for (opcion of idiomas; track opcion.codigo) {
+            <option [value]="opcion.codigo">{{ opcion.nombre }}</option>
+          }
+        </select>
+      </label>
+      <!-- UN solo botón. Antes había dos, «Entrar» y «Empezar», que sin sesión
+           llevaban exactamente al mismo sitio: dos formas de hacer lo mismo
+           obligan a elegir entre opciones que no se diferencian en nada. -->
+      <a [routerLink]="destino()" class="boton">{{ etiqueta() | t }}</a>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ================= Portada ================= -->
+    <section class="hero">
+      <p class="pildora">{{ 'landing.pill' | t }}</p>
+      <h1>
+        {{ 'landing.h1_a' | t }}<br />
+        <span class="resalte">{{ 'landing.h1_b' | t }}</span>
+      </h1>
+      <p class="entradilla">{{ 'landing.lead' | t }}</p>
+      <div class="acciones">
+        <a [routerLink]="destino()" class="boton grande">{{ etiqueta() | t }}</a>
+        @if (!volviendo()) {
+          <a routerLink="/login" class="enlace grande">
+            {{ 'landing.have_account' | t }}
+          </a>
+        }
+      </div>
+      <p class="fino">{{ 'landing.readonly' | t }}</p>
+    </section>
+
+    <!-- ================= Lo que resuelve ================= -->
+    <section class="bloque">
+      <h2>{{ 'landing.problem_h' | t }}</h2>
+      <p class="parrafo">{{ 'landing.problem_1' | t }}</p>
+      <p class="parrafo">{{ 'landing.problem_2' | t }}</p>
+    </section>
+
+    <!-- ================= Capacidades =================
+         Las seis tarjetas salen de una lista, no seis bloques copiados: con
+         seis copias, traducir obligaba a tocar seis sitios y bastaba olvidar
+         uno para dejar media portada en otro idioma. -->
+    <section class="bloque">
+      <h2>{{ 'landing.does_h' | t }}</h2>
+      <div class="rejilla">
+        @for (tarjeta of tarjetas; track tarjeta.clave) {
+          <article class="tarjeta">
+            <span class="icono" aria-hidden="true">{{ tarjeta.icono }}</span>
+            <h3>{{ 'landing.' + tarjeta.clave + '_h' | t }}</h3>
+            <p>{{ 'landing.' + tarjeta.clave + '_p' | t }}</p>
+          </article>
+        }
+      </div>
+    </section>
+
+    <!-- ================= Cómo funciona ================= -->
+    <section class="bloque">
+      <h2>{{ 'landing.steps_h' | t }}</h2>
+      <ol class="pasos">
+        @for (paso of pasos; track paso; let i = $index) {
+          <li>
+            <span class="numero">{{ i + 1 }}</span>
+            <div>
+              <h3>{{ 'landing.' + paso + '_h' | t }}</h3>
+              <p>{{ 'landing.' + paso + '_p' | t }}</p>
+            </div>
+          </li>
+        }
+      </ol>
+    </section>
+
+    <!-- ================= Lo que NO hace ================= -->
+    <section class="bloque limites">
+      <h2>{{ 'landing.limits_h' | t }}</h2>
+      <ul class="lista">
+        @for (limite of limites; track limite) {
+          <li>
+            <b>{{ 'landing.' + limite + '_b' | t }}</b>
+            {{ 'landing.' + limite + '_p' | t }}
+          </li>
+        }
+      </ul>
+    </section>
+
+    <!-- ================= Cierre ================= -->
+    <section class="cierre">
+      <h2>{{ 'landing.end_h' | t }}</h2>
+      <p class="entradilla">{{ 'landing.end_p' | t }}</p>
+      <a [routerLink]="destino()" class="boton grande">{{ etiqueta() | t }}</a>
+    </section>
+  </main>
+
+  <footer>
+    <span>{{ 'landing.foot' | t }}</span>
+    <span class="fino">{{ 'landing.foot_legal' | t }}</span>
+  </footer>
+</div>

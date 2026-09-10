@@ -59,6 +59,9 @@ class ReconcileReport:
     media_missing_file: int = 0
     media_terminal: int = 0
     media_registered: int = 0
+    # Adjuntos que fallaron por un fallo NUESTRO, no por el CDN: se les
+    # devuelve la oportunidad. Ver `reconcile_media_states`.
+    media_reintentables_por_bug: int = 0
     reclassified: int = 0
     aliases_linked: int = 0
     usernames_filled: int = 0
@@ -84,6 +87,7 @@ class ReconcileReport:
             + self.media_missing_file
             + self.media_terminal
             + self.media_registered
+            + self.media_reintentables_por_bug
             + self.reclassified
             + self.aliases_linked
             + self.usernames_filled
@@ -98,7 +102,8 @@ class ReconcileReport:
             f"estados +{self.history_states_created}/~{self.history_states_updated} "
             f"cursores={self.cursors_updated} "
             f"media(reintentables={self.media_missing_file} "
-            f"terminales={self.media_terminal} nuevos={self.media_registered}) "
+            f"terminales={self.media_terminal} nuevos={self.media_registered} "
+            f"reabiertos={self.media_reintentables_por_bug}) "
             f"reclasificados={self.reclassified} "
             f"alias={self.aliases_linked} usuarios={self.usernames_filled} "
             f"previas={self.previews_updated} "
@@ -475,6 +480,15 @@ class MaintenanceService:
            que es TERMINAL y honesto, en vez de dejarlo eternamente
            "pendiente": marcar multimedia como terminal si esta permitido.
 
+        3. ``failed`` por "descarga sin el protobuf del mensaje". Ese fallo no
+           era del CDN ni del adjunto: era que esta aplicacion no le pasaba a
+           Baileys el ``WebMessageInfo``, que hace falta para descargar. Con
+           el arreglo puesto, esos adjuntos SI se pueden bajar, pero se
+           quedarian fuera para siempre porque agotaron los tres intentos
+           contra un fallo que no era suyo. Se les pone el contador a cero.
+
+           Medido en la base real: 1210 filas, el 100% de los adjuntos.
+
         El mensaje y su metadata NUNCA se tocan: que el archivo no se pueda
         recuperar no invalida el mensaje.
         """
@@ -525,6 +539,29 @@ class MaintenanceService:
                 )
             ).rowcount
             report.media_terminal += sin_material or 0
+
+            # Solo se tocan los que llevan EXACTAMENTE ese error. Un 403 del
+            # CDN sigue siendo terminal y no se reabre: reintentarlo seria
+            # volver al bucle que ya se cerro en su dia.
+            por_bug = session.execute(
+                update(MediaFile)
+                .where(
+                    MediaFile.download_status == "failed",
+                    MediaFile.last_error.like("%protobuf del mensaje%"),
+                )
+                .values(
+                    download_status="pending",
+                    download_attempts=0,
+                    last_error=None,
+                )
+            ).rowcount
+            report.media_reintentables_por_bug += por_bug or 0
+            if por_bug:
+                log.info(
+                    "%d adjuntos vuelven a la cola: fallaron porque no se les "
+                    "pasaba el protobuf del mensaje, no por el CDN",
+                    por_bug,
+                )
         return report
 
     # -- 3a bis. Excavaciones que se quedaron a medias -----------------------
@@ -544,13 +581,33 @@ class MaintenanceService:
         Se devuelve a ``pending``, que es lo que era antes de pedir. No se
         marca como agotado ni como completo: no se sabe si el telefono habria
         respondido.
+
+        POR ``chat_id``, NUNCA POR ``chat_jid``
+        ---------------------------------------
+        Esto recorria los jid atascados y hacia
+        ``UPDATE ... WHERE chat_jid IN (...)``. Desde que la unicidad es
+        ``(whatsapp_account_id, jid)``, **el mismo jid existe una vez por cada
+        cuenta que hable con ese contacto**, asi que ese UPDATE alcanzaba las
+        filas de LAS DOS. Con dos telefonos en la casa eso es lo normal, no lo
+        raro: comparten casi toda la agenda.
+
+        Lo que hacia:
+
+        * la conversacion de A con Marta se quedaba atascada y la de B con
+          Marta, que iba bien, cambiaba de estado sin motivo;
+        * y el destino se decidia con el ancla de UNA de las dos: si A tenia
+          ancla y B no, la de B acababa en ``pending`` -- en la cola para
+          pedir historial sin con que pedirlo.
+
+        ``chat_id`` es unico y ya lleva la cuenta dentro, asi que cada
+        conversacion se reconcilia sola.
         """
         from app.history.cursor import get_valid_history_cursor
         from app.models import ChatHistoryState
 
         with self._database.transaction() as session:
             atascados = session.execute(
-                select(ChatHistoryState.chat_jid).where(
+                select(ChatHistoryState.chat_id).where(
                     ChatHistoryState.history_status == "fetching"
                 )
             ).scalars().all()
@@ -560,23 +617,25 @@ class MaintenanceService:
             # esta pendiente de nada: esta esperando una semilla, y decir
             # 'pending' lo pondria en la cola para pedir sin con que.
             con_ancla, sin_ancla = [], []
-            for chat_jid in atascados:
+            for chat_id in atascados:
+                # Por `chat_id`, que es unico: `chat_jid` con dos cuentas
+                # devuelve el ancla de cualquiera de las dos.
                 destino = (
                     con_ancla
-                    if get_valid_history_cursor(session, chat_jid=chat_jid)
+                    if get_valid_history_cursor(session, chat_id=chat_id)
                     else sin_ancla
                 )
-                destino.append(chat_jid)
+                destino.append(chat_id)
             if con_ancla:
                 session.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid.in_(con_ancla))
+                    .where(ChatHistoryState.chat_id.in_(con_ancla))
                     .values(history_status="pending", last_error=None)
                 )
             if sin_ancla:
                 session.execute(
                     update(ChatHistoryState)
-                    .where(ChatHistoryState.chat_jid.in_(sin_ancla))
+                    .where(ChatHistoryState.chat_id.in_(sin_ancla))
                     .values(history_status="waiting_seed", last_error=None)
                 )
         report.stuck_fetching_reset += len(atascados)

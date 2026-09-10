@@ -18,11 +18,29 @@ export class SessionService {
   getSession() {
     return this.api.get<Record<string, unknown>>('/session').pipe(map(normalizeSession));
   }
-  pair() {
-    return this.api.post<Record<string, unknown>>('/session/pair').pipe(map(normalizeSession));
+  /**
+   * Pide el código de vinculación.
+   *
+   * `accountId` sirve para vincular una cuenta que NO es la activa —añadir un
+   * segundo WhatsApp sin dejar de ver el primero—. Sin él va la activa, que
+   * es lo que hace la pantalla de alta inicial.
+   *
+   * Va como parámetro y no por la cabecera de siempre a propósito: la
+   * cabecera lleva la cuenta que se está *mirando*, y aquí hace falta decir
+   * otra cosa —la que se está *vinculando*— sin cambiar el contexto.
+   */
+  pair(accountId?: string) {
+    return this.api
+      .post<Record<string, unknown>>(this.conCuenta('/session/pair', accountId))
+      .pipe(map(normalizeSession));
   }
-  qr() {
-    return this.api.get<Record<string, unknown>>('/session/qr').pipe(
+  session(accountId?: string) {
+    return this.api
+      .get<Record<string, unknown>>(this.conCuenta('/session', accountId))
+      .pipe(map(normalizeSession));
+  }
+  qr(accountId?: string) {
+    return this.api.get<Record<string, unknown>>(this.conCuenta('/session/qr', accountId)).pipe(
       map((value): QrStatus => ({
         available: value['available'] === true,
         imageUrl: typeof value['image_url'] === 'string' ? value['image_url'] : undefined,
@@ -33,12 +51,22 @@ export class SessionService {
       })),
     );
   }
-  qrImageUrl(generation?: number) {
-    return this.api.url(
+  qrImageUrl(generation?: number, accountId?: string) {
+    const base =
       generation === undefined
         ? `/session/qr/image?size=560&v=${Date.now()}`
-        : `/session/qr/image?generation=${generation}&size=560`,
-    );
+        : `/session/qr/image?generation=${generation}&size=560`;
+    // Una `<img>` no puede llevar cabeceras, así que la cuenta viaja en la
+    // URL. Es el mismo dato por el otro camino que acepta el servidor.
+    return this.api.url(this.conCuenta(base, accountId), {
+      conCuenta: accountId === undefined,
+    });
+  }
+
+  private conCuenta(ruta: string, accountId?: string): string {
+    if (!accountId) return ruta;
+    const union = ruta.includes('?') ? '&' : '?';
+    return `${ruta}${union}account_id=${encodeURIComponent(accountId)}`;
   }
 }
 

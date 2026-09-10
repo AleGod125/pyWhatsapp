@@ -82,10 +82,58 @@ class DriveClient:
         archivos = datos.get("files") or []
         return archivos[0]["id"] if archivos else None
 
-    def crear_carpeta(self, nombre: str, *, padre: str | None = None) -> str:
+    def buscar_por_marca(
+        self, clave: str, valor: str, *, padre: str | None = None
+    ) -> tuple[str, str] | None:
+        """Una carpeta por su marca interna. Devuelve ``(id, nombre)``.
+
+        POR QUE NO BASTA BUSCAR POR NOMBRE
+        ----------------------------------
+        La carpeta de cada cuenta se llama como la persona --"WhatsApp Dora
+        Niebles"-- y eso puede cambiar: si alguien se cambia el nombre de
+        perfil en WhatsApp, buscar por nombre no la encuentra y se crearia una
+        SEGUNDA carpeta, dejando la copia partida en dos sitios.
+
+        Dos personas pueden llamarse igual, ademas, y entonces buscar por
+        nombre devolveria la carpeta de la otra.
+
+        La marca es el identificador de la cuenta, que no cambia nunca. El
+        nombre pasa a ser solo la etiqueta que se lee.
+        """
+        seguro = valor.replace("'", "\'")
+        consulta = [
+            f"appProperties has {{ key='{clave}' and value='{seguro}' }}",
+            f"mimeType = '{CARPETA_MIME}'",
+            "trashed = false",
+        ]
+        if padre:
+            consulta.append(f"'{padre}' in parents")
+        parametros = urllib.parse.urlencode(
+            {
+                "q": " and ".join(consulta),
+                "fields": "files(id,name)",
+                "pageSize": 10,
+                "spaces": "drive",
+            }
+        )
+        datos = self._peticion("GET", f"{API}/files?{parametros}")
+        archivos = datos.get("files") or []
+        if not archivos:
+            return None
+        return archivos[0]["id"], archivos[0].get("name") or ""
+
+    def crear_carpeta(
+        self,
+        nombre: str,
+        *,
+        padre: str | None = None,
+        marca: dict[str, str] | None = None,
+    ) -> str:
         cuerpo: dict[str, Any] = {"name": nombre, "mimeType": CARPETA_MIME}
         if padre:
             cuerpo["parents"] = [padre]
+        if marca:
+            cuerpo["appProperties"] = marca
         datos = self._peticion(
             "POST",
             f"{API}/files?fields=id",
@@ -94,10 +142,51 @@ class DriveClient:
         )
         return datos["id"]
 
+    def renombrar(self, file_id: str, nombre: str) -> None:
+        """Le pone otra etiqueta a una carpeta que ya existe.
+
+        Se usa cuando alguien se cambia el nombre en WhatsApp: la carpeta es
+        la misma --se encuentra por su marca-- y solo cambia lo que se lee.
+        """
+        self._peticion(
+            "PATCH",
+            f"{API}/files/{file_id}?fields=id",
+            cuerpo=json.dumps({"name": nombre}).encode(),
+            content_type="application/json",
+        )
+
     def asegurar_carpeta(self, nombre: str, *, padre: str | None = None) -> str:
         """Busca y, si no esta, crea. Idempotente."""
         existente = self.buscar(nombre, padre=padre)
         return existente or self.crear_carpeta(nombre, padre=padre)
+
+    def asegurar_carpeta_marcada(
+        self, nombre: str, *, padre: str | None, clave: str, valor: str
+    ) -> str:
+        """La carpeta de una cuenta: se busca por marca, se etiqueta por nombre.
+
+        Tres casos, y los tres tienen que quedar en UNA sola carpeta:
+
+        * no existe          -> se crea con su marca;
+        * existe igual       -> se devuelve tal cual;
+        * existe con OTRO nombre -> se renombra, no se duplica.
+        """
+        encontrada = self.buscar_por_marca(clave, valor, padre=padre)
+        if encontrada is None:
+            return self.crear_carpeta(
+                nombre, padre=padre, marca={clave: valor}
+            )
+        ident, actual = encontrada
+        if actual != nombre:
+            try:
+                self.renombrar(ident, nombre)
+            except Exception:  # noqa: BLE001 - la etiqueta no vale una subida
+                log.warning(
+                    "No se pudo renombrar la carpeta de la cuenta a %r; se "
+                    "sigue usando la que hay",
+                    nombre,
+                )
+        return ident
 
     # -- Subida -------------------------------------------------------------
 
@@ -173,8 +262,12 @@ class DriveClient:
                 reintentable=True,
             ) from exc
         if not destino:
+            # Google contesto, pero sin la cabecera que hacia falta. Es un
+            # tropiezo del momento, no algo que no pueda existir: se reintenta.
             raise StorageError(
-                "DRIVE_NO_SESSION", "Google no devolvio sesion de subida."
+                "DRIVE_NO_SESSION",
+                "Google no devolvio sesion de subida.",
+                reintentable=True,
             )
         return destino
 
@@ -303,7 +396,9 @@ class DriveClient:
             ) from exc
         except json.JSONDecodeError as exc:
             raise StorageError(
-                "DRIVE_BAD_RESPONSE", "Google devolvio una respuesta ilegible."
+                "DRIVE_BAD_RESPONSE",
+                "Google devolvio una respuesta ilegible.",
+                reintentable=True,
             ) from exc
 
     @staticmethod

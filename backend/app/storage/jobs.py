@@ -161,6 +161,27 @@ class StorageJobQueue:
                 .values(status="complete", last_error=None, updated_at=_ahora())
             )
 
+    def rendirse(self, job_id: uuid.UUID, motivo: str) -> None:
+        """Da el trabajo por perdido SIN reintentarlo.
+
+        Es para los fallos que no se arreglan repitiendolos: un tipo de
+        trabajo desconocido, un destino que no puede existir. Reintentarlos
+        doce veces solo escribe doce lineas iguales en el log y retrasa a los
+        que si pueden salir.
+
+        El contenido no se pierde: sigue en PostgreSQL, y el trabajo se puede
+        volver a encolar cuando se corrija la causa.
+        """
+        with self._database.transaction() as sesion:
+            trabajo = sesion.get(StorageJob, job_id)
+            if trabajo is None:
+                return
+            trabajo.status = "failed"
+            trabajo.last_error = motivo[:500]
+            trabajo.updated_at = _ahora()
+            sesion.flush()
+        log.warning("Subida abandonada sin reintentar: %s", motivo[:160])
+
     def reintentar(
         self, job_id: uuid.UUID, motivo: str, *, retry_after: float | None = None
     ) -> None:

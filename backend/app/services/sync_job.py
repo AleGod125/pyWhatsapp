@@ -81,7 +81,7 @@ ERROR = "error"
 PHASES = (
     "reconcile",   # recalcular lo derivado; nada destructivo
     "names",       # emparejar contactos con su LID (de ahi salen los nombres)
-    "archive",     # releer los blobs ya archivados (solo revision completa)
+    # "archive" ESTUVO AQUI y se quito a proposito. Ver `_fase_archivo`.
     "seeds",       # buscar anclas nuevas (blobs sin escanear, alias nuevos)
     "revalidate",  # que chats pueden pedir historial AHORA
     "backfill",    # pedir historial SOLO de los que tienen ancla
@@ -103,6 +103,20 @@ class SyncState:
     chats_total: int = 0
     chats_processed: int = 0
     messages_new: int = 0
+    #: Cuantos mensajes hay en la base al empezar el ciclo, y cuantos ahora.
+    #:
+    #: De la resta sale lo que se ensena en la barra, y sale bien SIEMPRE.
+    #: `messages_new` no servia para eso: se apoya en `_ingest_watch`, un
+    #: observador que se abre justo antes de pedir y se cierra en cuanto la
+    #: peticion devuelve. El blob llega despues, por otro hilo, y para
+    #: entonces el observador ya es `None`: `note_history_ingest` se va sin
+    #: contar nada.
+    #:
+    #: Lo que veia el usuario: "Excavando 18/326 chats - 0 mensajes - 20m 11s"
+    #: con 6314 mensajes ya guardados. La cuenta fina se conserva --el
+    #: diagnostico por chat la necesita-- y esto la acompana.
+    messages_at_start: int = 0
+    messages_total: int = 0
     media_pending: int = 0
     last_error: str | None = None
     # Lo que reconcilio la pasada segura, para poder decir que cambio.
@@ -183,6 +197,19 @@ class SyncState:
             "chats_total": self.chats_total,
             "chats_processed": self.chats_processed,
             "messages_new": self.messages_new,
+            # Lo que la barra ensena: crece con cada mensaje que entra, venga
+            # por donde venga. Nunca se queda en cero mientras llega historial.
+            "messages_in_run": max(0, self.messages_total - self.messages_at_start),
+            "messages_total": self.messages_total,
+            # LA SUBIDA A DRIVE, AL MISMO NIVEL QUE LA EXTRACCION.
+            #
+            # Son dos carriles independientes --el excavador no espera a Drive
+            # y nunca lo hizo-- y por eso la extraccion termina antes que la
+            # subida. Sin decirlo, la pantalla anunciaba "completada" mientras
+            # miles de mensajes seguian sin copiar: cierto lo primero, y
+            # engañoso junto.
+            "drive_pending": self.drive_pending,
+            "drive_done": max(0, self.messages_total - self.drive_pending),
             "mode": self.mode,
             "web_promoted": self.web_promoted,
             "retries_reopened": self.retries_reopened,
@@ -213,6 +240,9 @@ class SyncState:
                 "new_seeds": self.new_seeds,
                 "stale_candidates": self.stale_candidates,
                 "drive_pending": self.drive_pending,
+                # Cuantos han llegado ya a Drive, para poder decir "8230 de
+                # 12450" en vez de un numero suelto que no se sabe si es mucho.
+                "drive_done": max(0, self.messages_total - self.drive_pending),
             },
             # Lo que de verdad hizo el boton, para poder medirlo. Va aparte
             # del resumen de estado porque responde a otra pregunta: no "como
@@ -271,7 +301,40 @@ class SyncJob:
         return self.state.state == RUNNING
 
     def snapshot(self) -> dict[str, Any]:
+        # El total se relee AQUI, no se acumula por el camino.
+        #
+        # Acumular obliga a que cada via que mete mensajes se acuerde de
+        # sumar, y con el historial, los mensajes en vivo y la reingesta de
+        # blobs son tres. Contar filas es una consulta indexada y no se puede
+        # desincronizar de la base porque ES la base.
+        self.state.messages_total = self._cuantos_mensajes_hay()
+        # Lo que le falta a Drive, TAMBIEN en cada vistazo.
+        #
+        # Se calculaba una sola vez, al final del ciclo, asi que durante la
+        # excavacion valia 0 y despues ya no se movia. Y es justo despues
+        # cuando importa: la extraccion termina en minutos y la subida sigue
+        # su ritmo por detras, sin que nada en pantalla lo dijera. El usuario
+        # veia "sincronizacion completada" con miles de mensajes aun sin
+        # copiar.
+        self.state.drive_pending = self._sin_subir()
         return self.state.to_json()
+
+    def _cuantos_mensajes_hay(self) -> int:
+        """Filas en ``messages``. Nunca lanza: es un numero para pintar."""
+        from sqlalchemy import func, select
+
+        from app.models import Message
+
+        if self._database is None:
+            return self.state.messages_total
+        try:
+            with self._database.transaction() as sesion:
+                return int(
+                    sesion.execute(select(func.count()).select_from(Message)).scalar()
+                    or 0
+                )
+        except Exception:  # noqa: BLE001 - un contador no puede tumbar el estado
+            return self.state.messages_total
 
     # -- Arranque ------------------------------------------------------------
 
@@ -301,12 +364,17 @@ class SyncJob:
                     "Ya hay una sincronizacion en curso."
                 )
             job_id = uuid.uuid4().hex[:12]
+            # El punto de partida se toma ANTES de mover nada: de el sale
+            # "cuantos ha traido esta corrida", que es lo que ve el usuario.
+            al_empezar = self._cuantos_mensajes_hay()
             self.state = SyncState(
                 state=RUNNING,
                 job_id=job_id,
                 phase=PHASES[0],
                 started_at=_ahora(),
                 mode="full" if profundo else "incremental",
+                messages_at_start=al_empezar,
+                messages_total=al_empezar,
             )
 
         if profundo:
@@ -528,7 +596,10 @@ class SyncJob:
         try:
             await self._fase_reconciliar()
             await self._fase_nombres(runtime)
-            await self._fase_archivo(runtime)
+            # LA EXCAVACION NO LEE DEL DISCO. `_fase_archivo` releia los lotes
+            # archivados, y ese es el camino por el que entraron 6613 mensajes
+            # de otra persona. Sigue existiendo como herramienta manual
+            # (`scripts/ingest_blobs.py`), nunca como paso automatico.
             await self._fase_semillas(runtime)
             await self._fase_revalidar(runtime)
             await self._fase_backfill(runtime)
@@ -582,6 +653,12 @@ class SyncJob:
 
             mutaciones = await fetch_contact_names(cliente)
             resueltos = await resolve_lids_via_usync(cliente, self._database)
+            # Y el nombre de la PROPIA cuenta, que puede no estar todavia
+            # cuando se sella: WhatsApp manda `me.name` un instante despues del
+            # pair-success, y para entonces la fila ya se escribio. Sin esto,
+            # el selector se queda con el numero crudo hasta el proximo
+            # arranque.
+            await asyncio.to_thread(self._refrescar_nombre_de_la_cuenta, runtime)
             if mutaciones or resueltos:
                 log.info(
                     "[SYNC] agenda: %d mutacion(es) de app-state, "
@@ -591,6 +668,58 @@ class SyncJob:
                 )
         except Exception:  # noqa: BLE001 - los nombres son un extra
             log.debug("No se pudo reintentar la agenda en este ciclo")
+
+    def _refrescar_nombre_de_la_cuenta(self, runtime: Any) -> None:
+        """Rellena `display_name` desde las credenciales, si falta.
+
+        `creds.json` es la fuente buena --lo escribe Baileys con lo que
+        contesta WhatsApp-- pero `me.name` llega un momento DESPUES del
+        pair-success, y el sellado ya ha pasado. Resultado: la cuenta queda
+        con el numero crudo en el selector.
+
+        Se mira en cada vuelta de la fase de nombres, que es barata, y solo
+        escribe si de verdad falta o si lo que hay es el numero. Lo que el
+        usuario haya escrito a mano no se toca.
+
+        Al cambiarlo se avisa por el bus para que el selector se entere sin
+        recargar la pagina.
+        """
+        cuenta = getattr(runtime, "runtime_owner_account_id", None)
+        if cuenta is None or self._database is None:
+            return
+        try:
+            from app.auth.atribucion import identidad_en_disco
+            from app.models import WhatsAppAccount
+
+            ajustes = getattr(runtime, "settings", None)
+            real = identidad_en_disco(ajustes, cuenta) if ajustes else None
+            if real is None or not real.nombre:
+                return
+
+            nuevo = real.nombre[:120]
+            with self._database.transaction() as sesion:
+                fila = sesion.get(WhatsAppAccount, cuenta)
+                if fila is None:
+                    return
+                actual = (fila.display_name or "").strip()
+                # Vacio, o el numero puesto como sustituto. Un nombre escrito
+                # por la persona manda sobre el del telefono.
+                if actual and actual not in (fila.phone_number or "", real.telefono):
+                    return
+                if actual == nuevo:
+                    return
+                fila.display_name = nuevo
+                sesion.flush()
+
+            log.info("[NOMBRES] La cuenta %s pasa a llamarse %r", str(cuenta)[:8], nuevo)
+            bus = getattr(runtime, "bus", None)
+            if bus is not None:
+                bus.publish(
+                    "account.updated",
+                    {"account_id": str(cuenta), "display_name": nuevo},
+                )
+        except Exception:  # noqa: BLE001 - un nombre no puede tumbar el ciclo
+            log.exception("No se pudo refrescar el nombre de la cuenta")
 
     async def _fase_reconciliar(self) -> None:
         """Reconciliacion SEGURA. Nunca borra nada."""
@@ -604,7 +733,22 @@ class SyncJob:
         self._emitir()
 
     async def _fase_archivo(self, runtime: Any) -> None:
-        """Releer los blobs que ya estan en disco. SOLO en la revision completa.
+        """Releer los blobs que ya estan en disco. YA NO SE LLAMA SOLA.
+
+        POR QUE SE SACO DEL CICLO
+        -------------------------
+        Porque es la unica parte de la excavacion que leia del disco, y por
+        ahi entro la peor fuga que ha tenido este proyecto: se vacio la base,
+        los 256 lotes archivados se quedaron huerfanos, se vinculo el telefono
+        de otra persona bajo otro correo de Google, y esta fase los adopto --
+        326 conversaciones y 6613 mensajes ajenos, con el telefono de su dueno
+        apagado y sin vincular.
+
+        Se cerraron las tres causas (archivado apagado, carpeta por cuenta, no
+        adoptar huerfanos), y aun asi esto sale del ciclo: excavar es pedirle
+        cosas al TELEFONO. Que un ciclo automatico lea ficheros del disco y
+        los meta en la cuenta que este mirando es una fuente de datos que
+        nadie pidio y que nadie revisa.
 
         Va la PRIMERA de las que tocan historial, y es deliberado: lo que ya
         esta en casa no cuesta ni una peticion de red, y pedirle al telefono

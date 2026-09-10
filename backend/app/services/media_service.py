@@ -5,13 +5,19 @@ Pipeline:
     mensaje -> media_files(pending) -> worker -> descarga -> verificacion
     -> archivo en data/media/<tipo>/ -> status=downloaded
 
-Se usa ``Client.download_media()``, que es la API real de pywhats. NO se
-reimplementa AES ni HKDF, y no se inventa ningun endpoint de CDN: pywhats
-resuelve los hosts por su cuenta.
+Se usa ``Client.download_media()``, que en Baileys es
+``downloadMediaMessage``. NO se reimplementa AES ni HKDF, y no se inventa
+ningun endpoint de CDN: Baileys resuelve los hosts por su cuenta.
 
-La verificacion tampoco se duplica: ``pywhats.media.crypto.decrypt_media`` ya
-comprueba el SHA256 del fichero cifrado, el HMAC y el SHA256 del contenido
-descifrado. Si algo no cuadra, lanza; aqui solo se traduce a un estado.
+La verificacion tampoco se duplica: Baileys ya comprueba el SHA256 del fichero
+cifrado, el HMAC y el SHA256 del contenido descifrado. Si algo no cuadra,
+lanza; aqui solo se traduce a un estado.
+
+LO QUE HAY QUE DARLE: EL MENSAJE ENTERO
+---------------------------------------
+Baileys descarga a partir del ``WebMessageInfo``, no de ``direct_path`` y
+``media_key`` sueltos. Ese protobuf ya esta guardado en ``messages.raw_proto``;
+esta capa solo tiene que ir a buscarlo. Ver ``_download_one``.
 
 Los workers viven en el event loop del cliente y toman el trabajo de una cola,
 asi que las descargas NUNCA bloquean al receptor de mensajes.
@@ -30,7 +36,7 @@ from sqlalchemy import func, select, update
 from app.core.config import Settings
 from app.core.database import Database
 from app.core.logging_setup import get_logger
-from app.models import MediaFile
+from app.models import MediaFile, Message
 
 log = get_logger("MEDIA")
 
@@ -46,8 +52,9 @@ _SUBDIRS = {
     "unknown": "other",
 }
 
-# Tipo de media de pywhats por cada tipo normalizado nuestro. Determina las
-# claves derivadas y la ruta del CDN, asi que no puede fallar.
+# Etiqueta criptografica por cada tipo normalizado nuestro. Hoy sirve sobre
+# todo para descartar los tipos que no se pueden bajar: las claves las deriva
+# Baileys a partir del propio mensaje.
 _CRYPTO_TYPE = {
     "image": "WhatsApp Image Keys",
     "sticker": "WhatsApp Image Keys",
@@ -359,7 +366,10 @@ class MediaService:
                     MediaFile.media_key,
                     MediaFile.file_sha256,
                     MediaFile.file_enc_sha256,
-                ).where(MediaFile.id == media_id)
+                    Message.raw_proto,
+                )
+                .join(Message, Message.id == MediaFile.message_id)
+                .where(MediaFile.id == media_id)
             ).one_or_none()
             if row is None:
                 return
@@ -379,6 +389,7 @@ class MediaService:
             media_key,
             file_sha256,
             file_enc_sha256,
+            raw_proto,
         ) = row
 
         # Deduplicacion: si ya existe el mismo contenido en disco, se reutiliza
@@ -402,12 +413,33 @@ class MediaService:
             self._fail(media_id, "unavailable", "el mensaje no traia direct_path")
             return
 
+        # SIN EL PROTOBUF NO HAY DESCARGA, Y NO ES OPINABLE
+        # -------------------------------------------------
+        # `downloadMediaMessage` de Baileys recibe el `WebMessageInfo` entero:
+        # de ahi saca la ruta del CDN, las claves y --cuando el CDN ya no lo
+        # sirve-- la peticion de resubida al telefono. Este metodo lo estaba
+        # omitiendo y construia el `MediaInfo` solo con columnas sueltas, que
+        # es lo que necesitaba el proveedor anterior.
+        #
+        # El resultado, medido en la base real: 1210 adjuntos en `failed`, los
+        # 1210 con "descarga sin el protobuf del mensaje", cero descargados. No
+        # fallaba una parte: fallaba el 100%.
+        #
+        # Es terminal, no reintentable: si la fila no tiene `raw_proto`, no lo
+        # va a tener en la ronda siguiente.
+        if not raw_proto:
+            self._fail(
+                media_id, "unavailable", "el mensaje no conserva su raw_proto"
+            )
+            return
+
         info = MediaInfo(
             direct_path=direct_path,
             media_key=bytes(media_key),
             file_sha256=bytes(file_sha256 or b""),
             file_enc_sha256=bytes(file_enc_sha256 or b""),
             media_type=crypto_type,
+            raw_proto=bytes(raw_proto),
         )
 
         try:

@@ -73,12 +73,16 @@ describe('ChatSidebar: excavar todo el historial', () => {
     expect(boton(el)).toBeNull();
   });
 
-  it('mientras excava se dice que espere y que NO recargue', () => {
+  it('mientras excava se dice, en una línea y al fondo', () => {
+    // Era un bloque de cuatro líneas ENCIMA de la lista: ocupaba media
+    // pantalla y empujaba hacia abajo las conversaciones justo cuando el
+    // usuario quiere verlas aparecer. El aviso tapaba aquello de lo que
+    // avisaba. Dice lo mismo sin quitarle sitio a nada.
     const el = render({ excavando: true });
-    const aviso = el.querySelector('.excavando');
+    const aviso = el.querySelector('.excavando-pie');
 
     expect(aviso).not.toBeNull();
-    expect(aviso!.textContent).toContain('no recargues');
+    expect(aviso!.textContent).toContain('Excavando');
     // Y que sea un estado, no decoración: quien use lector de pantalla también
     // tiene que enterarse de que hay algo en marcha.
     expect(aviso!.getAttribute('role')).toBe('status');
@@ -87,13 +91,15 @@ describe('ChatSidebar: excavar todo el historial', () => {
   it('el progreso se pinta cuando lo hay', () => {
     const el = render({ excavando: true, excavacionProgreso: '12 de 340 conversaciones' });
 
-    expect(el.querySelector('.progreso')!.textContent).toContain('12 de 340');
+    expect(el.querySelector('.excavando-pie .cuanto')!.textContent).toContain(
+      '12 de 340',
+    );
   });
 
   it('sin progreso no se pinta un hueco', () => {
     const el = render({ excavando: true });
 
-    expect(el.querySelector('.progreso')).toBeNull();
+    expect(el.querySelector('.excavando-pie .cuanto')).toBeNull();
   });
 
   it('bloqueado se deshabilita y se explica por qué', () => {

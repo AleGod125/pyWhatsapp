@@ -308,53 +308,60 @@ strong.provisional {
 
 /* El cartel de esperar. Ocupa el sitio del boton --literalmente, es la otra
    rama del `@if`-- porque el boton que no existe no se puede pulsar. */
-.excavando {
-  display: grid;
-  gap: 5px;
-  margin: 0 12px 8px;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--color-accent) 35%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
-}
-
-.excavando strong {
-  font-size: var(--font-size-sm);
-  color: var(--color-text);
-}
-
-.excavando .progreso {
+/* La excavacion, en UNA LINEA y al fondo.
+ *
+ * Antes era un bloque de cuatro lineas encima de la lista: ocupaba media
+ * pantalla en un portatil y empujaba las conversaciones hacia abajo justo
+ * cuando el usuario quiere verlas aparecer. El aviso tapaba aquello de lo que
+ * avisaba. Aqui no le quita sitio a nada y dice lo mismo.
+ */
+.excavando-pie {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
+}
+
+.excavando-pie .que {
+  flex: 0 0 auto;
+}
+
+.excavando-pie .cuanto {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  /* Los numeros no bailan al cambiar: sin esto la linea se movia sola cada
+     vez que avanzaba el contador. */
   font-variant-numeric: tabular-nums;
 }
 
-.excavando .aviso {
-  font-size: var(--font-size-xs);
-  line-height: 1.35;
-  color: var(--color-text-muted);
-}
-
-.excavando .aviso b {
-  color: var(--color-text);
-}
-
-/* La barra no marca progreso, marca que sigue vivo: el total de mensajes que
-   quedan por traer no se sabe hasta haberlos traido, y una barra que promete
-   un porcentaje inventado es peor que ninguna. */
-.excavando .barra {
-  height: 3px;
-  border-radius: 2px;
-  overflow: hidden;
-  background: color-mix(in srgb, var(--color-accent) 20%, transparent);
-}
-
-.excavando .barra i {
-  display: block;
-  width: 34%;
-  height: 100%;
+/* Late en vez de dar un porcentaje. El total de mensajes que quedan no se sabe
+   hasta haberlos traido, y una barra que promete un porcentaje inventado es
+   peor que ninguna: late para decir "sigue vivo", que es lo unico cierto. */
+.excavando-pie .punto {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
   background: var(--color-accent);
-  animation: barra-de-recarga 1.1s ease-in-out infinite;
+  animation: late-la-excavacion 1.4s ease-in-out infinite;
+}
+
+@keyframes late-la-excavacion {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 /* Quien pide menos movimiento no recibe ninguno: la informacion sigue estando
@@ -363,10 +370,32 @@ strong.provisional {
   .chat.entrando {
     animation: none;
   }
-  .recargando::after,
-  .excavando .barra i {
+  .recargando::after {
     animation: none;
     width: 100%;
     opacity: 0.5;
+  }
+  .excavando-pie .punto {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+// Las marcas de la fila: silenciado y fijado.
+//
+// Van pegadas a la hora y no junto al nombre a proposito: el nombre puede ser
+// largo y recortarse, y una marca que desaparece al recortar no sirve para
+// nada. Aqui el ancho esta reservado.
+.chat .marcas {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-right: 4px;
+
+  .marca {
+    font-style: normal;
+    font-size: 0.72em;
+    line-height: 1;
+    opacity: 0.75;
   }
 }

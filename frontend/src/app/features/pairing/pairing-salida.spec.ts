@@ -90,13 +90,15 @@ describe('salida de la pantalla de vinculación', () => {
     fixture.destroy();
   });
 
-  it('sin sesión va al formulario de acceso', () => {
+  it('sin sesión va a la portada', () => {
+    // Todos los destinos salen de `rutaPara`, así que esta pantalla hereda la
+    // regla sin saber nada de ella: sin sesión, la portada.
     const { http, navegar, fixture } = montar();
     http
       .expectOne(`${BASE}/onboarding/status`)
       .flush(onboarding({ authenticated: false, next_step: 'login' }));
 
-    expect(navegar).toHaveBeenCalledWith('/login');
+    expect(navegar).toHaveBeenCalledWith('/');
     fixture.destroy();
   });
 
