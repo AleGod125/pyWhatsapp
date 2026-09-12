@@ -175,7 +175,7 @@ class DriveStorageWorker:
             log.debug("El desalojo de multimedia fallo; se reintenta")
 
     def _barrer_pendientes(self) -> None:
-        """Agrupa en segmentos lo que todavia no ha salido hacia Drive."""
+        """Prepara lo que todavia no ha salido hacia Drive: texto Y adjuntos."""
         dueno = getattr(self._runtime, "runtime_owner_user_id", None)
         cuenta = getattr(self._runtime, "runtime_owner_account_id", None)
         if dueno is None or cuenta is None:
@@ -186,6 +186,20 @@ class DriveStorageWorker:
             self._storage.encolar_pendientes(user_id=dueno, account_id=cuenta)
         except Exception:  # noqa: BLE001
             log.exception("No se pudo preparar lo pendiente de subir")
+
+        # LOS ADJUNTOS TAMBIEN, y esta llamada faltaba.
+        #
+        # Sin ella el texto subia a Drive y se purgaba de PostgreSQL, mientras
+        # los adjuntos se quedaban en el disco PARA SIEMPRE: 384 MB de fotos,
+        # videos y notas de voz en claro, y `media_files.drive_file_id` a nulo
+        # en las 1227 filas. El desalojo local tampoco podia tocarlos, porque
+        # solo borra lo que Drive confirma.
+        try:
+            self._storage.encolar_multimedia_pendiente(
+                user_id=dueno, account_id=cuenta
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("No se pudo preparar la multimedia pendiente de subir")
 
     # -- Trabajo -------------------------------------------------------------
 

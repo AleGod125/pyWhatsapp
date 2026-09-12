@@ -342,6 +342,82 @@ class StorageService:
                     cerrados += 1
         return cerrados
 
+    def encolar_multimedia_pendiente(
+        self, *, user_id: uuid.UUID, account_id: uuid.UUID, limite: int = 500
+    ) -> int:
+        """Encola los adjuntos descargados que todavia no estan en Drive.
+
+        ESTO FALTABA, Y ES POR LO QUE `data/media` NO PARABA DE CRECER
+        --------------------------------------------------------------
+        El trabajador SABE subir multimedia --`_subir_multimedia`, y el tipo
+        de trabajo ``media`` esta contemplado en `_procesar`-- pero nadie lo
+        encolaba nunca. `encolar_pendientes` solo mira `messages`.
+
+        Medido sobre la instalacion real::
+
+            storage_jobs         365, todos 'complete'   <- solo segmentos
+            media_files         1227, todos 'local'      <- ni uno encolado
+            con drive_file_id      0
+
+        O sea: el texto llegaba a Drive y se purgaba de PostgreSQL, y los
+        adjuntos se quedaban EN EL DISCO para siempre. 384 MB de fotos, videos
+        y notas de voz de personas reales, en claro, junto al codigo. Y el
+        desalojo local no podia tocarlos: solo borra lo que Drive confirma, y
+        Drive no tenia nada.
+
+        Se barre la tabla en vez de colgar un gancho de cada sitio que crea un
+        adjunto, por la misma razon que en `encolar_pendientes`: hay tres
+        caminos de entrada y basta olvidarlo en uno.
+
+        SOLO LO QUE SE PUEDE SUBIR
+        --------------------------
+        Hace falta el fichero en disco (``download_status = 'downloaded'``).
+        Lo que caduco en el CDN o fallo la descarga no tiene nada que subir, y
+        encolarlo seria gastar reintentos contra un archivo que no existe.
+        """
+        if not self.habilitado:
+            return 0
+
+        from app.models.schema import MediaFile
+
+        encolados = 0
+        with self._database.transaction() as sesion:
+            pendientes = (
+                sesion.execute(
+                    select(MediaFile)
+                    .where(
+                        MediaFile.whatsapp_account_id == account_id,
+                        MediaFile.download_status == "downloaded",
+                        MediaFile.local_path.is_not(None),
+                        MediaFile.drive_file_id.is_(None),
+                    )
+                    .order_by(MediaFile.id)
+                    .limit(limite)
+                )
+                .scalars()
+                .all()
+            )
+            if not pendientes:
+                return 0
+
+            for fila in pendientes:
+                self._jobs.encolar(
+                    sesion,
+                    user_id=user_id,
+                    account_id=account_id,
+                    job_type="media",
+                    entity_id=str(fila.id),
+                    payload_bytes=int(fila.file_size or 0),
+                    detail={"chat_id": fila.chat_id, "tipo": fila.media_type},
+                )
+                encolados += 1
+
+        log.info(
+            "[STORAGE] %d adjunto(s) encolados para subir a Drive",
+            encolados,
+        )
+        return encolados
+
     # -- Reconstruccion tras un cierre brusco --------------------------------
 
     def reconstruir(self, segmento_id: uuid.UUID) -> bytes | None:

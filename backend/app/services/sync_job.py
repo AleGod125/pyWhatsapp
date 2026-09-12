@@ -599,7 +599,7 @@ class SyncJob:
             # LA EXCAVACION NO LEE DEL DISCO. `_fase_archivo` releia los lotes
             # archivados, y ese es el camino por el que entraron 6613 mensajes
             # de otra persona. Sigue existiendo como herramienta manual
-            # (`scripts/ingest_blobs.py`), nunca como paso automatico.
+            # a mano y a proposito, nunca como paso automatico.
             await self._fase_semillas(runtime)
             await self._fase_revalidar(runtime)
             await self._fase_backfill(runtime)

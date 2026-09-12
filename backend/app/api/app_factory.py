@@ -99,16 +99,18 @@ def create_app(runtime: Any, *, cors_origin: str | None = None) -> Flask:
     # justo al reves de tener que acordarse de protegerla.
     app.before_request(comprobar_csrf)
 
-    # Herramientas de diagnostico. Se montan siempre, y cada ruta se protege
-    # sola: la de app-state exige COMPAT_APPSTATE_SEEDS y devuelve 409 sin el.
+    # AQUI SE MONTABAN LOS ENDPOINTS DE DIAGNOSTICO, Y SE RETIRARON.
     #
-    # Antes el blueprint entero dependia de ese interruptor, asi que la unica
-    # forma de averiguar por que ON_DEMAND no responde era arrancar con una
-    # bandera que no tiene nada que ver con ON_DEMAND.
-    from app.experimental.diagnostics_api import diagnostics as diagnostics_bp
-
-    app.register_blueprint(diagnostics_bp)
-    log.debug("Endpoints de diagnostico montados")
+    # `app/experimental/diagnostics_api.py` exponia `/ondemand/probe` y
+    # `/ondemand/canary`: dos POST que disparan una peticion de historial
+    # sobre la cuenta vinculada. El comentario de aqui decia que "cada ruta se
+    # protege sola", y no era cierto -- ninguna de las dos llevaba
+    # `@requiere_sesion`, y el unico `before_request` global es el de CSRF,
+    # que para un `curl` desde fuera no es ninguna barrera.
+    #
+    # Con la API publicada en un dominio, eso es superficie abierta que
+    # ademas no tenia ni una prueba. Era una herramienta para diagnosticar
+    # ON_DEMAND a mano; ese trabajo ya se hace con el log.
 
     @app.get("/")
     def raiz():

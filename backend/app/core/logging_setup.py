@@ -120,6 +120,70 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         r"\1***",
     ),
+    # UN TELEFONO SUELTO, sin el ``@s.whatsapp.net`` detras.
+    #
+    # El patron de arriba exige el servidor, y por eso dejaba pasar todo lo
+    # que escribe el numero pelado. Los avisos de atribucion son justo asi:
+    #
+    #     [AUTH] IDENTIDAD INVERTIDA: la cuenta 91a8470b esta registrada como
+    #            573002389304 y la sesion que hay en su carpeta es de
+    #            573008927374
+    #
+    # Tres numeros de dos personas reales, en claro, en un fichero que se
+    # guardaba 120 MB de historial. Se deja el prefijo --pais y operadora,
+    # que es lo que sirve para seguir un caso-- y se tapa el resto.
+    #
+    # Va DESPUES del patron de JID a proposito: aquel ya dejo su marca y esto
+    # no vuelve a tocarlo, porque exige que no haya ``@`` justo detras.
+    #
+    # ONCE DIGITOS COMO MINIMO, y no diez. Una marca de tiempo Unix en
+    # segundos tiene exactamente diez (``1700000000``), y este log esta lleno
+    # de ellas: anclas, cursores, ventanas de reintento. Tapandolas se pierde
+    # justamente lo que sirve para seguir un historial atascado.
+    #
+    # Un telefono con indicativo de pais no baja de once (``573002389304`` son
+    # doce). El solape queda en los trece digitos de una marca en
+    # milisegundos; ahi se tapa de mas, y se prefiere asi: perder una cifra de
+    # diagnostico se nota y se arregla, filtrar el telefono de alguien no.
+    # Ni el punto ni los dos puntos valen como frontera por la derecha.
+    #
+    # Estaban en la exclusion para no partir versiones ni direcciones IP, y
+    # dejaban pasar lo mas comun de todo: el numero al FINAL DE LA FRASE.
+    # Sobre el log real quedaban catorce asi::
+    #
+    #     ...sus credenciales son de 573008927374. Manda el fichero.
+    #     ...y en su carpeta es de 573008927374. Sus chats son de 573002389304:
+    #
+    # No hacian falta para lo que protegian: los tramos de una IP o de una
+    # version tienen tres o cuatro cifras, y aqui se piden once como minimo.
+    # El guion si se queda: cubre los nombres con fecha --
+    # ``session-20260911185133-revoked``-- que no son de nadie.
+    # El `(?<!hex=)` protege lo que el recorte de arriba dejo a proposito.
+    #
+    # `_recortar_hex` conserva los primeros caracteres del volcado para poder
+    # saber QUE campo llego --que es la unica razon de que ese aviso exista--
+    # y esos caracteres pueden ser doce digitos seguidos (``000102030405``),
+    # que encajan aqui. Sin esta guarda, el recorte quedaba recortado otra vez
+    # y el aviso perdia su unico contenido util.
+    (
+        re.compile(
+            r"(?<!hex=)(?<![0-9a-zA-Z_./-])([0-9]{6})[0-9]{5,9}(?![0-9a-zA-Z_@-])"
+        ),
+        r"\1***",
+    ),
+    # El almacen de Signal nombra sus ficheros POR EL TELEFONO del contacto:
+    # ``session-573243116421.0.json``. Salen en los avisos de archivado de una
+    # sesion revocada, que listan lo que no se pudo mover.
+    #
+    # El patron de arriba no llega: el guion de ``session-`` es frontera por
+    # la izquierda, y tiene que serlo para no comerse las fechas de
+    # ``session-20260911185133-revoked``. Asi que este caso va aparte.
+    # El `(?!20)` separa un telefono de una FECHA. Las carpetas de sesion
+    # archivada se llaman ``session-20260911185133-revoked``, y esos catorce
+    # digitos tambien entran en el patron. Tapandolos se pierde justo lo que
+    # sirve para encontrar la carpeta. Ningun indicativo de pais empieza por
+    # 20; los anos de este siglo, todos.
+    (re.compile(r"\bsession-(?!20)([0-9]{6})[0-9]{5,9}"), r"session-\1***"),
 )
 
 
@@ -232,15 +296,24 @@ def setup_logging(
         # y con el una consulta tan simple como "que paso hace un rato" habia
         # que hacerla sobre cien megas de texto.
         #
-        # Cinco tandas de 20 MB: 100 MB de tope duro, y el historial que hace
-        # falta de verdad --las ultimas horas-- sigue entero. `delay` evita
-        # crear el fichero hasta que haya algo que escribir.
+        # DOS TANDAS DE 5 MB, no cinco de 20.
+        #
+        # El tope anterior eran 120 MB, y se alcanzaron: 107 MB en `app.log.1`
+        # mas 13 MB en `app.log`. Un log no es solo espacio -- este lleva
+        # identificadores de conversaciones y, hasta el filtro de arriba,
+        # telefonos en claro. Cuanto mas historial se guarda, mas hay que
+        # proteger y mas se arrastra al copiar el proyecto.
+        #
+        # Diez megas cubren de sobra lo unico que se consulta de verdad, que
+        # son las ultimas horas. Lo anterior no se ha mirado nunca.
+        #
+        # `delay` evita crear el fichero hasta que haya algo que escribir.
         from logging.handlers import RotatingFileHandler
 
         file_handler = RotatingFileHandler(
             log_file,
-            maxBytes=20 * 1024 * 1024,
-            backupCount=5,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=1,
             encoding="utf-8",
             delay=True,
         )

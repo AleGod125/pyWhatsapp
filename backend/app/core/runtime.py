@@ -1703,9 +1703,14 @@ class AppRuntime:
 
             # Durante una prueba de diagnostico los blobs ON_DEMAND se
             # observan y no se guardan: la prueba tiene que poder repetirse
-            # sin cambiar la base. El blob ya quedo archivado en
-            # ``data/history/``, asi que no se pierde nada y se puede ingerir
-            # despues con 'py scripts/ingest_blobs.py'.
+            # sin cambiar la base.
+            #
+            # ANTES esto decia que el blob quedaba archivado en disco y se
+            # podia reingerir despues. Ya no: el archivado local esta apagado
+            # por defecto --era el camino por el que entraron 6613 mensajes de
+            # otra persona-- y el script que lo reingeria se retiro. Lo que se
+            # observa en una prueba de diagnostico, se pierde, y esta bien: la
+            # prueba se repite pidiendolo otra vez.
             #
             # Solo los ON_DEMAND: un INITIAL_BOOTSTRAP que llegue a la vez se
             # guarda como siempre.
@@ -1756,9 +1761,13 @@ class AppRuntime:
                     )
             except Exception as exc:  # noqa: BLE001 - el blob ya esta en disco
                 sync_log.exception("Fallo al persistir el History Sync: %s", exc)
+                # NO se promete un fichero en disco: el archivado de lotes
+                # esta apagado por defecto, asi que lo normal es que no haya
+                # nada que reingerir. Decir lo contrario mandaba a buscar una
+                # carpeta vacia y un script que ya no existe.
                 sync_log.warning(
-                    "El blob sigue en data/history/; se puede reintentar con "
-                    "'py scripts/ingest_blobs.py' sin volver a pedir nada al servidor"
+                    "Ese lote de historial no se pudo guardar. Se volvera a "
+                    "pedir en la siguiente vuelta de la excavacion."
                 )
                 return
 

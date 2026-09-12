@@ -116,7 +116,7 @@ class HistoryRecheck:
         Devuelve ``(blobs_revisados, mensajes_nuevos)``. No descarga nada: los
         ``.pb`` de ``data/history/`` son lo que WhatsApp ya entrego.
         """
-        # Mismo sitio que usa ``scripts/ingest_blobs.py``: no hay un ajuste
+        # El mismo sitio que miraba la reingesta de lotes: no hay un ajuste
         # aparte para esto, y tener dos verdades sobre donde viven los blobs
         # seria peor que derivarlo del mismo ``data_dir``.
         directorio: Path = self._settings.data_dir / "history"

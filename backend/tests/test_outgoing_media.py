@@ -200,60 +200,6 @@ def test_un_texto_no_registra_ningun_adjunto(servicio, session, crudo):
 # ---------------------------------------------------------------------------
 
 
-def test_el_reparador_encuentra_los_adjuntos_sin_fila(session, cuenta, servicio, crudo, monkeypatch):
-    """Los que se perdieron antes del arreglo se recuperan del protobuf."""
-    import app.services.live_service as live_service
-    from scripts.repair_missing_media import aplicar, auditar
-
-    # Se reproduce el fallo: el registro del adjunto no llega a ocurrir.
-    monkeypatch.setattr(
-        live_service.LiveMessageService,
-        "_register_parsed_media",
-        lambda *a, **k: False,
-    )
-    crudo(envuelto(ISAAC_LID, imagen=True))
-    servicio.handle(evento(id="MEDIAREP001"))
-    session.flush()
-    assert _media(session, "MEDIAREP001") is None, "asi quedaba antes del arreglo"
-
-    candidatos = [c for c in auditar(session) if c.whatsapp_message_id == "MEDIAREP001"]
-    assert len(candidatos) == 1
-    assert candidatos[0].media_type == "image"
-
-    aplicar(session, candidatos)
-    session.flush()
-
-    recuperado = _media(session, "MEDIAREP001")
-    assert recuperado is not None
-    assert recuperado.download_status == "pending"
-
-
-def test_el_reparador_no_inventa_adjuntos_para_los_textos(session, servicio, crudo):
-    """Un texto no tiene adjunto; el reparador no puede fabricarle uno."""
-    from scripts.repair_missing_media import auditar
-
-    crudo(envuelto(ISAAC_LID, texto="hola"))
-    servicio.handle(evento(id="MEDIAREP002", text="hola"))
-    session.flush()
-
-    assert not [
-        c for c in auditar(session) if c.whatsapp_message_id == "MEDIAREP002"
-    ]
-
-
-def test_el_reparador_no_toca_los_que_ya_tienen_fila(session, cuenta, servicio, crudo):
-    from scripts.repair_missing_media import auditar
-
-    crudo(envuelto(ISAAC_LID, imagen=True))
-    servicio.handle(evento(id="MEDIAREP003"))
-    session.flush()
-    assert _media(session, "MEDIAREP003") is not None
-
-    assert not [
-        c for c in auditar(session) if c.whatsapp_message_id == "MEDIAREP003"
-    ]
-
-
 # ---------------------------------------------------------------------------
 # Nada sensible en los logs
 # ---------------------------------------------------------------------------
@@ -273,16 +219,3 @@ def test_el_registro_no_escribe_material_sensible(servicio, session, crudo, capl
         assert prohibido not in texto
 
 
-def test_el_reparador_no_imprime_material_sensible(capsys):
-    """El informe dice si el dato ESTA, nunca cual es."""
-    from pathlib import Path
-
-    fuente = Path("scripts/repair_missing_media.py").read_text(encoding="utf-8")
-    # Se busca en las cadenas que se imprimen, no en la prosa del docstring.
-    impresiones = [
-        linea for linea in fuente.splitlines() if linea.strip().startswith("print(")
-    ]
-    unidas = " ".join(impresiones)
-    assert "media.media_key" not in unidas
-    assert "media.direct_path" not in unidas
-    assert "tiene_clave" in fuente, "se informa de la PRESENCIA, no del valor"

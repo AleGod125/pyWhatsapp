@@ -484,20 +484,6 @@ def test_la_fase_se_acotaria_a_la_cuenta_que_pulsa():
     assert "runtime_owner_account_id" in inspect.getsource(SyncJob._fase_archivo)
 
 
-def test_el_script_suelto_usa_EL_MISMO_servicio():
-    """Dos implementaciones serian dos criterios sobre de quien es un blob.
-
-    Y la version anterior del script llamaba a `ingest_history_sync` sin
-    cuenta: los mensajes entraban sin dueno y el filtro de propiedad los
-    excluia. Quedaban guardados sin que los viera nadie.
-    """
-    fuente = (
-        __import__("pathlib").Path("scripts/ingest_blobs.py").read_text(encoding="utf-8")
-    )
-    assert "reingerir_blobs" in fuente
-    assert "--cuenta" in fuente
-
-
 # ---------------------------------------------------------------------------
 # Reabrir las agotadas: solo con evidencia, nunca por pulsar
 # ---------------------------------------------------------------------------
